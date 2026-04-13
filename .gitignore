@@ -8,6 +8,8 @@ __pycache__/
 *.py[cod]
 *$py.class
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
 .coverage
 coverage.xml
 htmlcov/
@@ -52,6 +54,7 @@ Thumbs.db
 # Logs and temporary files
 *.log
 *.tmp
+*.pid
 tmp/
 temp/
 *.out

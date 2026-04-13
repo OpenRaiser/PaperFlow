@@ -46,6 +46,11 @@ REQUIRED_ENV_VARS = (
     "FEISHU_VERIFICATION_TOKEN",
 )
 
+
+def bootstrap_runtime() -> None:
+    runtime_bootstrap = importlib.import_module("scripts.runtime_bootstrap")
+    runtime_bootstrap.bootstrap_runtime(verbose=True)
+
 sys.path.insert(0, str(ROOT_DIR))
 
 try:
@@ -283,6 +288,7 @@ def write_url_files(public_url: str) -> tuple[Path, Path]:
 
 def print_summary(port: int, public_url: str, ngrok_url_path: Path, feishu_url_path: Path) -> None:
     request_url = public_url.rstrip("/") + "/"
+    scheduler = importlib.import_module("services.webhook-server.scripts.scheduler")
     print()
     print("=" * 60)
     print("SciTaste Webhook + ngrok Ready")
@@ -294,12 +300,14 @@ def print_summary(port: int, public_url: str, ngrok_url_path: Path, feishu_url_p
     print(f"Saved URL file : {ngrok_url_path}")
     print(f"Saved URL file : {feishu_url_path}")
     print("ngrok dashboard: http://127.0.0.1:4040")
+    print(f"Automatic jobs : {scheduler.describe_schedule()}")
     print()
     print("Feishu setup:")
     print("1. Open Feishu Open Platform -> your app -> Event Subscription")
     print(f"2. Set Request URL to {request_url}")
     print("3. Enable event: Receive Messages v1.0 (im.message.receive_v1)")
     print("4. Save the subscription")
+    print("5. Keep this process running if you want scheduled pushes/reports to fire")
     print()
     print("Press Ctrl+C to stop.")
 
@@ -320,6 +328,7 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    bootstrap_runtime()
     verify_required_env()
 
     if not args.ngrok_only:

@@ -3,6 +3,7 @@
 ArXiv Paper Fetcher
 """
 
+import os
 import requests
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
@@ -11,6 +12,8 @@ import time
 import urllib.parse
 
 ARXIV_API_URL = "https://export.arxiv.org/api/query"
+DEFAULT_REQUEST_TIMEOUT = float(os.environ.get("ARXIV_REQUEST_TIMEOUT", "12"))
+DEFAULT_REQUEST_HEADERS = {"User-Agent": "SciTaste/0.1 ArxivFetcher"}
 
 # arXiv 类别映射
 CATEGORIES = {
@@ -58,7 +61,7 @@ def fetch_by_date(
     for attempt in range(max_retries):
         try:
             print(f"Attempt {attempt + 1}/{max_retries}...")
-            response = requests.get(url, timeout=60)
+            response = requests.get(url, timeout=60, headers=DEFAULT_REQUEST_HEADERS)
             if response.status_code == 429:
                 wait_time = (attempt + 1) * 30  # 30s, 60s, 90s
                 print(f"Rate limited (429), waiting {wait_time}s before retry...")
@@ -164,7 +167,11 @@ def extract_pdf_url(element: ET.Element, ns: dict) -> str:
     arxiv_id = extract_arxiv_id(element, ns)
     return f"https://arxiv.org/pdf/{arxiv_id}.pdf"
 
-def get_paper_detail(arxiv_id: str) -> Optional[Dict]:
+def get_paper_detail(
+    arxiv_id: str,
+    timeout: float = DEFAULT_REQUEST_TIMEOUT,
+    max_retries: int = 1,
+) -> Optional[Dict]:
     """
     获取单篇论文详情
 
@@ -181,14 +188,24 @@ def get_paper_detail(arxiv_id: str) -> Optional[Dict]:
         "max_results": 1
     }
 
-    try:
-        response = requests.get(ARXIV_API_URL, params=params, timeout=30)
-        response.raise_for_status()
-        papers = parse_arxiv_xml(response.text)
-        return papers[0] if papers else None
-    except requests.RequestException as e:
-        print(f"Error fetching paper detail: {e}")
-        return None
+    for attempt in range(max_retries):
+        try:
+            response = requests.get(
+                ARXIV_API_URL,
+                params=params,
+                timeout=timeout,
+                headers=DEFAULT_REQUEST_HEADERS,
+            )
+            response.raise_for_status()
+            papers = parse_arxiv_xml(response.text)
+            return papers[0] if papers else None
+        except requests.RequestException as e:
+            if attempt >= max_retries - 1:
+                print(f"Error fetching paper detail: {e}")
+                return None
+            time.sleep(min(2 * (attempt + 1), 5))
+
+    return None
 
 if __name__ == "__main__":
     import argparse

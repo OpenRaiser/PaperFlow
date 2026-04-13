@@ -1,7 +1,11 @@
 param(
-    [string]$UserId = "ou_c4f5d0e9c7185e943cbd4216c9b68de7",
+    [string]$UserId = "",
     [string]$MessageText = "Test message"
 )
+
+if (-not $UserId) {
+    throw "Missing UserId. Pass -UserId or configure FEISHU_USER_ID elsewhere."
+}
 
 # 创建飞书 post 消息内容
 # 格式要求：每行是一个数组，包含一个或多个 block

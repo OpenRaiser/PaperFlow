@@ -14,10 +14,25 @@ import re
 from pathlib import Path
 from typing import Dict, Any, Optional, List
 
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(PROJECT_ROOT / ".env")
+except ImportError:
+    pass
+
 try:
     from openai import OpenAI
 except ImportError:
     OpenAI = None
+
+try:
+    from huggingface_hub import InferenceClient, get_token
+except ImportError:
+    InferenceClient = None
+    get_token = None
 
 try:
     import torch
@@ -31,8 +46,9 @@ except ImportError:
     AutoTokenizer = None
 
 LLM_FALLBACK_DISABLED = False
+HF_LLM_DISABLED = False
 LOCAL_LLM_DISABLED = False
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
+LOCAL_LLM_DEVICE_OVERRIDE: Optional[str] = None
 _LOCAL_LLM_CACHE: Dict[str, Dict[str, Any]] = {}
 
 
@@ -85,7 +101,24 @@ def _is_placeholder_openai_key(api_key: Optional[str]) -> bool:
     return not normalized.startswith("sk-")
 
 
-def _get_openai_client() -> Optional[OpenAI]:
+def _get_first_env_value(*names: str) -> str:
+    for name in names:
+        value = (os.environ.get(name) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _should_prefer_dashscope_credentials(provider_hint: Optional[str] = None) -> bool:
+    hint = str(provider_hint or "").strip().lower()
+    if hint in {"dashscope", "aliyun", "bailian"}:
+        return True
+
+    base_url = _get_first_env_value("OPENAI_BASE_URL", "DASHSCOPE_BASE_URL").lower()
+    return "dashscope.aliyuncs.com" in base_url
+
+
+def _get_openai_client(timeout_override: Optional[float] = None) -> Optional[OpenAI]:
     """获取 OpenAI 客户端（如果可用）"""
     global LLM_FALLBACK_DISABLED
 
@@ -95,11 +128,120 @@ def _get_openai_client() -> Optional[OpenAI]:
     if OpenAI is None:
         return None
 
-    api_key = os.environ.get("OPENAI_API_KEY")
+    if _should_prefer_dashscope_credentials():
+        api_key = _get_first_env_value("DASHSCOPE_API_KEY", "OPENAI_API_KEY")
+        base_url = _get_first_env_value("DASHSCOPE_BASE_URL", "OPENAI_BASE_URL") or None
+        raw_timeout = _get_first_env_value("DASHSCOPE_API_TIMEOUT", "OPENAI_API_TIMEOUT") or "60"
+    else:
+        api_key = _get_first_env_value("OPENAI_API_KEY", "DASHSCOPE_API_KEY")
+        base_url = _get_first_env_value("OPENAI_BASE_URL", "DASHSCOPE_BASE_URL") or None
+        raw_timeout = _get_first_env_value("OPENAI_API_TIMEOUT", "DASHSCOPE_API_TIMEOUT") or "60"
     if _is_placeholder_openai_key(api_key):
         return None
+    try:
+        timeout = float(raw_timeout)
+    except ValueError:
+        timeout = 60.0
+    if timeout_override is not None:
+        timeout = float(timeout_override)
 
-    return OpenAI(api_key=api_key)
+    return OpenAI(api_key=api_key, base_url=base_url, timeout=timeout, max_retries=0)
+
+
+def _is_placeholder_hf_token(api_key: Optional[str]) -> bool:
+    normalized = str(api_key or "").strip().lower()
+    if not normalized:
+        return True
+
+    return (
+        "your_hf_token" in normalized
+        or normalized.endswith("-here")
+        or normalized == "hf_xxxxxxxxxxxxxxxxxxxx"
+    )
+
+
+def _looks_like_hf_user_token(api_key: Optional[str]) -> bool:
+    return str(api_key or "").strip().lower().startswith("hf_")
+
+
+def _looks_like_auth_error(exc: Exception) -> bool:
+    message = str(exc or "").lower()
+    return any(
+        token in message
+        for token in (
+            "401",
+            "unauthorized",
+            "invalid api key",
+            "incorrect api key",
+            "invalid token",
+            "authentication",
+            "permission denied",
+            "forbidden",
+        )
+    )
+
+
+def _get_hf_llm_model() -> str:
+    return os.environ.get("HF_LLM_MODEL", "Qwen/Qwen3-8B").strip() or "Qwen/Qwen3-8B"
+
+
+def _get_reading_report_timeout() -> float:
+    raw_timeout = os.environ.get("READING_REPORT_LLM_TIMEOUT", "").strip()
+    if not raw_timeout:
+        raw_timeout = _get_first_env_value("OPENAI_API_TIMEOUT", "HF_LLM_TIMEOUT", "HF_API_TIMEOUT") or "60"
+    try:
+        return max(30.0, float(raw_timeout))
+    except ValueError:
+        return 60.0
+
+
+def _resolve_hf_provider(primary_env_name: str, fallback_env_name: str = "HF_INFERENCE_PROVIDER") -> str:
+    primary = os.environ.get(primary_env_name, "").strip()
+    if primary:
+        return primary
+    fallback = os.environ.get(fallback_env_name, "").strip()
+    return fallback or "auto"
+
+
+def _get_hf_llm_client() -> Optional[Any]:
+    global HF_LLM_DISABLED
+
+    if HF_LLM_DISABLED or InferenceClient is None:
+        return None
+
+    api_key = os.environ.get("HF_TOKEN") or os.environ.get("HF_API_KEY") or ""
+    if _is_placeholder_hf_token(api_key):
+        api_key = ""
+
+    if not api_key and get_token is not None:
+        try:
+            api_key = get_token() or ""
+        except Exception:
+            api_key = ""
+
+    if _is_placeholder_hf_token(api_key):
+        return None
+
+    provider_name = _resolve_hf_provider("HF_LLM_PROVIDER")
+    if provider_name == "auto" and not _looks_like_hf_user_token(api_key):
+        print(
+            "HF LLM parser disabled: HF_LLM_PROVIDER/HF_INFERENCE_PROVIDER is set to auto, "
+            "but the configured key is not a Hugging Face hf_ token. "
+            "Set HF_LLM_PROVIDER to your actual provider name, for example nscale."
+        )
+        return None
+
+    try:
+        timeout = float(os.environ.get("HF_LLM_TIMEOUT", os.environ.get("HF_API_TIMEOUT", "60")))
+    except ValueError:
+        timeout = 60.0
+
+    return InferenceClient(
+        model=_get_hf_llm_model(),
+        provider=provider_name,
+        api_key=api_key,
+        timeout=timeout,
+    )
 
 
 def _get_llm_parser_provider() -> str:
@@ -107,7 +249,11 @@ def _get_llm_parser_provider() -> str:
     provider = os.environ.get("LLM_PARSER_PROVIDER", "auto").strip().lower()
     if provider in {"none", "disabled", "off"}:
         return "disabled"
-    if provider in {"local", "openai"}:
+    if provider in {"dashscope", "aliyun", "bailian"}:
+        return "openai"
+    if provider in {"local", "openai", "hf_api", "huggingface", "huggingface_api", "hf-inference"}:
+        if provider in {"huggingface", "huggingface_api", "hf-inference"}:
+            return "hf_api"
         return provider
     return "auto"
 
@@ -122,6 +268,68 @@ def _get_local_llm_model_path() -> Optional[Path]:
     if not candidate.is_absolute():
         candidate = (PROJECT_ROOT / candidate).resolve()
     return candidate if candidate.exists() else None
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name, "true" if default else "false").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _should_fallback_local_llm_to_cpu_on_oom() -> bool:
+    return _env_flag("LOCAL_LLM_FALLBACK_TO_CPU_ON_OOM", True)
+
+
+def _is_cuda_oom_error(exc: Exception) -> bool:
+    message = str(exc or "").lower()
+    return (
+        "cuda out of memory" in message
+        or ("out of memory" in message and "cuda" in message)
+        or "cudnn_status_not_supported" in message
+    )
+
+
+def _clear_cuda_cache() -> None:
+    if torch is None or not hasattr(torch, "cuda"):
+        return
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+def _resolve_local_llm_device(force_device: Optional[str] = None) -> str:
+    preferred = (force_device or LOCAL_LLM_DEVICE_OVERRIDE or os.environ.get("LOCAL_LLM_DEVICE", "auto")).strip().lower()
+    if preferred in {"cuda", "gpu"} and torch is not None and torch.cuda.is_available():
+        return "cuda"
+    if preferred == "cpu":
+        return "cpu"
+    if torch is not None and torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
+
+
+def _local_llm_cache_key(model_path: Path, device: str) -> str:
+    return f"{model_path}::{device}"
+
+
+def _evict_local_llm_backend(cache_key: Optional[str]) -> None:
+    if not cache_key:
+        return
+
+    backend = _LOCAL_LLM_CACHE.pop(cache_key, None)
+    if not backend:
+        return
+
+    model = backend.get("model")
+    device = str(backend.get("device") or "")
+    if model is not None and device == "cuda":
+        try:
+            model.to("cpu")
+        except Exception:
+            pass
+
+    _clear_cuda_cache()
 
 
 def _is_embedding_style_checkpoint(model_path: Path) -> bool:
@@ -179,6 +387,10 @@ def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
     if not normalized:
         return None
 
+    normalized = re.sub(r"<think>.*?</think>", "", normalized, flags=re.IGNORECASE | re.DOTALL).strip()
+    normalized = re.sub(r"^```(?:json)?\s*", "", normalized, flags=re.IGNORECASE).strip()
+    normalized = re.sub(r"\s*```$", "", normalized).strip()
+
     try:
         parsed = json.loads(normalized)
         return parsed if isinstance(parsed, dict) else None
@@ -197,9 +409,267 @@ def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def _get_local_llm_backend() -> Optional[Dict[str, Any]]:
+_DIRECTION_DISPLAY_MAP = {
+    "gui-agent": "GUI Agent",
+    "multimodal-reasoning": "Multimodal Reasoning",
+    "vision": "Vision",
+    "language": "Language",
+    "machine-learning": "Machine Learning",
+    "deep-learning": "Deep Learning",
+    "reinforcement-learning": "Reinforcement Learning",
+    "reasoning": "Reasoning",
+    "agent": "Agent",
+    "optimization": "Optimization",
+    "retrieval": "Retrieval",
+    "generation": "Generation",
+    "data-native": "Data Native",
+    "bio-molecular": "Bio Molecular",
+    "science-discovery": "Science Discovery",
+}
+
+_DIRECTION_GENERIC_TERMS = {
+    "direction",
+    "directions",
+    "topic",
+    "topics",
+    "area",
+    "areas",
+    "field",
+    "fields",
+    "interest",
+    "interests",
+    "research",
+    "方向",
+    "研究方向",
+    "主题",
+    "领域",
+    "兴趣",
+}
+
+
+def _normalize_direction_key(value: Any) -> str:
+    normalized = str(value or "").strip().lower()
+    if not normalized:
+        return ""
+    normalized = normalized.replace("&", " and ")
+    normalized = normalized.replace("/", " ")
+    normalized = re.sub(r"[_\s]+", "-", normalized)
+    normalized = re.sub(r"[^0-9a-z\u4e00-\u9fff\-]+", "-", normalized)
+    normalized = re.sub(r"-{2,}", "-", normalized).strip("-")
+    return normalized
+
+
+def _get_direction_parser_timeout() -> float:
+    raw_timeout = (
+        _get_first_env_value("LLM_PARSER_DIRECTION_TIMEOUT", "SCITASTE_DIRECTION_LLM_TIMEOUT")
+        or "18"
+    )
+    try:
+        timeout = float(raw_timeout)
+    except ValueError:
+        timeout = 18.0
+    return min(60.0, max(5.0, timeout))
+
+
+def _looks_like_explicit_direction_description(text: str) -> bool:
+    lowered = str(text or "").strip().lower()
+    if not lowered:
+        return False
+    markers = (
+        "direction:",
+        "directions:",
+        "topic:",
+        "topics:",
+        "研究方向",
+        "方向：",
+        "方向:",
+        "感兴趣",
+        "interested in",
+        "focus on",
+        "working on",
+        "关注",
+        "聚焦",
+        "方向是",
+        "领域是",
+    )
+    return any(marker in lowered for marker in markers) or any(
+        delimiter in lowered for delimiter in (",", "，", ";", "；", "、", "/", "\n")
+    )
+
+
+def _build_direction_alias_map(lexicon: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    alias_map: Dict[str, Dict[str, Any]] = {}
+
+    def register(alias: Any, payload: Dict[str, Any]) -> None:
+        alias_key = _normalize_direction_key(alias)
+        if alias_key:
+            alias_map.setdefault(alias_key, payload)
+
+    for direction_key in KNOWN_DIRECTIONS:
+        payload = {
+            "name": direction_key,
+            "name_cn": _DIRECTION_DISPLAY_MAP.get(direction_key, direction_key.replace("-", " ").title()),
+            "is_known": True,
+            "_auto_learn": False,
+        }
+        register(direction_key, payload)
+        register(direction_key.replace("-", " "), payload)
+        register(_DIRECTION_DISPLAY_MAP.get(direction_key, ""), payload)
+
+    for direction_key, data in (lexicon or {}).items():
+        payload = {
+            "name": _normalize_direction_key(direction_key) or str(direction_key),
+            "name_cn": str(data.get("name_cn") or data.get("name") or direction_key),
+            "is_known": True,
+            "_auto_learn": False,
+        }
+        register(direction_key, payload)
+        register(data.get("name"), payload)
+        register(data.get("name_cn"), payload)
+        for keyword in data.get("keywords", []) or []:
+            register(keyword, payload)
+
+    return alias_map
+
+
+def _clean_direction_candidate(candidate: Any) -> str:
+    value = str(candidate or "").strip()
+    if not value:
+        return ""
+
+    value = re.sub(r"^[`'\"“”‘’]+|[`'\"“”‘’]+$", "", value)
+    value = re.sub(
+        r"^(?:direction|directions|topic|topics|area|areas|field|fields|研究方向|方向|主题|领域)\s*[:：]?\s*",
+        "",
+        value,
+        flags=re.IGNORECASE,
+    )
+    value = re.sub(
+        r"^(?:我最近|最近|目前|现在|主要|比较|更|想|正在|在|做|研究|关注|聚焦|偏向|对)\s*",
+        "",
+        value,
+    )
+    value = re.sub(
+        r"(?:更?感兴趣了?|感兴趣|有兴趣|比较关注|方向上|方向|领域|主题|相关研究|相关方向)$",
+        "",
+        value,
+    )
+    value = re.sub(r"\s+", " ", value).strip(" ,.;:，；、/\\-")
+    lowered = value.lower()
+    if not value or lowered in _DIRECTION_GENERIC_TERMS:
+        return ""
+    if len(value) < 2 or len(value) > 80:
+        return ""
+    return value
+
+
+def _extract_direction_candidates_fast(text: str, alias_map: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+    normalized_text = str(text or "").strip()
+    if not normalized_text:
+        return []
+
+    candidate_sources: List[str] = []
+    explicit_patterns = [
+        r"(?:direction|directions|topic|topics|area|areas|field|fields|研究方向|方向|主题|领域)\s*[:：]\s*(.+)",
+        r"(?:我最近|最近|目前|现在|我)?(?:对|关注|聚焦)\s*(.+?)\s*(?:更?感兴趣了?|感兴趣|有兴趣|比较关注|$)",
+        r"(?:working on|focus on|interested in)\s+(.+)$",
+    ]
+    for pattern in explicit_patterns:
+        for match in re.finditer(pattern, normalized_text, flags=re.IGNORECASE):
+            captured = str(match.group(1) or "").strip()
+            if captured:
+                candidate_sources.append(captured)
+
+    if not candidate_sources:
+        candidate_sources.append(normalized_text)
+
+    split_pattern = r"(?:,|，|;|；|、|\band\b|\bor\b|以及|和|与|\+|/|\n)+"
+    seen: set[str] = set()
+    directions: List[Dict[str, Any]] = []
+
+    for source in candidate_sources:
+        for fragment in re.split(split_pattern, source, flags=re.IGNORECASE):
+            candidate = _clean_direction_candidate(fragment)
+            if not candidate:
+                continue
+
+            normalized_candidate = _normalize_direction_key(candidate)
+            if not normalized_candidate or normalized_candidate in seen:
+                continue
+            seen.add(normalized_candidate)
+
+            matched = alias_map.get(normalized_candidate)
+            if matched is not None:
+                directions.append(
+                    {
+                        "name": matched["name"],
+                        "name_cn": matched["name_cn"],
+                        "confidence": 0.82,
+                        "source_text": candidate,
+                        "is_known": True,
+                        "_auto_learn": False,
+                    }
+                )
+                continue
+
+            directions.append(
+                {
+                    "name": normalized_candidate,
+                    "name_cn": candidate if re.search(r"[\u4e00-\u9fff]", candidate) else candidate.title(),
+                    "confidence": 0.58,
+                    "source_text": candidate,
+                    "is_known": False,
+                    "_auto_learn": False,
+                }
+            )
+
+    return directions[:3]
+
+
+def _normalize_direction_results(
+    directions: List[Dict[str, Any]],
+    alias_map: Dict[str, Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    normalized_directions: List[Dict[str, Any]] = []
+    seen_names: set[str] = set()
+
+    for direction in directions:
+        if not isinstance(direction, dict):
+            continue
+
+        raw_name = direction.get("name") or direction.get("name_cn") or direction.get("source_text")
+        normalized_name = _normalize_direction_key(raw_name)
+        if not normalized_name or normalized_name in seen_names:
+            continue
+
+        matched = alias_map.get(normalized_name)
+        try:
+            confidence = float(direction.get("confidence", 0.6))
+        except (TypeError, ValueError):
+            confidence = 0.6
+        confidence = max(0.0, min(1.0, confidence))
+
+        normalized_direction = {
+            "name": matched["name"] if matched else normalized_name,
+            "name_cn": str(
+                direction.get("name_cn")
+                or (matched["name_cn"] if matched else raw_name or normalized_name)
+            ).strip(),
+            "confidence": confidence,
+            "source_text": str(direction.get("source_text") or raw_name or "").strip(),
+            "is_known": bool(direction.get("is_known", matched is not None)),
+            "_auto_learn": bool(direction.get("_auto_learn", matched is None)),
+        }
+
+        seen_names.add(normalized_direction["name"])
+        normalized_directions.append(normalized_direction)
+
+    return normalized_directions[:3]
+
+
+def _get_local_llm_backend(force_device: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Load a local causal LM backend for parser inference."""
-    global LOCAL_LLM_DISABLED
+    global LOCAL_LLM_DISABLED, LOCAL_LLM_DEVICE_OVERRIDE
 
     if LOCAL_LLM_DISABLED:
         return None
@@ -222,20 +692,14 @@ def _get_local_llm_backend() -> Optional[Dict[str, Any]]:
         LOCAL_LLM_DISABLED = True
         return None
 
-    cache_key = str(model_path)
+    device = _resolve_local_llm_device(force_device)
+    cache_key = _local_llm_cache_key(model_path, device)
     if cache_key in _LOCAL_LLM_CACHE:
         return _LOCAL_LLM_CACHE[cache_key]
 
     trust_remote_code = os.environ.get("LOCAL_LLM_TRUST_REMOTE_CODE", "false").strip().lower() in {
         "1", "true", "yes", "on"
     }
-    configured_device = os.environ.get("LOCAL_LLM_DEVICE", "auto").strip().lower()
-    if configured_device in {"cuda", "gpu"} and torch.cuda.is_available():
-        device = "cuda"
-    elif configured_device == "cpu":
-        device = "cpu"
-    else:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
 
     try:
         tokenizer = AutoTokenizer.from_pretrained(
@@ -247,6 +711,7 @@ def _get_local_llm_backend() -> Optional[Dict[str, Any]]:
 
         model_kwargs: Dict[str, Any] = {
             "trust_remote_code": trust_remote_code,
+            "low_cpu_mem_usage": True,
         }
         if device == "cuda":
             model_kwargs["torch_dtype"] = torch.float16
@@ -256,6 +721,11 @@ def _get_local_llm_backend() -> Optional[Dict[str, Any]]:
             model = model.to(device)
         model.eval()
     except Exception as e:
+        if device == "cuda" and _is_cuda_oom_error(e) and _should_fallback_local_llm_to_cpu_on_oom():
+            print("Local LLM initialization hit CUDA OOM; retrying on CPU.")
+            LOCAL_LLM_DEVICE_OVERRIDE = "cpu"
+            _clear_cuda_cache()
+            return _get_local_llm_backend(force_device="cpu")
         print(f"Local LLM initialization error: {e}")
         LOCAL_LLM_DISABLED = True
         return None
@@ -265,13 +735,22 @@ def _get_local_llm_backend() -> Optional[Dict[str, Any]]:
         "model": model,
         "device": device,
         "path": str(model_path),
+        "cache_key": cache_key,
     }
     _LOCAL_LLM_CACHE[cache_key] = backend
     return backend
 
 
-def _generate_json_with_local_llm(system_prompt: str, user_text: str, max_new_tokens: int = 512) -> Optional[Dict[str, Any]]:
+def _generate_json_with_local_llm(
+    system_prompt: str,
+    user_text: str,
+    max_new_tokens: int = 512,
+    *,
+    allow_cpu_retry: bool = True,
+) -> Optional[Dict[str, Any]]:
     """Generate a JSON response from a local causal LM."""
+    global LOCAL_LLM_DEVICE_OVERRIDE
+
     backend = _get_local_llm_backend()
     if backend is None or torch is None:
         return None
@@ -279,6 +758,7 @@ def _generate_json_with_local_llm(system_prompt: str, user_text: str, max_new_to
     tokenizer = backend["tokenizer"]
     model = backend["model"]
     device = backend["device"]
+    cache_key = backend.get("cache_key")
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_text},
@@ -299,7 +779,7 @@ def _generate_json_with_local_llm(system_prompt: str, user_text: str, max_new_to
         if device == "cuda":
             inputs = {key: value.to(device) for key, value in inputs.items()}
 
-        with torch.no_grad():
+        with torch.inference_mode():
             outputs = model.generate(
                 **inputs,
                 max_new_tokens=int(max_new_tokens),
@@ -313,29 +793,183 @@ def _generate_json_with_local_llm(system_prompt: str, user_text: str, max_new_to
         generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
         return _extract_json_object(generated_text)
     except Exception as e:
+        if device == "cuda" and _is_cuda_oom_error(e):
+            _clear_cuda_cache()
+            if allow_cpu_retry and _should_fallback_local_llm_to_cpu_on_oom():
+                print("Local LLM parsing hit CUDA OOM; switching to CPU fallback.")
+                LOCAL_LLM_DEVICE_OVERRIDE = "cpu"
+                _evict_local_llm_backend(cache_key)
+                return _generate_json_with_local_llm(
+                    system_prompt,
+                    user_text,
+                    max_new_tokens=max_new_tokens,
+                    allow_cpu_retry=False,
+                )
+            _evict_local_llm_backend(cache_key)
+            LOCAL_LLM_DEVICE_OVERRIDE = "cpu"
+            print("Local LLM parsing skipped after CUDA OOM; using heuristic fallback.")
+            return None
         print(f"Local LLM parsing error: {e}")
         return None
+    finally:
+        if device == "cuda":
+            _clear_cuda_cache()
 
 
-def _generate_json_with_openai(system_prompt: str, user_text: str, max_tokens: int = 500) -> Optional[Dict[str, Any]]:
-    """Generate a JSON response from OpenAI."""
-    client = _get_openai_client()
+def _coerce_hf_message_content_to_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content.strip()
+
+    if isinstance(content, list):
+        fragments: List[str] = []
+        for item in content:
+            if isinstance(item, str):
+                if item.strip():
+                    fragments.append(item.strip())
+                continue
+            if isinstance(item, dict):
+                text = item.get("text") or item.get("content") or item.get("value")
+                if text:
+                    fragments.append(str(text).strip())
+                continue
+            text = getattr(item, "text", None) or getattr(item, "content", None)
+            if text:
+                fragments.append(str(text).strip())
+        return "\n".join(fragment for fragment in fragments if fragment).strip()
+
+    return str(content or "").strip()
+
+
+def _extract_hf_generation_text(response: Any) -> str:
+    if isinstance(response, str):
+        return response.strip()
+
+    generated_text = getattr(response, "generated_text", None)
+    if generated_text:
+        return str(generated_text).strip()
+
+    return str(response or "").strip()
+
+
+def _build_hf_generation_prompt(system_prompt: str, user_text: str) -> str:
+    return (
+        f"{system_prompt}\n\n"
+        "请直接返回一个 JSON 对象，不要输出解释、思考过程、Markdown 代码块或额外文本。\n"
+        "如果你是 Qwen 系列模型，请使用 no-think 模式。\n\n"
+        f"用户输入：\n{user_text}\n\n"
+        "/no_think\n"
+        "JSON:\n"
+    )
+
+
+def _generate_json_with_hf_api(system_prompt: str, user_text: str, max_tokens: int = 500) -> Optional[Dict[str, Any]]:
+    """Generate a JSON response from Hugging Face Inference API."""
+    global HF_LLM_DISABLED
+
+    client = _get_hf_llm_client()
     if client is None:
         return None
 
+    model = _get_hf_llm_model()
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                f"{system_prompt}\n\n"
+                "你必须只返回一个 JSON 对象，不要输出解释、代码块或额外文本。"
+            ),
+        },
+        {
+            "role": "user",
+            "content": f"/no_think\n{user_text}",
+        },
+    ]
+
+    try:
+        response = client.chat_completion(
+            model=model,
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=0.1,
+            response_format={"type": "json_object"},
+        )
+        text = _coerce_hf_message_content_to_text(response.choices[0].message.content)
+        parsed = _extract_json_object(text)
+        if parsed is not None:
+            return parsed
+    except Exception as exc:
+        if _looks_like_auth_error(exc):
+            HF_LLM_DISABLED = True
+            print(f"HF LLM auth error: {exc}")
+            return None
+        print(f"HF chat completion error: {exc}")
+
+    try:
+        response = client.text_generation(
+            _build_hf_generation_prompt(system_prompt, user_text),
+            model=model,
+            max_new_tokens=int(max_tokens),
+            do_sample=False,
+            return_full_text=False,
+        )
+        return _extract_json_object(_extract_hf_generation_text(response))
+    except Exception as exc:
+        if _looks_like_auth_error(exc):
+            HF_LLM_DISABLED = True
+            print(f"HF LLM auth error: {exc}")
+            return None
+        print(f"HF text generation error: {exc}")
+        return None
+
+
+def _generate_json_with_openai(
+    system_prompt: str,
+    user_text: str,
+    max_tokens: int = 500,
+    timeout_override: Optional[float] = None,
+) -> Optional[Dict[str, Any]]:
+    """Generate a JSON response from OpenAI."""
+    client = (
+        _get_openai_client(timeout_override=timeout_override)
+        if timeout_override is not None
+        else _get_openai_client()
+    )
+    if client is None:
+        return None
+
+    model = _get_first_env_value("LLM_PARSER_OPENAI_MODEL", "DASHSCOPE_LLM_MODEL") or "gpt-4o-mini"
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                f"{system_prompt}\n\n"
+                "你必须只返回一个 JSON 对象，不要输出解释、代码块、思考过程或额外文本。"
+            ),
+        },
+        {"role": "user", "content": user_text},
+    ]
+
     try:
         response = client.chat.completions.create(
-            model=os.environ.get("LLM_PARSER_OPENAI_MODEL", "gpt-4o-mini"),
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_text},
-            ],
+            model=model,
+            messages=messages,
             response_format={"type": "json_object"},
-            temperature=0.3,
+            temperature=0,
             max_tokens=max_tokens,
         )
         return _extract_json_object(response.choices[0].message.content)
     except Exception as e:
+        if any(token in str(e).lower() for token in ["response_format", "json_object", "unsupported", "not support"]):
+            try:
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    temperature=0,
+                    max_tokens=max_tokens,
+                )
+                return _extract_json_object(response.choices[0].message.content)
+            except Exception as retry_exc:
+                e = retry_exc
         if any(token in str(e).lower() for token in ["401", "unauthorized", "invalid api key", "incorrect api key"]):
             global LLM_FALLBACK_DISABLED
             LLM_FALLBACK_DISABLED = True
@@ -347,6 +981,7 @@ def _generate_json_with_configured_llm(
     system_prompt: str,
     user_text: str,
     max_tokens: int,
+    timeout_override: Optional[float] = None,
 ) -> Optional[Dict[str, Any]]:
     """Generate a JSON response using the configured parser backend."""
     provider = _get_llm_parser_provider()
@@ -362,8 +997,18 @@ def _generate_json_with_configured_llm(
         if local_result is not None or provider == "local":
             return local_result
 
+    if provider in {"hf_api", "auto"}:
+        hf_result = _generate_json_with_hf_api(system_prompt, user_text, max_tokens=max_tokens)
+        if hf_result is not None or provider == "hf_api":
+            return hf_result
+
     if provider in {"openai", "auto"}:
-        return _generate_json_with_openai(system_prompt, user_text, max_tokens=max_tokens)
+        return _generate_json_with_openai(
+            system_prompt,
+            user_text,
+            max_tokens=max_tokens,
+            timeout_override=timeout_override,
+        )
 
     return None
 
@@ -389,6 +1034,9 @@ def parse_intent_with_llm(text: str, known_topics: Optional[List[str]] = None) -
 
     system_prompt = """你是一个学术画像解析助手。你的任务是解析用户对学术兴趣方向的描述，提取结构化信息。
 请特别注意否定、纠正、转折和语气词。
+只要用户表达“不感兴趣 / 不需要 / 去掉 / 移除 / 降低 / 别推 / 不想看”，就优先理解为负向调整，而不是正向兴趣。
+不要因为用户提到了一个主题，就默认他对这个主题感兴趣。
+像“GUI Agent”“Cold Start”“protein language model”这种短语必须保持为完整主题，不要拆成多个词。
 
 示例：
 - “我对 GUI Agent 不感兴趣” -> action=adjust_interest, direction=decrease, topics=["GUI Agent"]
@@ -415,12 +1063,16 @@ def parse_intent_with_llm(text: str, known_topics: Optional[List[str]] = None) -
     result = _generate_json_with_configured_llm(
         system_prompt=system_prompt,
         user_text=text,
-        max_tokens=500,
+        max_tokens=200,
     )
     if not isinstance(result, dict):
         return None
 
     if result.get("confidence", 0) < 0.5:
+        return None
+
+    valid_actions = {"adjust_interest", "adjust_weight", "add_must_read", "remove_must_read", "unknown"}
+    if result.get("action") not in valid_actions:
         return None
 
     if isinstance(result.get("topics"), list):
@@ -442,62 +1094,95 @@ def parse_research_directions(text: str, auto_learn: bool = True) -> List[Dict[s
     """
     # 加载已知方向列表
     from config.direction_lexicon import load_lexicon
+
     lexicon = load_lexicon()
-    known_directions = list(DIRECTION_CN_MAP.values()) + [
-        data.get("name_cn", "") for data in lexicon.values()
+    alias_map = _build_direction_alias_map(lexicon)
+    heuristic_candidates = _normalize_direction_results(
+        _extract_direction_candidates_fast(text, alias_map),
+        alias_map,
+    )
+
+    if heuristic_candidates and (
+        _looks_like_explicit_direction_description(text) or len(heuristic_candidates) >= 2
+    ):
+        return [
+            {key: value for key, value in direction.items() if not key.startswith("_")}
+            for direction in heuristic_candidates
+        ]
+
+    known_directions = [
+        _DIRECTION_DISPLAY_MAP.get(direction_key, direction_key.replace("-", " ").title())
+        for direction_key in KNOWN_DIRECTIONS
+    ] + [
+        str(data.get("name_cn") or data.get("name") or "").strip()
+        for data in lexicon.values()
+        if str(data.get("name_cn") or data.get("name") or "").strip()
     ]
 
-    system_prompt = f"""你是一个研究方向识别助手。从用户输入中识别他们感兴趣的研究方向。
+    candidate_hint = ""
+    if heuristic_candidates:
+        candidate_hint = "Fast candidate phrases: " + ", ".join(
+            direction.get("source_text") or direction.get("name_cn") or direction.get("name")
+            for direction in heuristic_candidates
+        )
 
-已知研究方向包括：{", ".join(known_directions)}
-
-返回 JSON 格式：
-{{
-    "directions": [
-        {{
-            "name": "方向名称（英文，使用连字符格式，如 multimodal-reasoning）",
-            "name_cn": "中文名称",
-            "confidence": 0.0-1.0,
-            "source_text": "原文中提到的部分",
-            "is_known": true/false (是否在已知列表中)
-        }}
-    ]
-}}
-
-如果是中文方向名，请翻译成英文。如果方向不在已知列表中，也请提取，用拼音或翻译表示。"""
+    system_prompt = (
+        "You extract up to 3 research directions from a user's self-description.\n"
+        "Keep multi-word phrases intact and prefer specific topics over broad umbrellas.\n"
+        "Do not split phrases like 'protein language model' or 'world model for epidemiology'.\n"
+        f"Known directions include: {', '.join(known_directions[:40])}.\n"
+        f"{candidate_hint}\n"
+        "Return JSON only in this format:\n"
+        "{\n"
+        '  "directions": [\n'
+        "    {\n"
+        '      "name": "english-kebab-case-or-best-normalized-name",\n'
+        '      "name_cn": "Chinese display name",\n'
+        '      "confidence": 0.0,\n'
+        '      "source_text": "matched phrase from the user text",\n'
+        '      "is_known": true\n'
+        "    }\n"
+        "  ]\n"
+        "}\n"
+        "If the user names a new direction, still extract it.\n"
+        "Return at most 3 directions."
+    )
 
     result = _generate_json_with_configured_llm(
         system_prompt=system_prompt,
         user_text=text,
-        max_tokens=800,
+        max_tokens=160,
+        timeout_override=_get_direction_parser_timeout(),
     )
-    if not isinstance(result, dict):
-        return []
+    llm_directions = _normalize_direction_results(result.get("directions", []), alias_map) if isinstance(result, dict) else []
 
-    directions = result.get("directions", [])
-    if not isinstance(directions, list):
-        return []
+    final_directions: List[Dict[str, Any]] = []
+    seen_names: set[str] = set()
+    for bucket in (llm_directions, heuristic_candidates):
+        for direction in bucket:
+            name = str(direction.get("name") or "").strip()
+            if not name or name in seen_names:
+                continue
+            seen_names.add(name)
+            final_directions.append(direction)
+            if len(final_directions) >= 3:
+                break
+        if len(final_directions) >= 3:
+            break
 
-    # 标准化方向名称
-    new_directions = []
-    normalized_directions: List[Dict[str, Any]] = []
-    for direction in directions:
-        if not isinstance(direction, dict):
-            continue
-        name = str(direction.get("name", "")).strip().lower().replace(" ", "-").replace("_", "-")
-        if not name:
-            continue
-        direction["name"] = name
-        normalized_directions.append(direction)
-        if not direction.get("is_known", True):
-            new_directions.append(direction)
+    if not final_directions:
+        return []
 
     # 自动学习新方向
-    if auto_learn and new_directions:
+    if auto_learn:
+        new_directions = [direction for direction in final_directions if direction.get("_auto_learn")]
         for direction in new_directions:
             _learn_new_direction(direction, text)
 
-    return normalized_directions
+    return [
+        {key: value for key, value in direction.items() if not key.startswith("_")}
+        for direction in final_directions
+    ]
 
 
 def _truncate_prompt_text(text: Any, max_chars: int) -> str:
@@ -596,6 +1281,7 @@ def synthesize_reading_report_with_llm(
         system_prompt=system_prompt,
         user_text=user_text,
         max_tokens=900,
+        timeout_override=_get_reading_report_timeout(),
     )
     if not isinstance(result, dict):
         return None

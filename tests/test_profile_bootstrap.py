@@ -372,7 +372,7 @@ def test_handle_profile_update_decreases_language_family_topics_together(test_db
     assert updated_profile["core_directions"]["nlp"] == 0.20
     assert updated_profile["topic_weights"]["nlp"] == 0.20
     assert updated_profile["core_directions"]["vision"] == 0.70
-    assert len(updated_profile["interest_vector"]) == 768
+    assert len(updated_profile["interest_vector"]) == 1024
 
 
 def test_handle_profile_update_uses_llm_topic_without_broadening_scope(test_db_path, monkeypatch):
@@ -531,6 +531,23 @@ def test_detect_intent_routes_plain_institution_and_keyword_additions_to_must_re
     assert keyword_intent["slots"]["command"] == "添加关键词：GUI Agent"
 
 
+def test_detect_intent_routes_plain_institution_removal_to_must_read():
+    coordinator = master_coordinator.MasterCoordinator(user_id="user_rolea")
+
+    intent = coordinator.detect_intent("去掉机构上海ai lab")
+
+    assert intent["intent"] == "must_read"
+    assert intent["slots"]["command"] == "去掉机构上海ai lab"
+
+
+def test_detect_intent_routes_academic_profile_to_show_profile():
+    coordinator = master_coordinator.MasterCoordinator(user_id="user_rolea")
+
+    intent = coordinator.detect_intent("学术画像")
+
+    assert intent["intent"] == "show_profile"
+
+
 def test_detect_intent_does_not_treat_general_research_text_as_cold_start_when_profile_exists(monkeypatch):
     coordinator = master_coordinator.MasterCoordinator(user_id="user_rolea")
     coordinator.profile = {
@@ -656,3 +673,41 @@ def test_reading_agent_reports_when_no_valid_papers_found(monkeypatch):
     assert docs == []
     assert messages
     assert "没有找到可生成精读的论文" in messages[0]["text"]
+
+
+def test_handle_reading_report_prefers_latest_selected_papers(monkeypatch):
+    captured = {}
+
+    class FakeReadingAgent:
+        @staticmethod
+        def create_reading_report(**kwargs):
+            captured.update(kwargs)
+            return [{"url": "https://example.feishu.cn/docx/selected"}]
+
+    real_import = importlib.import_module
+
+    def fake_import(name):
+        if name == "agents.reading-agent.main":
+            return FakeReadingAgent()
+        return real_import(name)
+
+    monkeypatch.setattr(
+        master_coordinator,
+        "get_latest_selected_papers",
+        lambda user_id: {
+            "push_id": "push_selected_1",
+            "papers": [
+                {"id": 91, "title": "Selected A", "authors": ["A"], "abstract": "A"},
+                {"id": 75, "title": "Selected B", "authors": ["B"], "abstract": "B"},
+            ],
+        },
+    )
+    monkeypatch.setattr(master_coordinator, "get_latest_push", lambda user_id: None)
+    monkeypatch.setattr(master_coordinator.importlib, "import_module", fake_import)
+
+    coordinator = master_coordinator.MasterCoordinator(user_id="user_rolea")
+    result = coordinator.handle_reading_report()
+
+    assert result["success"] is True
+    assert captured["paper_ids"] == [1, 2]
+    assert [paper["id"] for paper in captured["papers"]] == [91, 75]

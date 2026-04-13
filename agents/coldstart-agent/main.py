@@ -324,7 +324,7 @@ def _empty_parsed_profile_fragment() -> Dict[str, Any]:
     }
 
 
-def parse_natural_language(text: str) -> Dict[str, Any]:
+def parse_natural_language(text: str, use_llm: bool = True) -> Dict[str, Any]:
     """Parse a natural-language self-description into a bootstrap profile fragment."""
     normalized_text = re.sub(r"\s+", " ", (text or "").strip()).lower()
     if normalized_text in COLD_START_COMMAND_HINTS:
@@ -353,8 +353,10 @@ def parse_natural_language(text: str) -> Dict[str, Any]:
             core_directions[direction] = weight
             topic_weights[direction] = weight
 
-    # 规则匹配完成后，使用 LLM 检测新的方向（规则未覆盖的）
-    llm_directions = _parse_directions_with_llm(text)
+    # 先走轻量规则；只有规则没有命中时才回退到 LLM，避免启动时加载本地大模型。
+    llm_directions: List[Dict[str, Any]] = []
+    if use_llm and not core_directions:
+        llm_directions = _parse_directions_with_llm(text)
     for direction in llm_directions:
         name = direction.get("name", "")
         confidence = direction.get("confidence", 0.5)
@@ -454,11 +456,16 @@ def _parse_directions_with_llm(text: str) -> List[Dict[str, Any]]:
 
 def generate_interest_vector(core_directions: Dict[str, float]) -> List[float]:
     """Generate a deterministic pseudo-vector from the detected directions."""
+    try:
+        target_dim = max(1, int(str(os.environ.get("EMBEDDING_DIMENSIONS", "768")).strip()))
+    except ValueError:
+        target_dim = 768
+
     direction_str = "_".join(sorted(core_directions.keys()))
     hash_bytes = hashlib.sha256(direction_str.encode()).digest()
     vector = []
 
-    for index in range(768):
+    for index in range(target_dim):
         byte_index = index % 32
         sign = 1 if (hash_bytes[byte_index] & (1 << (index % 8))) else -1
         value = sign * ((hash_bytes[byte_index] >> (index % 8)) & 1)

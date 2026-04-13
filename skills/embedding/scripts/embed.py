@@ -4,6 +4,8 @@ Embedding service used by ranking and profile updates.
 
 Supported providers:
 - openai: real API embeddings, optionally down-projected to the configured size
+- dashscope: Alibaba Cloud Bailian (Qwen) embeddings via OpenAI-compatible API
+- nscale_api: call Nscale's native /v1/embeddings endpoint
 - local / sentence-transformers: free local model embeddings when installed
 - hash: deterministic fallback with no external dependency
 """
@@ -14,6 +16,8 @@ import os
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+import requests
 
 try:
     from dotenv import load_dotenv
@@ -67,6 +71,54 @@ def _is_placeholder_openai_key(api_key: Optional[str]) -> bool:
     )
 
 
+def _get_first_env_value(*names: str) -> str:
+    for name in names:
+        value = (os.environ.get(name) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _should_prefer_dashscope_credentials(provider_hint: Optional[str] = None) -> bool:
+    hint = str(provider_hint or "").strip().lower()
+    if hint in {"dashscope", "aliyun", "bailian"}:
+        return True
+
+    base_url = _get_first_env_value("OPENAI_BASE_URL", "DASHSCOPE_BASE_URL").lower()
+    return "dashscope.aliyuncs.com" in base_url
+
+
+def _get_openai_api_key(provider_hint: Optional[str] = None) -> str:
+    if _should_prefer_dashscope_credentials(provider_hint):
+        return _get_first_env_value("DASHSCOPE_API_KEY", "OPENAI_API_KEY")
+    return _get_first_env_value("OPENAI_API_KEY", "DASHSCOPE_API_KEY")
+
+
+def _get_openai_base_url(provider_hint: Optional[str] = None) -> Optional[str]:
+    if _should_prefer_dashscope_credentials(provider_hint):
+        base_url = _get_first_env_value("DASHSCOPE_BASE_URL", "OPENAI_BASE_URL")
+    else:
+        base_url = _get_first_env_value("OPENAI_BASE_URL", "DASHSCOPE_BASE_URL")
+    return base_url or None
+
+
+def _get_openai_timeout(provider_hint: Optional[str] = None) -> float:
+    if _should_prefer_dashscope_credentials(provider_hint):
+        raw_timeout = _get_first_env_value("DASHSCOPE_API_TIMEOUT", "OPENAI_API_TIMEOUT") or "60"
+    else:
+        raw_timeout = _get_first_env_value("OPENAI_API_TIMEOUT", "DASHSCOPE_API_TIMEOUT") or "60"
+    try:
+        return float(raw_timeout)
+    except ValueError:
+        return 60.0
+
+
+def _get_openai_embedding_model(provider_hint: Optional[str] = None) -> str:
+    if _should_prefer_dashscope_credentials(provider_hint):
+        return _get_first_env_value("DASHSCOPE_EMBEDDING_MODEL", "EMBEDDING_MODEL") or "text-embedding-3-small"
+    return _get_first_env_value("EMBEDDING_MODEL", "DASHSCOPE_EMBEDDING_MODEL") or "text-embedding-3-small"
+
+
 def _is_placeholder_hf_token(api_key: Optional[str]) -> bool:
     normalized = str(api_key or "").strip().lower()
     if not normalized:
@@ -76,6 +128,46 @@ def _is_placeholder_hf_token(api_key: Optional[str]) -> bool:
         or normalized.endswith("-here")
         or normalized == "hf_xxxxxxxxxxxxxxxxxxxx"
     )
+
+
+def _is_placeholder_nscale_key(api_key: Optional[str]) -> bool:
+    normalized = str(api_key or "").strip().lower()
+    if not normalized:
+        return True
+    return (
+        "your_nscale" in normalized
+        or normalized.endswith("-here")
+        or "service_token" in normalized
+        or "api_key" in normalized
+    )
+
+
+def _looks_like_hf_user_token(api_key: Optional[str]) -> bool:
+    return str(api_key or "").strip().lower().startswith("hf_")
+
+
+def _looks_like_auth_error(exc: Exception) -> bool:
+    message = str(exc or "").lower()
+    return any(
+        token in message
+        for token in (
+            "401",
+            "unauthorized",
+            "invalid api key",
+            "incorrect api key",
+            "invalid_request_error",
+            "authentication",
+            "forbidden",
+        )
+    )
+
+
+def _resolve_hf_provider(primary_env_name: str, fallback_env_name: str = "HF_INFERENCE_PROVIDER") -> str:
+    primary = (os.environ.get(primary_env_name) or "").strip()
+    if primary:
+        return primary
+    fallback = (os.environ.get(fallback_env_name) or "").strip()
+    return fallback or "auto"
 
 
 def build_paper_text(paper: Dict[str, Any]) -> str:
@@ -155,12 +247,41 @@ class EmbeddingService:
         self.local_model = None
         self.model_source = None
 
-        if requested_provider == "openai":
+        if requested_provider in {"openai", "dashscope", "aliyun", "bailian"}:
             self.provider = "openai"
-            self.model = model or os.environ.get("EMBEDDING_MODEL") or "text-embedding-3-small"
-            api_key = os.environ.get("OPENAI_API_KEY", "")
+            provider_hint = requested_provider
+            self.model = model or _get_openai_embedding_model(provider_hint)
+            api_key = _get_openai_api_key(provider_hint)
             if OPENAI_AVAILABLE and not _is_placeholder_openai_key(api_key):
-                self.client = OpenAI(api_key=api_key)
+                self.client = OpenAI(
+                    api_key=api_key,
+                    base_url=_get_openai_base_url(provider_hint),
+                    timeout=_get_openai_timeout(provider_hint),
+                )
+            else:
+                self.provider = "hash"
+                self.model = "hash"
+        elif requested_provider in {"nscale_api", "nscale"}:
+            self.provider = "nscale_api"
+            self.model = model or os.environ.get("NSCALE_EMBEDDING_MODEL") or os.environ.get("HF_EMBEDDING_MODEL") or "Qwen3-Embedding-8B"
+            api_key = (
+                os.environ.get("NSCALE_API_KEY")
+                or os.environ.get("NSCALE_SERVICE_TOKEN")
+                or ""
+            )
+            if _is_placeholder_nscale_key(api_key):
+                api_key = ""
+            base_url = (
+                os.environ.get("NSCALE_BASE_URL")
+                or "https://aiproxy.infaas-amd-dev.glo1.nscale.com"
+            ).strip().rstrip("/")
+            timeout = float(os.environ.get("NSCALE_API_TIMEOUT", os.environ.get("HF_API_TIMEOUT", "60")))
+            if api_key:
+                self.client = {
+                    "api_key": api_key,
+                    "base_url": base_url,
+                    "timeout": timeout,
+                }
             else:
                 self.provider = "hash"
                 self.model = "hash"
@@ -172,9 +293,17 @@ class EmbeddingService:
                 api_key = ""
             if not api_key and HUGGINGFACE_HUB_AVAILABLE and get_token is not None:
                 api_key = get_token() or ""
-            provider_name = (os.environ.get("HF_INFERENCE_PROVIDER") or "auto").strip() or "auto"
+            provider_name = _resolve_hf_provider("HF_EMBEDDING_PROVIDER")
             timeout = float(os.environ.get("HF_API_TIMEOUT", "60"))
-            if HUGGINGFACE_HUB_AVAILABLE and not _is_placeholder_hf_token(api_key):
+            if provider_name == "auto" and api_key and not _looks_like_hf_user_token(api_key):
+                print(
+                    "Embedding provider fallback: HF_EMBEDDING_PROVIDER/HF_INFERENCE_PROVIDER is auto, "
+                    "but the configured key is not a Hugging Face hf_ token. "
+                    "Set HF_EMBEDDING_PROVIDER explicitly or use a Hugging Face token."
+                )
+                self.provider = "hash"
+                self.model = "hash"
+            elif HUGGINGFACE_HUB_AVAILABLE and not _is_placeholder_hf_token(api_key):
                 self.client = InferenceClient(
                     model=self.model,
                     provider=provider_name,
@@ -278,6 +407,35 @@ class EmbeddingService:
         response = self.client.feature_extraction(text, model=self.model)
         return _flatten_embedding_payload(response)
 
+    def _get_nscale_api_embedding(self, text: str) -> List[float]:
+        if not isinstance(self.client, dict):
+            raise RuntimeError("Nscale client is not configured")
+
+        response = requests.post(
+            f"{self.client['base_url']}/v1/embeddings",
+            headers={
+                "Authorization": f"Bearer {self.client['api_key']}",
+                "Content-Type": "application/json; charset=utf-8",
+            },
+            json={
+                "model": self.model,
+                "input": text,
+                "encoding_format": "float",
+                "dimensions": None,
+                "user": None,
+            },
+            timeout=float(self.client["timeout"]),
+        )
+        response.raise_for_status()
+        payload = response.json()
+        data = payload.get("data") or []
+        if not data or not isinstance(data, list):
+            raise RuntimeError(f"Unexpected Nscale embeddings payload: {payload}")
+        embedding = data[0].get("embedding")
+        if not isinstance(embedding, list):
+            raise RuntimeError(f"Unexpected Nscale embedding item: {data[0]}")
+        return [float(value) for value in embedding]
+
     def _get_local_embedding(self, text: str) -> List[float]:
         vector = self.local_model.encode(text, normalize_embeddings=True)
         return vector.tolist() if hasattr(vector, "tolist") else list(vector)
@@ -308,6 +466,8 @@ class EmbeddingService:
         try:
             if self.provider == "openai" and self.client is not None:
                 embedding = self._get_openai_embedding(normalized_text)
+            elif self.provider == "nscale_api" and self.client is not None:
+                embedding = self._get_nscale_api_embedding(normalized_text)
             elif self.provider == "hf_api" and self.client is not None:
                 embedding = self._get_hf_api_embedding(normalized_text)
             elif self.provider == "local" and self.local_model is not None:
@@ -354,6 +514,13 @@ class EmbeddingService:
                         self._save_cached(normalized_texts[index], embedding)
             except Exception as exc:
                 print(f"Batch embedding error ({self.provider}:{self.model}): {exc}")
+                if _looks_like_auth_error(exc):
+                    print(
+                        "Embedding auth failed. Check OPENAI_API_KEY / DASHSCOPE_API_KEY "
+                        "and verify the key is valid for the configured DashScope endpoint."
+                    )
+                self.provider = "hash"
+                self.model = "hash"
                 for index in missing_indices:
                     results[index] = self._get_hash_embedding(normalized_texts[index])
 

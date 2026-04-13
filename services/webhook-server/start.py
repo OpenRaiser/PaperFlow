@@ -35,6 +35,11 @@ REQUIRED_ENV_VARS = (
 )
 
 
+def bootstrap_runtime() -> None:
+    runtime_bootstrap = importlib.import_module("scripts.runtime_bootstrap")
+    runtime_bootstrap.bootstrap_runtime(verbose=True)
+
+
 def verify_env() -> int:
     missing = [name for name in REQUIRED_ENV_VARS if not os.environ.get(name)]
     if missing:
@@ -60,14 +65,18 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    bootstrap_runtime()
+
     if args.verify:
         return verify_env()
 
     webhook_server = importlib.import_module("services.webhook-server.scripts.webhook_server")
+    scheduler = importlib.import_module("services.webhook-server.scripts.scheduler")
 
     print(f"[INFO] Starting Feishu webhook server on port {args.port}...")
     print(f"[INFO] Event endpoint: http://127.0.0.1:{args.port}/")
     print(f"[INFO] Health check: http://127.0.0.1:{args.port}/health")
+    print(f"[INFO] Automatic schedule: {scheduler.describe_schedule()}")
     print("[INFO] Press Ctrl+C to stop")
 
     webhook_server.run_server(args.port)

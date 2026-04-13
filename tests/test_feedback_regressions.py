@@ -204,6 +204,42 @@ def test_process_feedback_triggers_reading_report_generation_for_selected_papers
     assert captured["report_kwargs"]["use_chat_id"] is True
 
 
+def test_create_reading_reports_for_selection_passes_actual_paper_ids():
+    captured = {}
+
+    class FakeReadingAgent:
+        @staticmethod
+        def create_reading_report(**kwargs):
+            captured.update(kwargs)
+            return []
+
+    original_import = feedback_agent.importlib.import_module
+
+    def fake_import(name):
+        if name == "agents.reading-agent.main":
+            return FakeReadingAgent()
+        return original_import(name)
+
+    feedback_agent.importlib.import_module = fake_import
+    try:
+        feedback_agent.create_reading_reports_for_selection(
+            user_id="user_rolea",
+            selected={1, 3},
+            papers=[
+                {"id": 81, "title": "Paper 81"},
+                {"id": 83, "title": "Paper 83"},
+                {"id": 82, "title": "Paper 82"},
+            ],
+            target_id="oc_test_chat",
+            use_chat_id=True,
+            send_to_feishu=True,
+        )
+    finally:
+        feedback_agent.importlib.import_module = original_import
+
+    assert captured["paper_ids"] == [81, 82]
+
+
 def test_process_feedback_skips_reading_report_generation_when_feishu_send_disabled(
     test_db_path,
     sample_profile,

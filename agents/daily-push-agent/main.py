@@ -9,6 +9,7 @@ import sys
 import os
 import math
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import List, Dict
 from dataclasses import dataclass
 from collections import defaultdict
@@ -64,6 +65,7 @@ except ImportError:
 # 配置文件路径
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "config")
 ROLE_META_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "data", "roles.json")
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def load_yaml_config(filename: str) -> Dict:
@@ -336,8 +338,8 @@ def compute_relevance_signal(paper: Dict, profile: Dict) -> float:
     interest_sim = max(
         0.0,
         cosine_similarity(
-            paper.get("embedding", [0] * 768),
-            profile.get("interest_vector", [0] * 768),
+            paper.get("embedding", []),
+            profile.get("interest_vector", []),
         ),
     )
 
@@ -473,6 +475,7 @@ def prepare_paper_features(papers: List[Dict]) -> List[Dict]:
     embedding_texts = [build_paper_text(paper) for paper in papers]
     embeddings = embed_batch(embedding_texts)
     embedding_service = get_embedding_service()
+    print(f"Embedding descriptor: {embedding_service.descriptor}")
 
     for paper, embedding in zip(papers, embeddings):
         paper["embedding"] = embedding
@@ -759,8 +762,38 @@ def sort_and_categorize(
     # 按排名重新分类，确保每类都有论文
     result = categorize_papers_by_rank(result, profile, weights)
     result = apply_source_diversity_quota(result, weights)
+    result = apply_push_count_limit(result, weights)
 
     return result
+
+
+def apply_push_count_limit(scored_papers: List[PaperWithScore], weights: Dict) -> List[PaperWithScore]:
+    """Keep daily push volume manageable for chat delivery and user reading load."""
+    if not scored_papers:
+        return scored_papers
+
+    target_count = max(1, int(weights.get("push_target_count", 50)))
+    max_count = max(target_count, int(weights.get("push_max_count", target_count)))
+
+    if len(scored_papers) <= target_count:
+        return scored_papers
+
+    must_read = [paper for paper in scored_papers if paper.category == "must_read"]
+    non_must_read = [paper for paper in scored_papers if paper.category != "must_read"]
+
+    limited: List[PaperWithScore] = must_read[:max_count]
+    remaining_slots = max(0, target_count - len(limited))
+    if remaining_slots > 0:
+        limited.extend(non_must_read[:remaining_slots])
+
+    if len(limited) > max_count:
+        limited = limited[:max_count]
+
+    print(
+        f"Applying push count limit: {len(scored_papers)} -> {len(limited)} "
+        f"(target={target_count}, max={max_count})"
+    )
+    return limited
 
 
 def format_push_card(
@@ -989,8 +1022,18 @@ def daily_push(
     print("Loading user profile...")
     profile = get_profile(user_id)
     if profile is None:
-        print(f"Error: Profile not found for user {user_id}")
-        return
+        print(f"Profile missing for user {user_id}, attempting runtime bootstrap...")
+        try:
+            runtime_bootstrap = importlib.import_module("scripts.runtime_bootstrap")
+            runtime_bootstrap.ensure_role_profiles(Path(PROJECT_ROOT))
+            profile = get_profile(user_id)
+        except Exception as exc:
+            print(f"Runtime bootstrap failed while repairing profile: {exc}")
+
+    if profile is None:
+        message = f"Profile not found for user {user_id}"
+        print(f"Error: {message}")
+        return {"success": False, "message": message}
     print(f"Profile loaded: {profile.get('version', 'unknown')}")
 
     # 2. 加载权重配置
@@ -1072,6 +1115,18 @@ def daily_push(
                         "relevance_signal": p.relevance_signal,
                         "rank": i + 1,
                         "push_context": "daily_push",
+                        # Preserve source links so downstream selected-paper reading
+                        # can still resolve the original landing page / PDF after DB reload.
+                        "url": paper.get("url"),
+                        "paper_url": paper.get("paper_url") or paper.get("url"),
+                        "pdf_url": paper.get("pdf_url"),
+                        "doi_url": paper.get("doi_url"),
+                        "openreview_url": paper.get("openreview_url"),
+                        "source": paper.get("source"),
+                        "journal": paper.get("journal"),
+                        "venue": paper.get("venue") or paper.get("journal"),
+                        "publish_date": paper.get("publish_date"),
+                        "categories": paper.get("categories", []),
                     }
                 )
             except Exception as e:
@@ -1099,7 +1154,9 @@ def daily_push(
                         send_text_to_chat(resolved_chat_id, push_card)
                     else:
                         # 使用默认 user_id
-                        feishu_user_id = os.environ.get("FEISHU_USER_ID", "ou_c4f5d0e9c7185e943cbd4216c9b68de7")
+                        feishu_user_id = os.environ.get("FEISHU_USER_ID", "").strip()
+                        if not feishu_user_id:
+                            raise ValueError("Missing Feishu target. Configure feishu_chat_id in roles.json or FEISHU_USER_ID in .env.")
                         print(f"Sending to Feishu user: {feishu_user_id}")
                         send_daily_push(feishu_user_id, push_card)
                 print("Push sent to Feishu successfully!")
@@ -1124,6 +1181,12 @@ def daily_push(
     print(f"[MAYBE INTERESTED]: {maybe_interested_count}")
     edge_count = len(scored_papers) - must_read_count - high_relevant_count - maybe_interested_count
     print(f"[EDGE RELEVANT]: {edge_count}")
+    return {
+        "success": True,
+        "push_id": push_id,
+        "paper_count": len(scored_papers),
+        "total_fetched": len(papers),
+    }
 
 
 if __name__ == "__main__":

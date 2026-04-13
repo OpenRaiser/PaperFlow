@@ -8,16 +8,43 @@ Implements:
 - Multi-factor scoring
 """
 
+import os
 import numpy as np
 from typing import Dict, List, Any
 from datetime import datetime, timedelta
 import json
 
 
+def _configured_embedding_dimensions() -> int:
+    raw = str(os.environ.get("EMBEDDING_DIMENSIONS", "768")).strip()
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 768
+
+
+def _infer_vector_dimension(*vectors: List[float]) -> int:
+    lengths = [len(vector) for vector in vectors if isinstance(vector, list) and vector]
+    return max(lengths) if lengths else _configured_embedding_dimensions()
+
+
+def _resize_vector(vector: List[float], target_dim: int) -> List[float]:
+    if target_dim <= 0:
+        return []
+
+    values = [float(value) for value in (vector or [])]
+    if len(values) == target_dim:
+        return values
+    if len(values) > target_dim:
+        return values[:target_dim]
+    return values + [0.0] * (target_dim - len(values))
+
+
 def cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
     """Calculate cosine similarity"""
-    v1 = np.array(vec1)
-    v2 = np.array(vec2)
+    target_dim = _infer_vector_dimension(vec1, vec2)
+    v1 = np.array(_resize_vector(vec1, target_dim))
+    v2 = np.array(_resize_vector(vec2, target_dim))
     norm1 = np.linalg.norm(v1)
     norm2 = np.linalg.norm(v2)
     if norm1 == 0 or norm2 == 0:
@@ -44,11 +71,16 @@ def update_interest_vector(
     if not selected_vectors:
         return current_vector
 
+    target_dim = _infer_vector_dimension(current_vector, *selected_vectors)
+    resized_selected = [_resize_vector(vector, target_dim) for vector in selected_vectors if vector]
+    if not resized_selected:
+        return _resize_vector(current_vector, target_dim)
+
     # Calculate average embedding
-    avg_vector = np.mean(selected_vectors, axis=0)
+    avg_vector = np.mean(resized_selected, axis=0)
 
     # EMA update
-    current = np.array(current_vector)
+    current = np.array(_resize_vector(current_vector, target_dim))
     new_vector = (1 - alpha) * current + alpha * avg_vector
 
     # Normalize
@@ -154,8 +186,8 @@ def calculate_paper_score(
 
     # Interest vector similarity
     interest_sim = cosine_similarity(
-        paper.get("embedding", [0] * 768),
-        profile.get("interest_vector", [0] * 768)
+        paper.get("embedding", []),
+        profile.get("interest_vector", [])
     )
 
     # Topic weight match
@@ -320,7 +352,7 @@ def update_profile_with_feedback(
     ]
     if selected_embeddings:
         updated["interest_vector"] = update_interest_vector(
-            profile.get("interest_vector", [0] * 768),
+            profile.get("interest_vector", []),
             selected_embeddings,
             alpha=0.1
         )

@@ -48,21 +48,41 @@ def _deserialize_json_list(value: Any) -> List[Any]:
     return [value]
 
 
-def _build_paper_dict(row: sqlite3.Row, metadata_key: str = "metadata") -> Dict[str, Any]:
+def _load_json_metadata(raw: Any) -> Dict[str, Any]:
+    """Best-effort parse for JSON object metadata fields stored in SQLite."""
+    if isinstance(raw, dict):
+        return raw
+    if not raw:
+        return {}
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _build_paper_dict(
+    row: sqlite3.Row,
+    metadata_key: str = "metadata",
+    extra_metadata_keys: Optional[List[str]] = None,
+) -> Dict[str, Any]:
     """Convert a joined paper row into a normalized dict."""
     paper = dict(row)
     paper["authors"] = _deserialize_json_list(paper.get("authors"))
 
-    metadata_raw = paper.get(metadata_key)
-    metadata = {}
-    if metadata_raw:
-        try:
-            metadata = json.loads(metadata_raw)
-        except (json.JSONDecodeError, TypeError):
-            metadata = {}
+    metadata: Dict[str, Any] = {}
+    for extra_key in extra_metadata_keys or []:
+        metadata.update(_load_json_metadata(paper.get(extra_key)))
+
+    metadata.update(_load_json_metadata(paper.get(metadata_key)))
 
     if metadata_key != "metadata":
         paper.pop(metadata_key, None)
+    for extra_key in extra_metadata_keys or []:
+        if extra_key != "metadata":
+            paper.pop(extra_key, None)
 
     if metadata:
         paper["metadata"] = metadata
@@ -72,6 +92,9 @@ def _build_paper_dict(row: sqlite3.Row, metadata_key: str = "metadata") -> Dict[
             paper["score"] = metadata["score"]
         if "rank" in metadata:
             paper["rank"] = metadata["rank"]
+        for key, value in metadata.items():
+            if key not in paper or paper.get(key) in (None, "", [], {}):
+                paper[key] = value
 
     return paper
 
@@ -693,6 +716,83 @@ def get_latest_push(user_id: str) -> Optional[Dict]:
         "push_id": push_id,
         "push_time": push_time,
         "papers": papers
+    }
+
+
+def get_latest_selected_papers(user_id: str) -> Optional[Dict]:
+    """
+    Get the latest selected-paper batch for a user.
+
+    Returns:
+        Dict with push_id / selection_time / papers, or None when no selection exists.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        SELECT push_id, MAX(timestamp) AS timestamp
+        FROM behavior_logs
+        WHERE user_id = ?
+          AND action = 'selected'
+        GROUP BY push_id
+        ORDER BY timestamp DESC, push_id DESC
+        LIMIT 1
+        """,
+        (user_id,),
+    )
+
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        return None
+
+    push_id = row["push_id"]
+    selection_time = row["timestamp"]
+
+    cursor.execute(
+        """
+        SELECT p.*, bl.id AS behavior_log_id, bl.metadata AS bl_metadata,
+               push_bl.metadata AS push_metadata
+        FROM papers p
+        JOIN behavior_logs bl ON p.id = bl.paper_id
+        LEFT JOIN behavior_logs push_bl
+          ON push_bl.user_id = bl.user_id
+         AND push_bl.push_id = bl.push_id
+         AND push_bl.paper_id = bl.paper_id
+         AND push_bl.action = 'pushed'
+        WHERE bl.user_id = ?
+          AND bl.push_id = ?
+          AND bl.action = 'selected'
+        ORDER BY bl.id ASC
+        """,
+        (user_id, push_id),
+    )
+
+    papers = [
+        _build_paper_dict(
+            row,
+            metadata_key="bl_metadata",
+            extra_metadata_keys=["push_metadata"],
+        )
+        for row in cursor.fetchall()
+    ]
+    papers.sort(
+        key=lambda paper: (
+            paper.get("paper_number", paper.get("rank", 10**9)),
+            paper.get("behavior_log_id", 10**9),
+        )
+    )
+
+    conn.close()
+
+    if not papers:
+        return None
+
+    return {
+        "push_id": push_id,
+        "selection_time": selection_time,
+        "papers": papers,
     }
 
 

@@ -46,6 +46,7 @@ get_profile = db_ops.get_profile
 create_profile = db_ops.create_profile
 update_profile = db_ops.update_profile
 get_latest_push = db_ops.get_latest_push
+get_latest_selected_papers = getattr(db_ops, "get_latest_selected_papers", lambda user_id: None)
 get_recent_pushes = db_ops.get_recent_pushes
 
 # 飞书报告器
@@ -534,7 +535,7 @@ def detect_explicit_command_intent(text: Any) -> Optional[Dict[str, Any]]:
     if lowered in {"必读", "必读清单"}:
         return {"intent": "must_read", "confidence": 1.0, "slots": {"command": cleaned}}
 
-    if lowered in {"画像", "我的画像", "显示画像", "profile"}:
+    if lowered in {"画像", "学术画像", "我的画像", "我的学术画像", "显示画像", "显示学术画像", "profile"}:
         return {"intent": "show_profile", "confidence": 1.0, "slots": {}}
 
     if lowered in {"all red", "all lock", "none", "全部", "没有"}:
@@ -639,6 +640,9 @@ MUST_READ_ACTION_HINTS = (
     "加个",
     "添加",
     "增加",
+    "去掉",
+    "去除",
+    "取消",
     "移除",
     "删除",
     "删掉",
@@ -654,6 +658,15 @@ MUST_READ_TARGET_HINTS = (
     "must read author",
     "must read institution",
     "must read keyword",
+)
+
+MUST_READ_TARGET_TOKENS = (
+    "作者",
+    "机构",
+    "关键词",
+    "author",
+    "institution",
+    "keyword",
 )
 
 COLD_START_BOOTSTRAP_HINTS = (
@@ -688,15 +701,10 @@ def looks_like_must_read_command(text: Any) -> bool:
         return True
 
     has_action = any(hint in lowered for hint in MUST_READ_ACTION_HINTS)
-    has_target = any(token in cleaned for token in ("作者", "机构", "关键词")) or any(
-        token in lowered for token in ("author", "institution", "keyword")
+    has_target = any(token in cleaned for token in MUST_READ_TARGET_TOKENS) or any(
+        token in lowered for token in MUST_READ_TARGET_TOKENS
     )
-    has_command_shape = (
-        ":" in cleaned
-        or "：" in cleaned
-        or lowered.startswith(("加个", "添加", "增加", "移除", "删除", "删掉", "add ", "remove ", "delete "))
-    )
-    if has_action and has_target and (("必读" in cleaned or "must read" in lowered) or has_command_shape):
+    if has_action and has_target:
         return True
 
     return False
@@ -956,11 +964,13 @@ class MasterCoordinator:
 
         try:
             daily_push_agent = importlib.import_module("agents.daily-push-agent.main")
-            daily_push_agent.daily_push(
+            result = daily_push_agent.daily_push(
                 user_id=self.user_id,
                 send_to_feishu=True,
                 feishu_chat_id=self.chat_id
             )
+            if isinstance(result, dict):
+                return result
             return {"success": True, "message": "推送已发送"}
         except Exception as e:
             return {"success": False, "message": str(e)}
@@ -1005,28 +1015,38 @@ class MasterCoordinator:
         """处理精读报告"""
         print(f"Intent: Reading Report - papers: {paper_ids}")
 
-        # 从数据库获取最近的推送记录
-        push_info = get_latest_push(self.user_id)
+        selected_info = None
+        if paper_ids is None:
+            selected_info = get_latest_selected_papers(self.user_id)
 
-        if not push_info:
-            # 如果没有推送记录，使用测试数据
-            print("Warning: No recent push found, using test data")
-            test_papers = [
-                {"id": i+1, "arxiv_id": f"2401.{i:03d}", "title": f"Paper {i+1}",
-                 "authors": ["Author"], "abstract": "Abstract"}
-                for i in range(20)
-            ]
-            papers = test_papers
+        if selected_info and selected_info.get("papers"):
+            print(f"Using latest selected papers from push: {selected_info['push_id']}")
+            papers = selected_info["papers"]
+            paper_ids = list(range(1, len(papers) + 1))
         else:
+            # 从数据库获取最近的推送记录
+            push_info = get_latest_push(self.user_id)
+            if not push_info:
+                target_id = self.chat_id or self.feishu_user_id
+                if target_id:
+                    try:
+                        send_text(
+                            target_id,
+                            "这次没有找到可精读的已选论文。请先“推送”并回复编号，或先完成一次论文选择。",
+                            use_chat_id=bool(self.chat_id),
+                        )
+                    except Exception:
+                        pass
+                return {"success": False, "message": "No selected papers available for reading report"}
+
             print(f"Using papers from push: {push_info['push_id']}")
-            papers = push_info['papers']
+            papers = push_info["papers"]
 
         try:
             reading_agent = importlib.import_module("agents.reading-agent.main")
 
-            # 如果没有指定论文，使用前 3 篇
             if paper_ids is None:
-                paper_ids = [p['id'] for p in papers[:3]]
+                return {"success": False, "message": "No selected papers available for reading report"}
 
             created_docs = reading_agent.create_reading_report(
                 user_id=self.user_id,
@@ -1036,7 +1056,11 @@ class MasterCoordinator:
                 feishu_user_id=self.feishu_user_id,
                 chat_id=self.chat_id
             )
-            return {"success": True, "docs": created_docs}
+            return {
+                "success": bool(created_docs),
+                "docs": created_docs,
+                "message": "Reading reports created" if created_docs else "No reading reports were created",
+            }
         except Exception as e:
             return {"success": False, "message": str(e)}
 

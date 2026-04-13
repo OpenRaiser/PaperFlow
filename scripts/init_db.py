@@ -17,6 +17,7 @@ def ensure_runtime_dirs() -> None:
         "data",
         "data/db_backups",
         "data/embeddings_cache",
+        "data/webhook_task_locks",
         "models",
     ):
         (PROJECT_ROOT / relative).mkdir(parents=True, exist_ok=True)
@@ -39,4 +40,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

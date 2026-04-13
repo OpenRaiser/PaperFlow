@@ -146,3 +146,47 @@ def test_download_file_from_feishu_uses_relative_output_in_target_dir(monkeypatc
         "user",
     ]
     assert captured["args"][captured["args"].index("--output") + 1] == "paper.pdf"
+
+
+def test_create_doc_uses_stdin_markdown(monkeypatch, feishu_reporter):
+    captured = {}
+
+    def fake_run(args, **kwargs):
+        captured["args"] = args
+        captured["input"] = kwargs.get("input")
+        return SimpleNamespace(
+            stdout=json.dumps({"code": 0, "data": {"doc_id": "doc_test", "doc_url": "https://example.feishu.cn/docx/doc_test"}}),
+            stderr="",
+            returncode=0,
+        )
+
+    monkeypatch.setattr(feishu_reporter, "FEISHU_CLI_CMD", "lark-cli")
+    monkeypatch.setattr(feishu_reporter, "DEFAULT_IM_IDENTITY", "user")
+    monkeypatch.setattr(feishu_reporter.subprocess, "run", fake_run)
+
+    result = feishu_reporter.create_doc("Test Doc", "# Heading\n\n- item 1\n- item 2")
+
+    assert result["obj_token"] == "doc_test"
+    assert result["url"] == "https://example.feishu.cn/docx/doc_test"
+    assert captured["args"][captured["args"].index("--markdown") + 1] == "-"
+    assert captured["input"] == "# Heading\n\n- item 1\n- item 2"
+
+
+def test_send_text_records_recent_outbound_chat_message(monkeypatch, feishu_reporter):
+    captured = {}
+
+    def fake_run(args, **kwargs):
+        captured["args"] = args
+        return SimpleNamespace(
+            stdout=json.dumps({"code": 0, "data": {"message_id": "om_text"}}),
+            stderr="",
+            returncode=0,
+        )
+
+    feishu_reporter.RECENT_OUTBOUND_TEXT_MESSAGES.clear()
+    monkeypatch.setattr(feishu_reporter, "FEISHU_CLI_CMD", "lark-cli")
+    monkeypatch.setattr(feishu_reporter.subprocess, "run", fake_run)
+
+    feishu_reporter.send_text("oc_test_chat", "bot echo message", use_chat_id=True)
+
+    assert feishu_reporter.is_recent_outbound_text("chat_id", "oc_test_chat", "bot echo message") is True

@@ -11,6 +11,7 @@ PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 llm_parser = importlib.import_module("agents.master-coordinator.scripts.llm_parser")
+profile_updater = importlib.import_module("skills.profile-updater.scripts.update_profile")
 
 
 def test_get_openai_client_skips_placeholder_key(monkeypatch):
@@ -22,8 +23,71 @@ def test_get_openai_client_skips_placeholder_key(monkeypatch):
     assert client is None
 
 
+def test_get_openai_client_uses_dashscope_env_as_compat_fallback(monkeypatch):
+    captured = {}
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENAI_API_TIMEOUT", raising=False)
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "sk-test-dashscope-key")
+    monkeypatch.setenv("DASHSCOPE_BASE_URL", "https://compat.example.com/v1")
+    monkeypatch.setenv("DASHSCOPE_API_TIMEOUT", "33")
+    monkeypatch.setattr(llm_parser, "LLM_FALLBACK_DISABLED", False)
+    monkeypatch.setattr(llm_parser, "OpenAI", FakeClient)
+
+    client = llm_parser._get_openai_client()
+
+    assert isinstance(client, FakeClient)
+    assert captured["api_key"] == "sk-test-dashscope-key"
+    assert captured["base_url"] == "https://compat.example.com/v1"
+    assert captured["timeout"] == 33.0
+
+
+def test_dashscope_parser_provider_aliases_to_openai(monkeypatch):
+    monkeypatch.setenv("LLM_PARSER_PROVIDER", "dashscope")
+
+    assert llm_parser._get_llm_parser_provider() == "openai"
+
+
+def test_profile_updater_handles_mismatched_interest_vector_dimensions():
+    updated = profile_updater.update_interest_vector(
+        current_vector=[1.0, 0.0],
+        selected_vectors=[[1.0, 0.0, 0.0]],
+        alpha=0.5,
+    )
+
+    assert len(updated) == 3
+
+
+def test_get_hf_llm_client_skips_placeholder_token(monkeypatch):
+    monkeypatch.setenv("HF_TOKEN", "your_hf_token_here")
+    monkeypatch.setenv("HF_API_KEY", "")
+    monkeypatch.setattr(llm_parser, "HF_LLM_DISABLED", False)
+    monkeypatch.setattr(llm_parser, "get_token", lambda: "")
+
+    client = llm_parser._get_hf_llm_client()
+
+    assert client is None
+
+
+def test_get_hf_llm_client_skips_auto_router_for_non_hf_key(monkeypatch):
+    monkeypatch.setenv("HF_TOKEN", "sk-test-provider-key")
+    monkeypatch.setenv("HF_LLM_PROVIDER", "")
+    monkeypatch.setenv("HF_INFERENCE_PROVIDER", "auto")
+    monkeypatch.setattr(llm_parser, "HF_LLM_DISABLED", False)
+
+    client = llm_parser._get_hf_llm_client()
+
+    assert client is None
+
+
 def test_parse_intent_with_llm_disables_after_auth_error(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test-invalid")
+    monkeypatch.setenv("LLM_PARSER_PROVIDER", "openai")
     monkeypatch.setattr(llm_parser, "LLM_FALLBACK_DISABLED", False)
 
     class FakeCompletions:
@@ -41,7 +105,7 @@ def test_parse_intent_with_llm_disables_after_auth_error(monkeypatch):
     fake_client = FakeClient()
     monkeypatch.setattr(llm_parser, "_get_openai_client", lambda: fake_client)
 
-    result = llm_parser.parse_intent_with_llm("降低 GUI Agent 权重")
+    result = llm_parser.parse_intent_with_llm("lower GUI Agent weight")
 
     assert result is None
     assert llm_parser.LLM_FALLBACK_DISABLED is True
@@ -52,7 +116,7 @@ def test_parse_intent_with_llm_uses_local_provider(monkeypatch):
 
     captured = {}
 
-    def fake_local(system_prompt, user_text, max_new_tokens=512):
+    def fake_local(system_prompt, user_text, max_new_tokens=512, **kwargs):
         captured["system_prompt"] = system_prompt
         captured["user_text"] = user_text
         captured["max_new_tokens"] = max_new_tokens
@@ -67,18 +131,22 @@ def test_parse_intent_with_llm_uses_local_provider(monkeypatch):
     monkeypatch.setattr(llm_parser, "_generate_json_with_local_llm", fake_local)
     monkeypatch.setattr(llm_parser, "_generate_json_with_openai", lambda *args, **kwargs: None)
 
-    result = llm_parser.parse_intent_with_llm("我对 GUI Agent 不感兴趣", known_topics=["GUI Agent", "智能体"])
+    result = llm_parser.parse_intent_with_llm(
+        "我对 GUI Agent 不感兴趣",
+        known_topics=["GUI Agent", "智能体"],
+    )
 
     assert result["direction"] == "decrease"
     assert result["topics"] == ["GUI Agent"]
     assert captured["user_text"] == "我对 GUI Agent 不感兴趣"
-    assert "当前用户画像里已经存在的方向/主题有" in captured["system_prompt"]
+    assert "当前用户画像里已经存在的方向" in captured["system_prompt"]
 
 
 def test_parse_intent_with_llm_auto_falls_back_to_openai(monkeypatch):
     monkeypatch.setenv("LLM_PARSER_PROVIDER", "auto")
 
     monkeypatch.setattr(llm_parser, "_generate_json_with_local_llm", lambda *args, **kwargs: None)
+    monkeypatch.setattr(llm_parser, "_generate_json_with_hf_api", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         llm_parser,
         "_generate_json_with_openai",
@@ -95,6 +163,68 @@ def test_parse_intent_with_llm_auto_falls_back_to_openai(monkeypatch):
 
     assert result["direction"] == "increase"
     assert result["topics"] == ["protein language model"]
+
+
+def test_parse_intent_with_llm_uses_hf_api_provider(monkeypatch):
+    monkeypatch.setenv("LLM_PARSER_PROVIDER", "hf_api")
+
+    captured = {}
+
+    def fake_hf(system_prompt, user_text, max_tokens=500, **kwargs):
+        captured["system_prompt"] = system_prompt
+        captured["user_text"] = user_text
+        captured["max_tokens"] = max_tokens
+        return {
+            "action": "adjust_interest",
+            "direction": "decrease",
+            "topics": ["cold-start"],
+            "confidence": 0.91,
+            "reasoning": "matched explicit negative preference",
+        }
+
+    monkeypatch.setattr(llm_parser, "_generate_json_with_hf_api", fake_hf)
+    monkeypatch.setattr(llm_parser, "_generate_json_with_openai", lambda *args, **kwargs: None)
+
+    result = llm_parser.parse_intent_with_llm("我对 cold-start 不感兴趣")
+
+    assert result["direction"] == "decrease"
+    assert result["topics"] == ["cold-start"]
+    assert captured["user_text"] == "我对 cold-start 不感兴趣"
+
+
+def test_generate_json_with_hf_api_falls_back_to_text_generation(monkeypatch):
+    monkeypatch.setattr(llm_parser, "HF_LLM_DISABLED", False)
+    monkeypatch.setattr(llm_parser, "_get_hf_llm_model", lambda: "Qwen/Qwen3-8B")
+
+    class FakeMessage:
+        def __init__(self, content):
+            self.content = content
+
+    class FakeChoice:
+        def __init__(self, content):
+            self.message = FakeMessage(content)
+
+    class FakeChatResponse:
+        def __init__(self, content):
+            self.choices = [FakeChoice(content)]
+
+    class FakeClient:
+        def chat_completion(self, **kwargs):
+            raise RuntimeError("chat endpoint unavailable")
+
+        def text_generation(self, prompt, **kwargs):
+            return (
+                "<think>reasoning</think>\n```json\n"
+                '{"action":"adjust_interest","direction":"decrease","topics":["GUI Agent"],"confidence":0.9}'
+                "\n```"
+            )
+
+    monkeypatch.setattr(llm_parser, "_get_hf_llm_client", lambda: FakeClient())
+
+    result = llm_parser._generate_json_with_hf_api("system", "user", max_tokens=64)
+
+    assert result["direction"] == "decrease"
+    assert result["topics"] == ["GUI Agent"]
 
 
 def test_embedding_checkpoint_is_rejected_for_local_generation(tmp_path):
@@ -123,7 +253,7 @@ def test_synthesize_reading_report_with_llm_uses_local_provider(monkeypatch):
 
     captured = {}
 
-    def fake_local(system_prompt, user_text, max_new_tokens=512):
+    def fake_local(system_prompt, user_text, max_new_tokens=512, **kwargs):
         captured["system_prompt"] = system_prompt
         captured["user_text"] = user_text
         captured["max_new_tokens"] = max_new_tokens
@@ -157,3 +287,198 @@ def test_synthesize_reading_report_with_llm_uses_local_provider(monkeypatch):
     assert result["main_contributions"][0] == "提出两阶段流程"
     assert "Scientific Planner" in captured["user_text"]
     assert "科研论文精读助手" in captured["system_prompt"]
+
+
+def test_synthesize_reading_report_with_llm_uses_hf_api_provider(monkeypatch):
+    monkeypatch.setenv("LLM_PARSER_PROVIDER", "hf_api")
+
+    def fake_hf(system_prompt, user_text, max_tokens=500, **kwargs):
+        return {
+            "one_sentence_summary": "这篇论文给出了一套更稳定的论文兴趣建模流程。",
+            "research_background": "论文关注个性化科研推荐中的用户兴趣漂移问题。",
+            "core_method": "方法结合了结构化画像与反馈闭环。",
+            "key_results": "结果显示推荐命中率和可解释性同时提升。",
+            "main_contributions": ["统一冷启动与持续学习链路", "把反馈信号转成更稳定的画像更新"],
+            "limitations": ["跨学科场景仍需更多验证"],
+            "relevance_points": ["适合当前的学术推荐系统场景"],
+            "reading_focus": ["优先阅读方法设计和反馈实验"],
+            "recommendation_label": "推荐阅读",
+        }
+
+    monkeypatch.setattr(llm_parser, "_generate_json_with_hf_api", fake_hf)
+    monkeypatch.setattr(llm_parser, "_generate_json_with_openai", lambda *args, **kwargs: None)
+
+    result = llm_parser.synthesize_reading_report_with_llm(
+        paper={
+            "title": "Profile Drift Modeling",
+            "abstract": "We model user profile drift in paper recommendation.",
+            "authors": ["Alice"],
+        },
+        user_profile={"core_directions": {"agent": 0.8}},
+        parsed_pdf={"sections": {"method": "We combine profile priors with online feedback."}},
+        heuristic_payload={"one_sentence_summary": "heuristic draft"},
+    )
+
+    assert result["recommendation_label"] == "推荐阅读"
+    assert result["reading_focus"][0] == "优先阅读方法设计和反馈实验"
+
+
+def test_synthesize_reading_report_with_llm_uses_reading_timeout_override(monkeypatch):
+    monkeypatch.setenv("READING_REPORT_LLM_TIMEOUT", "180")
+
+    captured = {}
+
+    def fake_generate(system_prompt, user_text, max_tokens=500, timeout_override=None, **kwargs):
+        captured["timeout_override"] = timeout_override
+        return {
+            "one_sentence_summary": "summary",
+            "research_background": "background",
+            "core_method": "method",
+            "key_results": "results",
+            "main_contributions": ["c1"],
+            "limitations": ["l1"],
+            "relevance_points": ["r1"],
+            "reading_focus": ["f1"],
+            "recommendation_label": "推荐阅读",
+        }
+
+    monkeypatch.setattr(llm_parser, "_generate_json_with_configured_llm", fake_generate)
+
+    result = llm_parser.synthesize_reading_report_with_llm(
+        paper={"title": "Paper", "abstract": "Abstract", "authors": ["Alice"]},
+        user_profile={"core_directions": {"agent": 0.8}},
+        parsed_pdf=None,
+        heuristic_payload={},
+    )
+
+    assert result["recommendation_label"] == "推荐阅读"
+    assert captured["timeout_override"] == 180.0
+
+
+def test_local_llm_cuda_oom_falls_back_to_cpu(monkeypatch):
+    monkeypatch.setattr(llm_parser, "LOCAL_LLM_DEVICE_OVERRIDE", None)
+
+    class FakeTensor:
+        def __init__(self, values):
+            self.values = list(values)
+            self.shape = (1, len(self.values))
+
+        def to(self, device):
+            return self
+
+        def __getitem__(self, item):
+            if isinstance(item, slice):
+                return self.values[item]
+            return self.values[item]
+
+    class FakeTokenizer:
+        pad_token_id = 0
+        eos_token_id = 1
+
+        def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True):
+            return "prompt"
+
+        def __call__(self, prompt_text, return_tensors="pt"):
+            return {"input_ids": FakeTensor([1, 2, 3])}
+
+        def decode(self, generated_ids, skip_special_tokens=True):
+            return '{"action":"adjust_interest","direction":"decrease","topics":["GUI Agent"],"confidence":0.9}'
+
+    class FakeOutputs:
+        def __getitem__(self, index):
+            return list(range(6))
+
+    class FakeModel:
+        def __init__(self, device):
+            self.device = device
+
+        def generate(self, **kwargs):
+            if self.device == "cuda":
+                raise RuntimeError("CUDA out of memory. Tried to allocate 38.00 MiB.")
+            return FakeOutputs()
+
+    backends = {
+        "cuda": {
+            "tokenizer": FakeTokenizer(),
+            "model": FakeModel("cuda"),
+            "device": "cuda",
+            "cache_key": "fake::cuda",
+        },
+        "cpu": {
+            "tokenizer": FakeTokenizer(),
+            "model": FakeModel("cpu"),
+            "device": "cpu",
+            "cache_key": "fake::cpu",
+        },
+    }
+
+    monkeypatch.setattr(llm_parser, "_clear_cuda_cache", lambda: None)
+    monkeypatch.setattr(llm_parser, "_evict_local_llm_backend", lambda cache_key: None)
+    monkeypatch.setattr(llm_parser, "_should_fallback_local_llm_to_cpu_on_oom", lambda: True)
+    monkeypatch.setattr(
+        llm_parser,
+        "_get_local_llm_backend",
+        lambda force_device=None: backends["cpu"]
+        if force_device == "cpu" or llm_parser.LOCAL_LLM_DEVICE_OVERRIDE == "cpu"
+        else backends["cuda"],
+    )
+
+    class FakeTorch:
+        @staticmethod
+        def inference_mode():
+            class _Context:
+                def __enter__(self):
+                    return None
+
+                def __exit__(self, exc_type, exc, tb):
+                    return False
+
+            return _Context()
+
+    monkeypatch.setattr(llm_parser, "torch", FakeTorch)
+
+    result = llm_parser._generate_json_with_local_llm("system", "user", max_new_tokens=32)
+
+    assert result["direction"] == "decrease"
+    assert llm_parser.LOCAL_LLM_DEVICE_OVERRIDE == "cpu"
+
+
+def test_parse_research_directions_returns_fast_candidates_without_llm(monkeypatch):
+    monkeypatch.setenv("LLM_PARSER_PROVIDER", "openai")
+
+    def fail_openai(*args, **kwargs):
+        raise AssertionError("explicit direction descriptions should not require slow LLM parsing")
+
+    monkeypatch.setattr(llm_parser, "_generate_json_with_openai", fail_openai)
+
+    result = llm_parser.parse_research_directions(
+        "I am interested in protein language model and embodied ai",
+        auto_learn=False,
+    )
+
+    names = [item["name"] for item in result]
+    assert "protein-language-model" in names
+    assert "embodied-ai" in names
+
+
+def test_parse_research_directions_falls_back_after_openai_timeout(monkeypatch):
+    monkeypatch.setenv("LLM_PARSER_PROVIDER", "openai")
+    monkeypatch.setenv("LLM_PARSER_DIRECTION_TIMEOUT", "9")
+
+    captured = {}
+
+    def fake_openai(system_prompt, user_text, max_tokens=500, timeout_override=None, **kwargs):
+        captured["timeout_override"] = timeout_override
+        return None
+
+    monkeypatch.setattr(llm_parser, "_generate_json_with_openai", fake_openai)
+    monkeypatch.setattr(llm_parser, "_looks_like_explicit_direction_description", lambda text: False)
+
+    result = llm_parser.parse_research_directions(
+        "scientific planning for protein design",
+        auto_learn=False,
+    )
+
+    assert captured["timeout_override"] == 9.0
+    names = [item["name"] for item in result]
+    assert "scientific-planning-for-protein-design" in names

@@ -60,10 +60,19 @@ def create_reading_reports_for_selection(
     if not selected or not send_to_feishu:
         return []
 
+    paper_ids: List[int] = []
+    for paper_num in sorted(selected):
+        idx = int(paper_num) - 1
+        if not (0 <= idx < len(papers)):
+            continue
+        paper = papers[idx]
+        resolved_id = paper.get("id")
+        paper_ids.append(int(resolved_id) if resolved_id is not None else int(paper_num))
+
     reading_agent = importlib.import_module("agents.reading-agent.main")
     kwargs: Dict[str, Any] = {
         "user_id": user_id,
-        "paper_ids": sorted(selected),
+        "paper_ids": paper_ids,
         "papers": papers,
         "send_to_feishu": True,
     }
@@ -517,7 +526,7 @@ if __name__ == "__main__":
     print(f"Category counts: {category_counts}")
 
     # 设置飞书用户 ID
-    feishu_user_id = args.feishu_user_id or os.environ.get("FEISHU_USER_ID", "ou_c4f5d0e9c7185e943cbd4216c9b68de7")
+    feishu_user_id = args.feishu_user_id or os.environ.get("FEISHU_USER_ID", "").strip()
 
     result = process_feedback(
         user_id=args.user_id,

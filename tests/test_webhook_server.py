@@ -1,8 +1,10 @@
 """
-Tests for webhook bot-echo filtering and message retry deduplication.
+Tests for webhook bot-echo filtering and message/task deduplication.
 """
 
 import importlib.util
+import json
+import time
 from pathlib import Path
 
 
@@ -14,22 +16,27 @@ webhook_server = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(webhook_server)
 
 
-def test_is_likely_bot_echo_matches_push_and_feedback_messages():
-    assert webhook_server.is_likely_bot_echo("📰 今日论文 | 04-11 | 抓取 60 篇 → 筛后 60 篇")
-    assert webhook_server.is_likely_bot_echo("收到，6 篇已进入偏好学习流程。\n📊 今日反馈已记录")
-    assert not webhook_server.is_likely_bot_echo("降低 GUI Agent 权重")
+def _build_text_event(message_id: str, text: str) -> dict:
+    return {
+        "event": {
+            "message": {
+                "chat_id": "oc_rolea",
+                "message_id": message_id,
+                "msg_type": "text",
+                "content": json.dumps({"text": text}, ensure_ascii=False),
+            },
+            "sender": {
+                "sender_id": {"open_id": "ou_test", "user_id": None},
+                "sender_type": "user",
+            },
+        }
+    }
 
 
-def test_is_likely_bot_echo_matches_weekly_report_messages():
-    weekly_report = (
-        "============================================================\n"
-        "📊 你的学术画像周度报告 | 2026-04-05 ~ 2026-04-12\n"
-        "============================================================\n\n"
-        "━━━ 本周阅读统计 ━━━\n"
-        "推送论文总数：60\n"
-        "你选择精读：6（选择率 10.0%）"
-    )
-    assert webhook_server.is_likely_bot_echo(weekly_report)
+def test_is_likely_bot_echo_matches_known_prefixes():
+    prefix = webhook_server.BOT_MESSAGE_PREFIXES[0]
+    assert webhook_server.is_likely_bot_echo(prefix + " sample")
+    assert not webhook_server.is_likely_bot_echo("lower GUI Agent weight")
 
 
 def test_is_likely_bot_echo_matches_reading_report_summary():
@@ -45,6 +52,33 @@ def test_is_likely_bot_echo_matches_reading_report_summary():
     )
 
     assert webhook_server.is_likely_bot_echo(reading_report_summary)
+
+
+def test_recent_outbound_bot_text_is_ignored(monkeypatch):
+    webhook_server.PROCESSED_MESSAGE_IDS.clear()
+    webhook_server.RECENT_TEXT_MESSAGE_FINGERPRINTS.clear()
+    handler = webhook_server.FeishuEventHandler()
+
+    monkeypatch.setattr(
+        webhook_server,
+        "_is_recent_outbound_bot_message",
+        lambda chat_id, text: chat_id == "oc_rolea" and text == "精读任务已执行，但这次没有成功生成文档链接。请稍后重试；如果还不行，我可以继续帮你排查。",
+    )
+
+    result = handler._handle_message(
+        _build_text_event(
+            "om_bot_echo_like",
+            "精读任务已执行，但这次没有成功生成文档链接。请稍后重试；如果还不行，我可以继续帮你排查。",
+        )
+    )
+
+    assert result == {"status": "ignored", "reason": "recent_outbound_bot_message"}
+
+
+def test_is_likely_bot_echo_matches_duplicate_async_ack():
+    duplicate_ack = "当前已有一个冷启动任务在处理中，请稍候查看本群结果。"
+
+    assert webhook_server.is_likely_bot_echo(duplicate_ack)
 
 
 def test_is_duplicate_message_rejects_retries():
@@ -96,80 +130,139 @@ def test_file_message_routes_to_pdf_coldstart(monkeypatch):
     }
 
 
-def test_text_message_retry_with_new_message_id_is_deduplicated(monkeypatch):
+def test_text_message_retry_with_new_message_id_is_deduplicated(monkeypatch, tmp_path):
     webhook_server.PROCESSED_MESSAGE_IDS.clear()
     webhook_server.RECENT_TEXT_MESSAGE_FINGERPRINTS.clear()
+    webhook_server.INFLIGHT_COORDINATOR_TASKS.clear()
     handler = webhook_server.FeishuEventHandler()
     processed = []
 
-    def fake_route(user_id, message, chat_id, sender_open_id=None):
-        processed.append(
+    monkeypatch.setattr(webhook_server, "ASYNC_TASK_LOCK_DIR", tmp_path / "webhook_task_locks")
+    monkeypatch.setattr(handler, "_find_role_by_chat_id", lambda chat_id: "rolea")
+    monkeypatch.setattr(handler, "_send_async_ack_async", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        handler,
+        "_route_to_coordinator_async",
+        lambda task_key, user_id, message, chat_id, sender_open_id=None: processed.append(
             {
+                "task_key": task_key,
                 "user_id": user_id,
                 "message": message,
                 "chat_id": chat_id,
                 "sender_open_id": sender_open_id,
             }
-        )
-        return {"success": True}
+        ),
+    )
 
-    monkeypatch.setattr(handler, "_route_to_coordinator", fake_route)
-    monkeypatch.setattr(handler, "_find_role_by_chat_id", lambda chat_id: "rolea")
+    first_result = handler._handle_message(_build_text_event("om_weekly_1", "weekly report"))
+    second_result = handler._handle_message(_build_text_event("om_weekly_2", "weekly report"))
 
-    base_event = {
-        "event": {
-            "message": {
-                "chat_id": "oc_rolea",
-                "msg_type": "text",
-                "content": '{"text":"周报"}',
-            },
-            "sender": {
-                "sender_id": {"open_id": "ou_test", "user_id": None},
-                "sender_type": "user",
-            },
-        }
-    }
-
-    first_event = {
-        "event": {
-            **base_event["event"],
-            "message": {**base_event["event"]["message"], "message_id": "om_weekly_1"},
-        }
-    }
-    second_event = {
-        "event": {
-            **base_event["event"],
-            "message": {**base_event["event"]["message"], "message_id": "om_weekly_2"},
-        }
-    }
-
-    first_result = handler._handle_message(first_event)
-    second_result = handler._handle_message(second_event)
-
-    assert first_result["status"] == "success"
+    assert first_result["status"] == "accepted"
+    assert first_result["mode"] == "async"
     assert second_result == {"status": "ignored", "reason": "duplicate_text_message"}
     assert len(processed) == 1
 
 
-def test_is_likely_bot_echo_matches_must_read_list_messages():
-    must_read_list = (
-        "============================================================\n"
-        "📋 必读清单\n"
-        "============================================================\n\n"
-        "━━━ 👥 作者 (1) ━━━\n"
-        "  • tansong\n\n"
-        "━━━ 🏛️ 机构 (0) ━━━\n"
-        "  （空，待添加）\n\n"
-        "━━━ 🔑 关键词 (0) ━━━\n"
-        "  （空，待添加）\n\n"
-        "============================================================\n"
-        "添加方式：\n"
-        '  "加个必读作者：Mohammed AlQuraishi"\n'
-        '  "添加必读机构：MIT"\n'
-        '  "添加必读关键词：GUI Agent"\n\n'
-        "移除方式：\n"
-        '  "移除必读作者：张三"\n'
-        "============================================================"
+def test_feedback_messages_run_async_to_avoid_retry_duplicates(monkeypatch, tmp_path):
+    webhook_server.PROCESSED_MESSAGE_IDS.clear()
+    webhook_server.RECENT_TEXT_MESSAGE_FINGERPRINTS.clear()
+    webhook_server.INFLIGHT_COORDINATOR_TASKS.clear()
+    handler = webhook_server.FeishuEventHandler()
+    captured = {}
+
+    monkeypatch.setattr(webhook_server, "ASYNC_TASK_LOCK_DIR", tmp_path / "webhook_task_locks")
+    monkeypatch.setattr(handler, "_find_role_by_chat_id", lambda chat_id: "rolea")
+    monkeypatch.setattr(handler, "_send_async_ack_async", lambda *args, **kwargs: None)
+    monkeypatch.setattr(handler, "_route_to_coordinator_async", lambda *args, **kwargs: captured.update({"called": True}))
+    monkeypatch.setattr(handler, "_detect_coordinator_intent", lambda *args, **kwargs: "feedback")
+
+    result = handler._handle_message(_build_text_event("om_feedback_async_1", "1-3"))
+
+    assert result["status"] == "accepted"
+    assert result["mode"] == "async"
+    assert result["intent"] == "feedback"
+    assert captured["called"] is True
+
+
+def test_daily_push_duplicate_is_blocked_by_inflight_task_lock(monkeypatch, tmp_path):
+    webhook_server.PROCESSED_MESSAGE_IDS.clear()
+    webhook_server.RECENT_TEXT_MESSAGE_FINGERPRINTS.clear()
+    webhook_server.INFLIGHT_COORDINATOR_TASKS.clear()
+    handler = webhook_server.FeishuEventHandler()
+    captured = {"routes": 0, "acks": 0}
+
+    monkeypatch.setattr(webhook_server, "ASYNC_TASK_LOCK_DIR", tmp_path / "webhook_task_locks")
+    monkeypatch.setattr(webhook_server, "is_duplicate_text_message", lambda *args, **kwargs: False)
+    monkeypatch.setattr(handler, "_find_role_by_chat_id", lambda chat_id: "rolea")
+    monkeypatch.setattr(handler, "_detect_coordinator_intent", lambda *args, **kwargs: "daily_push")
+    monkeypatch.setattr(
+        handler,
+        "_send_async_ack_async",
+        lambda *args, **kwargs: captured.__setitem__("acks", captured["acks"] + 1),
+    )
+    monkeypatch.setattr(
+        handler,
+        "_route_to_coordinator_async",
+        lambda *args, **kwargs: captured.__setitem__("routes", captured["routes"] + 1),
     )
 
-    assert webhook_server.is_likely_bot_echo(must_read_list)
+    first_result = handler._handle_message(_build_text_event("om_push_1", "push"))
+    second_result = handler._handle_message(_build_text_event("om_push_2", "push"))
+
+    assert first_result["status"] == "accepted"
+    assert first_result.get("duplicate") is not True
+    assert second_result["status"] == "accepted"
+    assert second_result["duplicate"] is True
+    assert captured["routes"] == 1
+    assert captured["acks"] == 2
+
+
+def test_register_async_task_respects_existing_persistent_lock(monkeypatch, tmp_path):
+    webhook_server.INFLIGHT_COORDINATOR_TASKS.clear()
+    handler = webhook_server.FeishuEventHandler()
+    monkeypatch.setattr(webhook_server, "ASYNC_TASK_LOCK_DIR", tmp_path / "webhook_task_locks")
+
+    task_key = "user_rolea:daily_push"
+    lock_dir = webhook_server.ASYNC_TASK_LOCK_DIR
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = webhook_server._get_async_task_lock_path(task_key)
+    lock_path.write_text(
+        json.dumps({"task_key": task_key, "created_at": time.time(), "pid": 99999}),
+        encoding="utf-8",
+    )
+
+    assert handler._register_async_task(task_key) is False
+
+
+def test_register_async_task_reclaims_stale_persistent_lock(monkeypatch, tmp_path):
+    webhook_server.INFLIGHT_COORDINATOR_TASKS.clear()
+    handler = webhook_server.FeishuEventHandler()
+    monkeypatch.setattr(webhook_server, "ASYNC_TASK_LOCK_DIR", tmp_path / "webhook_task_locks")
+    monkeypatch.setenv("SCITASTE_ASYNC_TASK_LOCK_TTL_SECONDS", "30")
+
+    task_key = "user_rolea:daily_push"
+    lock_dir = webhook_server.ASYNC_TASK_LOCK_DIR
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = webhook_server._get_async_task_lock_path(task_key)
+    lock_path.write_text(
+        json.dumps({"task_key": task_key, "created_at": time.time() - 120, "pid": 99999}),
+        encoding="utf-8",
+    )
+
+    try:
+        assert handler._register_async_task(task_key) is True
+    finally:
+        handler._release_async_task(task_key)
+
+
+def test_clear_async_task_locks_on_startup_removes_existing_lock_files(monkeypatch, tmp_path):
+    lock_dir = tmp_path / "webhook_task_locks"
+    monkeypatch.setattr(webhook_server, "ASYNC_TASK_LOCK_DIR", lock_dir)
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    (lock_dir / "lock_a.json").write_text("{}", encoding="utf-8")
+    (lock_dir / "lock_b.json").write_text("{}", encoding="utf-8")
+
+    removed = webhook_server.clear_async_task_locks_on_startup()
+
+    assert removed == 2
+    assert list(lock_dir.glob("*.json")) == []

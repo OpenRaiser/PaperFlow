@@ -19,6 +19,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 from typing import Any, Dict, List, Optional
 
 try:
@@ -58,6 +59,8 @@ def _resolve_feishu_cli() -> str:
 FEISHU_CLI_CMD = _resolve_feishu_cli()
 CURRENT_USER_ID = os.environ.get("FEISHU_USER_ID", "ou_c4f5d0e9c7185e943cbd4216c9b68de7")
 DEFAULT_IM_IDENTITY = os.environ.get("FEISHU_IM_IDENTITY", "user")
+RECENT_OUTBOUND_TEXT_MESSAGES: Dict[str, float] = {}
+OUTBOUND_TEXT_TTL_SECONDS = 120.0
 
 
 def _sanitize_download_filename(file_name: str, fallback_name: str) -> str:
@@ -160,7 +163,39 @@ def _parse_cli_output(stdout: str, stderr: str) -> Dict[str, Any]:
     raise RuntimeError(f"Feishu CLI error: {combined or 'empty response'}")
 
 
-def _run_cli(args: List[str]) -> Dict[str, Any]:
+def _prune_outbound_text_cache(now: Optional[float] = None) -> None:
+    current = time.time() if now is None else now
+    expired_keys = [
+        key for key, created_at in RECENT_OUTBOUND_TEXT_MESSAGES.items()
+        if current - created_at > OUTBOUND_TEXT_TTL_SECONDS
+    ]
+    for key in expired_keys:
+        RECENT_OUTBOUND_TEXT_MESSAGES.pop(key, None)
+
+
+def _remember_outbound_text(receive_type: str, receive_id: str, text: str) -> None:
+    normalized = (text or "").strip()
+    if not receive_id or not normalized:
+        return
+    _prune_outbound_text_cache()
+    RECENT_OUTBOUND_TEXT_MESSAGES[f"{receive_type}:{receive_id}:{normalized}"] = time.time()
+
+
+def is_recent_outbound_text(receive_type: str, receive_id: str, text: str) -> bool:
+    normalized = (text or "").strip()
+    if not receive_id or not normalized:
+        return False
+    _prune_outbound_text_cache()
+    return f"{receive_type}:{receive_id}:{normalized}" in RECENT_OUTBOUND_TEXT_MESSAGES
+
+
+def _run_cli(
+    args: List[str],
+    *,
+    input_text: Optional[str] = None,
+    cwd: Optional[str] = None,
+    env: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
     result = subprocess.run(
         [FEISHU_CLI_CMD, *args],
         capture_output=True,
@@ -168,6 +203,9 @@ def _run_cli(args: List[str]) -> Dict[str, Any]:
         encoding="utf-8",
         errors="replace",
         check=False,
+        input=input_text,
+        cwd=cwd,
+        env=env,
     )
     return _parse_cli_output(result.stdout, result.stderr)
 
@@ -280,7 +318,9 @@ def send_text(user_id: str, text: str, use_chat_id: bool = False) -> Dict[str, A
     """
     if use_chat_id:
         return send_to_chat(user_id, "text", {"text": text})
-    return _send_api_message(user_id, "text", {"text": text})
+    result = _send_api_message(user_id, "text", {"text": text})
+    _remember_outbound_text("open_id", user_id, text)
+    return result
 
 
 def send_markdown(user_id: str, markdown: str) -> Dict[str, Any]:
@@ -324,7 +364,7 @@ def send_to_chat(chat_id: str, msg_type: str, content: Dict[str, Any], identity:
     }
     params = {"receive_id_type": "chat_id"}
 
-    return _run_cli([
+    result = _run_cli([
         "api",
         "POST",
         "/open-apis/im/v1/messages",
@@ -335,6 +375,9 @@ def send_to_chat(chat_id: str, msg_type: str, content: Dict[str, Any], identity:
         "--data",
         json.dumps(body, ensure_ascii=False, separators=(",", ":")),
     ])
+    if msg_type == "text":
+        _remember_outbound_text("chat_id", chat_id, content.get("text", ""))
+    return result
 
 
 def send_text_to_chat(chat_id: str, text: str, identity: Optional[str] = None) -> Dict[str, Any]:
@@ -374,12 +417,12 @@ def create_doc(title: str, content: str, folder_id: Optional[str] = None) -> Dic
             "--title",
             title,
             "--markdown",
-            content or "",
+            "-",
         ]
         if folder_id:
             args.extend(["--folder-token", folder_id])
 
-        result = _run_cli(args)
+        result = _run_cli(args, input_text=content or "")
 
         data = result.get("data", {}) if isinstance(result, dict) else {}
         if isinstance(data, dict):
@@ -414,8 +457,6 @@ def create_doc(title: str, content: str, folder_id: Optional[str] = None) -> Dic
         if doc_token:
             result.setdefault("obj_token", doc_token)
         return result
-    finally:
-        pass
 
 
 def get_user_info(user_id: Optional[str] = None) -> Dict[str, Any]:

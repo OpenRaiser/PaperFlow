@@ -23,6 +23,7 @@ import base64
 import importlib
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from pathlib import Path
 from typing import Dict, Any, Optional
 from urllib.parse import urlparse, parse_qs
 import logging
@@ -33,6 +34,7 @@ import time
 script_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.normpath(os.path.join(script_dir, "..", "..", ".."))
 sys.path.insert(0, project_root)
+PROJECT_ROOT_PATH = Path(project_root)
 
 try:
     from dotenv import load_dotenv
@@ -56,6 +58,8 @@ BOT_MESSAGE_PREFIXES = (
     "📊 你的学术画像周度报告",
     "SciTaste 学术画像确认",
     "收到，",
+    "当前已有一个",
+    "当前已有相同任务在处理中",
     "📊 今日反馈已记录",
     "抱歉，",  # 未知意图回复，避免回声触发
     "已增强你对",
@@ -70,17 +74,111 @@ TEXT_MESSAGE_FINGERPRINT_TTL_SECONDS = 5
 ASYNC_INTENT_ACKS = {
     "cold_start": "收到，正在生成学术画像，完成后会把结果发到本群。",
     "daily_push": "收到，正在抓取并排序今日论文，稍后把结果发到本群。",
+    "feedback": "收到，正在处理你的反馈和精读任务，结果会发到本群。",
     "reading_report": "收到，正在生成精读报告，完成后会把链接发到本群。",
     "weekly_report": "收到，正在生成周报，完成后会把结果发到本群。",
 }
 ASYNC_INTENT_DUPLICATE_ACKS = {
     "cold_start": "当前已有一个冷启动任务在处理中，请稍候查看本群结果。",
     "daily_push": "当前已有一个推送任务在处理中，请稍候查看本群结果。",
+    "feedback": "当前已有一个反馈处理任务在运行，请稍候查看本群结果。",
     "reading_report": "当前已有一个精读报告任务在处理中，请稍候查看本群结果。",
     "weekly_report": "当前已有一个周报任务在处理中，请稍候查看本群结果。",
 }
 INFLIGHT_COORDINATOR_TASKS: set[str] = set()
 INFLIGHT_COORDINATOR_TASKS_LOCK = threading.Lock()
+ASYNC_TASK_LOCK_DIR = PROJECT_ROOT_PATH / "data" / "webhook_task_locks"
+
+
+def get_async_task_lock_ttl_seconds() -> int:
+    raw = os.environ.get("SCITASTE_ASYNC_TASK_LOCK_TTL_SECONDS", "1800").strip()
+    try:
+        return max(30, int(raw))
+    except ValueError:
+        return 1800
+
+
+def _get_async_task_lock_path(task_key: str) -> Path:
+    digest = hashlib.sha256(task_key.encode("utf-8")).hexdigest()
+    return ASYNC_TASK_LOCK_DIR / f"{digest}.json"
+
+
+def _read_async_task_lock(path: Path) -> Dict[str, Any]:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _acquire_async_task_lock(task_key: str) -> bool:
+    ASYNC_TASK_LOCK_DIR.mkdir(parents=True, exist_ok=True)
+    lock_path = _get_async_task_lock_path(task_key)
+    now = time.time()
+    ttl_seconds = get_async_task_lock_ttl_seconds()
+
+    for _ in range(2):
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            payload = _read_async_task_lock(lock_path)
+            created_at = float(payload.get("created_at", 0.0) or 0.0)
+            if created_at and (now - created_at) <= ttl_seconds:
+                return False
+            try:
+                lock_path.unlink()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                return False
+            continue
+
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "task_key": task_key,
+                        "created_at": now,
+                        "pid": os.getpid(),
+                    },
+                    handle,
+                    ensure_ascii=False,
+                )
+            return True
+        except Exception:
+            try:
+                lock_path.unlink()
+            except OSError:
+                pass
+            return False
+
+    return False
+
+
+def _release_async_task_lock(task_key: str) -> None:
+    try:
+        _get_async_task_lock_path(task_key).unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
+
+
+def clear_async_task_locks_on_startup() -> int:
+    """Clear persistent async task locks from previous runs before serving requests."""
+    try:
+        if not ASYNC_TASK_LOCK_DIR.exists():
+            return 0
+    except OSError:
+        return 0
+
+    removed = 0
+    for lock_path in ASYNC_TASK_LOCK_DIR.glob("*.json"):
+        try:
+            lock_path.unlink()
+            removed += 1
+        except OSError:
+            continue
+    return removed
 
 
 def is_likely_bot_echo(text: str) -> bool:
@@ -126,6 +224,26 @@ def is_likely_bot_echo(text: str) -> bool:
         return True
 
     return False
+
+
+def _is_recent_outbound_bot_message(chat_id: str, text: str) -> bool:
+    normalized = (text or "").strip()
+    if not chat_id or not normalized:
+        return False
+
+    try:
+        feishu_reporter = importlib.import_module("skills.feishu-reporter.scripts.feishu_reporter")
+    except Exception:
+        return False
+
+    checker = getattr(feishu_reporter, "is_recent_outbound_text", None)
+    if not callable(checker):
+        return False
+
+    try:
+        return bool(checker("chat_id", chat_id, normalized))
+    except Exception:
+        return False
 
 
 def is_duplicate_message(message_id: str) -> bool:
@@ -299,6 +417,10 @@ class FeishuEventHandler:
             logger.info(f"Ignoring duplicate text payload in chat {chat_id}: {text[:50]}...")
             return {"status": "ignored", "reason": "duplicate_text_message"}
 
+        if msg_type == "text" and _is_recent_outbound_bot_message(chat_id, text):
+            logger.info("Ignoring recent outbound bot text echoed back by Feishu")
+            return {"status": "ignored", "reason": "recent_outbound_bot_message"}
+
         # 检查消息是否是 Bot 回声消息（send-as-user 时 sender_type 不可靠）
         if is_likely_bot_echo(text):
             logger.info("Ignoring likely bot echo based on message content")
@@ -334,7 +456,7 @@ class FeishuEventHandler:
             task_key = f"{coordinator_user_id}:{intent}"
             if not self._register_async_task(task_key):
                 logger.info(f"Skipping duplicate async coordinator task for {task_key}")
-                self._send_async_ack(
+                self._send_async_ack_async(
                     chat_id,
                     open_id,
                     ASYNC_INTENT_DUPLICATE_ACKS.get(intent, "当前已有相同任务在处理中，请稍候。"),
@@ -349,7 +471,7 @@ class FeishuEventHandler:
                 }
 
             logger.info(f"Dispatching async coordinator task for intent={intent}")
-            self._send_async_ack(chat_id, open_id, ASYNC_INTENT_ACKS[intent])
+            self._send_async_ack_async(chat_id, open_id, ASYNC_INTENT_ACKS[intent])
             self._route_to_coordinator_async(task_key, coordinator_user_id, text, chat_id, open_id)
             return {
                 "status": "accepted",
@@ -604,10 +726,25 @@ class FeishuEventHandler:
         except Exception as exc:
             logger.warning(f"Failed to send async acknowledgement: {exc}")
 
+    def _send_async_ack_async(self, chat_id: str, open_id: str, text: str) -> None:
+        """Send the acknowledgement in the background so webhook can return 200 quickly."""
+
+        def target() -> None:
+            self._send_async_ack(chat_id, open_id, text)
+
+        thread = threading.Thread(
+            target=target,
+            name=f"scitaste-ack-{int(time.time())}",
+            daemon=True,
+        )
+        thread.start()
+
     def _register_async_task(self, task_key: str) -> bool:
         """Register an async task if the same user+intent is not already running."""
         with INFLIGHT_COORDINATOR_TASKS_LOCK:
             if task_key in INFLIGHT_COORDINATOR_TASKS:
+                return False
+            if not _acquire_async_task_lock(task_key):
                 return False
             INFLIGHT_COORDINATOR_TASKS.add(task_key)
             return True
@@ -616,6 +753,7 @@ class FeishuEventHandler:
         """Release a finished async task registration."""
         with INFLIGHT_COORDINATOR_TASKS_LOCK:
             INFLIGHT_COORDINATOR_TASKS.discard(task_key)
+        _release_async_task_lock(task_key)
 
 
 class ReusableHTTPServer(HTTPServer):
@@ -735,7 +873,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
         logger.info("%s - %s" % (self.address_string(), format % args))
 
 
-def run_server(port: int = 8080):
+def run_server(port: int = 8080, start_scheduler: bool = True):
     """
     启动 webhook 服务器
 
@@ -750,6 +888,20 @@ def run_server(port: int = 8080):
         logger.error(f"Failed to bind webhook server on port {port}: {exc}", exc_info=True)
         raise
 
+    cleared_lock_count = clear_async_task_locks_on_startup()
+    if cleared_lock_count:
+        logger.info(f"Cleared {cleared_lock_count} stale async task lock(s) on startup")
+
+    scheduler_module = None
+    if start_scheduler:
+        try:
+            scheduler_module = importlib.import_module("services.webhook-server.scripts.scheduler")
+            scheduler_thread = scheduler_module.start_scheduler_thread()
+            if scheduler_thread:
+                logger.info(f"Scheduler started: {scheduler_module.describe_schedule()}")
+        except Exception as exc:
+            logger.error(f"Failed to start scheduler: {exc}", exc_info=True)
+
     logger.info(f"Starting Feishu webhook server on port {port}...")
     logger.info(f"Event endpoint: http://localhost:{port}/")
     logger.info(f"Health check: http://localhost:{port}/health")
@@ -760,6 +912,12 @@ def run_server(port: int = 8080):
     except KeyboardInterrupt:
         logger.info("Server stopped")
         httpd.shutdown()
+    finally:
+        if scheduler_module is not None:
+            try:
+                scheduler_module.stop_scheduler_thread()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

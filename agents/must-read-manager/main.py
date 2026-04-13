@@ -14,6 +14,7 @@ Must-Read Manager - 必读清单管理代理
 import sys
 import os
 import json
+import re
 from datetime import datetime
 from typing import Dict, List, Optional, Any, Literal
 
@@ -40,6 +41,51 @@ feishu_reporter = importlib.import_module("skills.feishu-reporter.scripts.feishu
 send_text = feishu_reporter.send_text
 
 
+LIST_COMMAND_HINTS = ("查看必读", "显示必读", "必读清单", "show must")
+ADD_ACTION_HINTS = ("加个", "加上", "添加", "增加", "加", "add")
+REMOVE_ACTION_HINTS = ("去掉", "去除", "取消", "移除", "删除", "删掉", "remove", "delete")
+ITEM_TYPE_ALIASES = {
+    "author": ("必读作者", "作者", "author"),
+    "institution": ("必读机构", "机构", "institution"),
+    "keyword": ("必读关键词", "关键词", "keyword"),
+}
+ITEM_TYPE_LABELS = {
+    "author": "作者",
+    "institution": "机构",
+    "keyword": "关键词",
+}
+COMMAND_RE = re.compile(
+    r"^\s*(?:请\s*)?(?:把\s*)?"
+    r"(?P<action>加个|加上|添加|增加|加|去掉|去除|取消|移除|删除|删掉|add|remove|delete)"
+    r"\s*(?:必读|must\s*read\s*)?"
+    r"(?P<item_type>作者|机构|关键词|author|institution|keyword)"
+    r"\s*(?:[:：]\s*|\s+)?(?P<value>.+?)\s*$",
+    flags=re.IGNORECASE,
+)
+
+
+def clean_must_read_value(value: str) -> str:
+    """Normalize user-provided must-read values while preserving readable output."""
+    cleaned = re.sub(r"\s+", " ", (value or "").strip().strip("\"'`"))
+    connector_patterns = (
+        r"^(?:的)\s*",
+        r"^(?:是|为)\s*",
+        r"^(?:叫做|叫|名为)\s*",
+    )
+    previous = None
+    while cleaned and cleaned != previous:
+        previous = cleaned
+        for pattern in connector_patterns:
+            cleaned = re.sub(pattern, "", cleaned, count=1)
+        cleaned = cleaned.strip()
+    return cleaned
+
+
+def normalize_must_read_value(value: str) -> str:
+    """Build a tolerant lookup key for must-read matching."""
+    return clean_must_read_value(value).casefold()
+
+
 def parse_command(text: str) -> Optional[Dict[str, Any]]:
     """
     解析用户命令
@@ -59,61 +105,65 @@ def parse_command(text: str) -> Optional[Dict[str, Any]]:
     Returns:
         命令字典 {"action": "add/remove/list", "type": "author/institution/keyword", "value": "..."}
     """
-    text_lower = text.lower().strip()
+    text = (text or "").strip()
+    text_lower = text.lower()
 
     # 查看清单
-    if any(kw in text_lower for kw in ["查看必读", "show must", "显示必读", "必读清单"]):
+    if any(kw in text_lower for kw in LIST_COMMAND_HINTS):
         return {"action": "list"}
 
-    # 添加操作
-    add_keywords = ["加", "添加", "add"]
-    is_add = any(kw in text_lower for kw in add_keywords)
+    match = COMMAND_RE.match(text)
+    if match:
+        action_text = match.group("action").lower()
+        item_text = match.group("item_type").lower()
+        value = clean_must_read_value(match.group("value"))
 
-    # 移除操作
-    remove_keywords = ["移除", "删除", "remove", "删掉"]
-    is_remove = any(kw in text_lower for kw in remove_keywords)
+        for canonical_type, aliases in ITEM_TYPE_ALIASES.items():
+            if item_text in {alias.lower() for alias in aliases}:
+                return {
+                    "action": "add" if action_text in ADD_ACTION_HINTS else "remove",
+                    "type": canonical_type,
+                    "value": value,
+                }
 
-    # 确定类型
-    type_mapping = {
-        "author": "author",
-        "作者": "author",
-        "institution": "institution",
-        "机构": "institution",
-        "keyword": "keyword",
-        "关键词": "keyword",
-    }
-
-    item_type = None
-    for key, value in type_mapping.items():
-        if key in text_lower:
-            item_type = value
-            break
-
-    if not item_type:
-        return None
-
+    is_add = any(kw in text_lower for kw in ADD_ACTION_HINTS)
+    is_remove = any(kw in text_lower for kw in REMOVE_ACTION_HINTS)
     if not (is_add or is_remove):
         return None
 
-    # 提取值（冒号后面的内容）
+    item_type = None
+    matched_alias = None
+    for canonical_type, aliases in ITEM_TYPE_ALIASES.items():
+        for alias in aliases:
+            alias_lower = alias.lower()
+            if alias_lower in text_lower:
+                item_type = canonical_type
+                matched_alias = alias
+                break
+        if item_type:
+            break
+
+    if not item_type or not matched_alias:
+        return None
+
     value = ""
     if ":" in text:
-        value = text.split(":", 1)[1].strip()
+        value = text.split(":", 1)[1]
     elif "：" in text:
-        value = text.split("：", 1)[1].strip()
+        value = text.split("：", 1)[1]
     else:
-        # 尝试提取最后一个词
-        parts = text.split()
-        if parts:
-            value = parts[-1].strip()
+        alias_index = text_lower.find(matched_alias.lower())
+        if alias_index >= 0:
+            value = text[alias_index + len(matched_alias):]
 
+    value = clean_must_read_value(value)
     if not value:
         return None
 
     return {
         "action": "add" if is_add else "remove",
         "type": item_type,
-        "value": value.strip(),
+        "value": value,
     }
 
 
@@ -133,16 +183,23 @@ def add_must_read(profile: Dict, item_type: str, value: str) -> Dict[str, Any]:
 
     key = f"{item_type}s"
     current_list = must_read.get(key, [])
+    item_label = ITEM_TYPE_LABELS.get(item_type, item_type)
 
-    if value in current_list:
-        return {"success": False, "message": f"{value} 已在必读清单中"}
+    cleaned_value = clean_must_read_value(value)
+    normalized_value = normalize_must_read_value(cleaned_value)
+    existing_value = next(
+        (item for item in current_list if normalize_must_read_value(str(item)) == normalized_value),
+        None,
+    )
+    if existing_value is not None:
+        return {"success": False, "message": f"{existing_value} 已在必读清单中"}
 
-    current_list.append(value)
+    current_list.append(cleaned_value)
     must_read[key] = current_list
     profile["must_read"] = must_read
     profile["updated_at"] = datetime.now().isoformat()
 
-    return {"success": True, "message": f"已添加 {value} 到必读{item_type}清单"}
+    return {"success": True, "message": f"已添加 {cleaned_value} 到必读{item_label}清单"}
 
 
 def remove_must_read(profile: Dict, item_type: str, value: str) -> Dict[str, Any]:
@@ -161,16 +218,23 @@ def remove_must_read(profile: Dict, item_type: str, value: str) -> Dict[str, Any
 
     key = f"{item_type}s"
     current_list = must_read.get(key, [])
+    item_label = ITEM_TYPE_LABELS.get(item_type, item_type)
+    cleaned_value = clean_must_read_value(value)
+    normalized_value = normalize_must_read_value(cleaned_value)
+    matched_value = next(
+        (item for item in current_list if normalize_must_read_value(str(item)) == normalized_value),
+        None,
+    )
 
-    if value not in current_list:
-        return {"success": False, "message": f"{value} 不在必读清单中"}
+    if matched_value is None:
+        return {"success": False, "message": f"{cleaned_value} 不在必读清单中"}
 
-    current_list.remove(value)
+    current_list.remove(matched_value)
     must_read[key] = current_list
     profile["must_read"] = must_read
     profile["updated_at"] = datetime.now().isoformat()
 
-    return {"success": True, "message": f"已从必读{item_type}清单中移除 {value}"}
+    return {"success": True, "message": f"已从必读{item_label}清单中移除 {matched_value}"}
 
 
 def format_must_read_list(profile: Dict) -> str:
@@ -421,7 +485,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # 设置飞书用户 ID
-    feishu_user_id = args.feishu_user_id or os.environ.get("FEISHU_USER_ID", "ou_c4f5d0e9c7185e943cbd4216c9b68de7")
+    feishu_user_id = args.feishu_user_id or os.environ.get("FEISHU_USER_ID", "").strip()
 
     result = process_must_read_command(
         user_id=args.user_id,

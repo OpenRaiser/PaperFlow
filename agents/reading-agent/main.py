@@ -20,6 +20,7 @@ import tempfile
 from datetime import datetime
 from typing import Dict, List, Optional, Any, Tuple
 from pathlib import Path
+from urllib.parse import urljoin
 
 import requests
 
@@ -48,6 +49,7 @@ log_behavior = db_ops.log_behavior
 
 
 PDF_DOWNLOAD_TIMEOUT = float(os.environ.get("READING_REPORT_PDF_TIMEOUT", "60"))
+ARXIV_DETAIL_TIMEOUT = float(os.environ.get("READING_REPORT_ARXIV_TIMEOUT", "12"))
 MAX_ABSTRACT_CHARS = int(os.environ.get("READING_REPORT_ABSTRACT_CHARS", "1200"))
 MAX_SECTION_CHARS = int(os.environ.get("READING_REPORT_SECTION_CHARS", "1800"))
 DEFAULT_REQUEST_HEADERS = {"User-Agent": "SciTaste/0.1 ReadingAgent"}
@@ -111,21 +113,30 @@ def extract_doc_url(doc_info: Dict[str, Any]) -> Optional[str]:
     if not isinstance(doc_info, dict):
         return None
 
+    def _valid_url(candidate: Any) -> Optional[str]:
+        text = str(candidate or "").strip()
+        if text.startswith("http://") or text.startswith("https://"):
+            return text
+        return None
+
     for candidate in (doc_info.get("url"), doc_info.get("doc_url"), doc_info.get("link")):
-        if isinstance(candidate, str) and candidate.strip():
-            return candidate.strip()
+        valid = _valid_url(candidate)
+        if valid:
+            return valid
 
     data = doc_info.get("data")
     if isinstance(data, dict):
         for candidate in (data.get("url"), data.get("doc_url"), data.get("link")):
-            if isinstance(candidate, str) and candidate.strip():
-                return candidate.strip()
+            valid = _valid_url(candidate)
+            if valid:
+                return valid
 
         document = data.get("document")
         if isinstance(document, dict):
             for candidate in (document.get("url"), document.get("doc_url"), document.get("link")):
-                if isinstance(candidate, str) and candidate.strip():
-                    return candidate.strip()
+                valid = _valid_url(candidate)
+                if valid:
+                    return valid
 
     return None
 
@@ -245,6 +256,137 @@ def _unique_preserve_order(items: List[str]) -> List[str]:
     return ordered
 
 
+def _append_analysis_note(base: Any, extra: Any) -> str:
+    base_text = _clean_text(base)
+    extra_text = _clean_text(extra)
+    if not base_text:
+        return extra_text
+    if not extra_text:
+        return base_text
+    if extra_text in base_text:
+        return base_text
+    if base_text in extra_text:
+        return extra_text
+    return f"{base_text} {extra_text}"
+
+
+def _describe_pdf_fallback(pdf_error: Optional[str]) -> str:
+    lowered = _clean_text(pdf_error).lower()
+    if not lowered:
+        return "未能拿到 PDF 全文，本次报告改为按模板基于摘要和元数据生成；方法与实验细节建议回原文核对。"
+    if "403" in lowered or "forbidden" in lowered:
+        reason = "源站拒绝了 PDF 访问"
+    elif "timed out" in lowered or "timeout" in lowered:
+        reason = "PDF 抓取超时"
+    elif "ssl" in lowered or "eof" in lowered or "connection" in lowered:
+        reason = "PDF 抓取时网络连接不稳定"
+    elif "content-type" in lowered or "did not return a pdf" in lowered:
+        reason = "源站没有直接返回 PDF 文件"
+    else:
+        reason = "PDF 抓取或解析失败"
+    return f"{reason}，本次报告改为按模板基于摘要和元数据生成；方法与实验细节建议回原文核对。"
+
+
+def _recommendation_score(label: str) -> int:
+    normalized = _clean_text(label)
+    mapping = {
+        "强烈推荐": 5,
+        "推荐阅读": 4,
+        "值得快速浏览": 3,
+        "按需阅读": 2,
+    }
+    return mapping.get(normalized, 3)
+
+
+def _format_markdown_link(label: str, url: str) -> str:
+    clean_url = _clean_text(url)
+    if clean_url.startswith("http://") or clean_url.startswith("https://"):
+        return clean_url
+    return clean_url or "暂无"
+
+
+def _get_first_url(paper: Dict[str, Any], *keys: str) -> str:
+    metadata = paper.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    for key in keys:
+        for container in (paper, metadata):
+            candidate = _clean_text(container.get(key))
+            if candidate.startswith("http://") or candidate.startswith("https://"):
+                return candidate
+    return ""
+
+
+def _get_direct_pdf_url(paper: Dict[str, Any]) -> str:
+    candidates = [
+        paper.get("pdf_url"),
+        paper.get("url"),
+        paper.get("paper_url"),
+        paper.get("doi_url"),
+        paper.get("openreview_url"),
+        (paper.get("metadata") or {}).get("pdf_url"),
+        (paper.get("metadata") or {}).get("url"),
+        (paper.get("metadata") or {}).get("link"),
+        (paper.get("metadata") or {}).get("paper_url"),
+        (paper.get("metadata") or {}).get("doi_url"),
+        (paper.get("metadata") or {}).get("openreview_url"),
+    ]
+
+    for candidate in candidates:
+        text = _clean_text(candidate)
+        if _looks_like_pdf_url(text):
+            return text
+
+    arxiv_id = _clean_text(paper.get("arxiv_id"))
+    if arxiv_id:
+        return f"https://arxiv.org/pdf/{arxiv_id}.pdf"
+    return ""
+
+
+def _build_resource_items(paper: Dict[str, Any]) -> List[Tuple[str, str]]:
+    code_url = _get_first_url(paper, "code_url", "github_url", "repo_url", "repository_url")
+    dataset_url = _get_first_url(paper, "dataset_url", "data_url")
+    project_url = _get_first_url(paper, "project_url", "paper_url", "openreview_url", "url")
+    pdf_url = _get_direct_pdf_url(paper)
+
+    items: List[Tuple[str, str]] = []
+    items.append(("代码", _format_markdown_link("代码链接", code_url) if code_url else "暂未发现公开链接"))
+    items.append(("数据", _format_markdown_link("数据链接", dataset_url) if dataset_url else "暂未发现公开链接"))
+    items.append(("项目主页", _format_markdown_link("项目主页", project_url) if project_url else "暂未发现公开链接"))
+    items.append(("原文 PDF", _format_markdown_link("PDF", pdf_url) if pdf_url else "暂未发现公开链接"))
+
+    arxiv_id = _clean_text(paper.get("arxiv_id"))
+    if arxiv_id:
+        items.append(("arXiv", _format_markdown_link(arxiv_id, f"https://arxiv.org/abs/{arxiv_id}")))
+
+    doi = _clean_text(paper.get("doi"))
+    if doi:
+        items.append(("DOI", _format_markdown_link(doi, f"https://doi.org/{doi}")))
+
+    return items
+
+
+def _build_recommendation_reason(payload: Dict[str, Any]) -> str:
+    reasons: List[str] = []
+    relevance_points = payload.get("relevance_points") or []
+    reading_focus = payload.get("reading_focus") or []
+    analysis_source = _clean_text(payload.get("analysis_source"))
+
+    if relevance_points:
+        reasons.append(_clean_text(relevance_points[0]))
+    if analysis_source == "pdf":
+        reasons.append("这次已拿到 PDF 全文结构，方法和结果信息相对更完整。")
+    elif _clean_text(payload.get("analysis_note")):
+        reasons.append(_clean_text(payload.get("analysis_note")))
+    if reading_focus:
+        reasons.append(f"建议优先看：{_clean_text(reading_focus[0])}")
+
+    if not reasons:
+        reasons.append("当前推荐主要基于题目、摘要、元数据和你的画像匹配结果。")
+    return reasons[0]
+
+
 def _looks_like_placeholder_title(title: str) -> bool:
     normalized = _clean_text(title).lower()
     if not normalized:
@@ -285,7 +427,23 @@ def _normalize_paper(paper: Dict[str, Any]) -> Dict[str, Any]:
         metadata = {}
     normalized["metadata"] = metadata
 
-    for field in ("title", "abstract", "institution", "venue", "publish_date", "arxiv_id", "doi", "pdf_url", "category"):
+    for field in (
+        "title",
+        "abstract",
+        "institution",
+        "venue",
+        "publish_date",
+        "arxiv_id",
+        "doi",
+        "pdf_url",
+        "url",
+        "paper_url",
+        "doi_url",
+        "openreview_url",
+        "journal",
+        "source",
+        "category",
+    ):
         if field in normalized:
             normalized[field] = _clean_text(normalized.get(field))
 
@@ -342,23 +500,156 @@ def _merge_paper_details(base: Dict[str, Any], detail: Dict[str, Any]) -> Dict[s
     return merged
 
 
+def _looks_like_pdf_url(candidate: Any) -> bool:
+    text = _clean_text(candidate).lower()
+    if not (text.startswith("http://") or text.startswith("https://")):
+        return False
+    return (
+        ".pdf" in text
+        or "/pdf?" in text
+        or "/pdf/" in text
+        or "arxiv.org/pdf/" in text
+        or "openreview.net/pdf" in text
+    )
+
+
+def _collect_source_page_urls(paper: Dict[str, Any]) -> List[str]:
+    metadata = paper.get("metadata") or {}
+    candidates = [
+        paper.get("paper_url"),
+        paper.get("url"),
+        paper.get("doi_url"),
+        paper.get("openreview_url"),
+        metadata.get("paper_url"),
+        metadata.get("url"),
+        metadata.get("link"),
+        metadata.get("doi_url"),
+        metadata.get("openreview_url"),
+    ]
+
+    urls: List[str] = []
+    for candidate in candidates:
+        text = _clean_text(candidate)
+        if not text.startswith("http://") and not text.startswith("https://"):
+            continue
+        if _looks_like_pdf_url(text):
+            continue
+        if text not in urls:
+            urls.append(text)
+    return urls
+
+
+def _resolve_pdf_url_from_source_page(source_url: str) -> str:
+    response = requests.get(
+        source_url,
+        timeout=PDF_DOWNLOAD_TIMEOUT,
+        headers=DEFAULT_REQUEST_HEADERS,
+        allow_redirects=True,
+    )
+    response.raise_for_status()
+
+    final_url = _clean_text(response.url) or _clean_text(source_url)
+    content_type = str(response.headers.get("Content-Type") or "").lower()
+    if _looks_like_pdf_url(final_url) or "application/pdf" in content_type:
+        return final_url
+
+    html = response.text or ""
+    patterns = (
+        r"""<meta[^>]+(?:name|property)=["']citation_pdf_url["'][^>]+content=["']([^"']+)["']""",
+        r"""<meta[^>]+content=["']([^"']+)["'][^>]+(?:name|property)=["']citation_pdf_url["']""",
+        r"""<a[^>]+href=["']([^"']+\.pdf(?:\?[^"']*)?)["']""",
+        r"""<a[^>]+href=["']([^"']*downloadPdf[^"']*)["']""",
+    )
+
+    for pattern in patterns:
+        match = re.search(pattern, html, re.IGNORECASE)
+        if not match:
+            continue
+        candidate = urljoin(final_url, match.group(1).strip())
+        if candidate:
+            return candidate
+
+    return ""
+
+
 def _extract_pdf_url(paper: Dict[str, Any]) -> str:
     candidates = [
         paper.get("pdf_url"),
+        paper.get("url"),
+        paper.get("paper_url"),
+        paper.get("doi_url"),
+        paper.get("openreview_url"),
         (paper.get("metadata") or {}).get("pdf_url"),
+        (paper.get("metadata") or {}).get("url"),
         (paper.get("metadata") or {}).get("link"),
         (paper.get("metadata") or {}).get("paper_url"),
+        (paper.get("metadata") or {}).get("doi_url"),
+        (paper.get("metadata") or {}).get("openreview_url"),
     ]
 
     for candidate in candidates:
         text = _clean_text(candidate)
-        if text.startswith("http://") or text.startswith("https://"):
+        if _looks_like_pdf_url(text):
             return text
+
+    for source_url in _collect_source_page_urls(paper):
+        try:
+            resolved = _resolve_pdf_url_from_source_page(source_url)
+        except Exception as exc:
+            print(f"  Failed to resolve PDF from source page {source_url[:120]}: {exc}")
+            continue
+        if _clean_text(resolved):
+            return resolved
 
     arxiv_id = _clean_text(paper.get("arxiv_id"))
     if arxiv_id:
         return f"https://arxiv.org/pdf/{arxiv_id}.pdf"
     return ""
+
+
+def _get_pdf_enrichment_mode() -> str:
+    """Return PDF enrichment mode: smart, always, or off."""
+    mode = os.environ.get("READING_REPORT_PDF_MODE", "always").strip().lower()
+    return mode or "smart"
+
+
+def _paper_has_sufficient_metadata_for_report(paper: Dict[str, Any]) -> bool:
+    """Whether the existing paper payload is already enough for a solid abstract-based report."""
+    return bool(
+        _clean_text(paper.get("abstract"))
+        and _parse_jsonish_list(paper.get("authors"))
+        and not _looks_like_placeholder_title(_clean_text(paper.get("title")))
+    )
+
+
+def _is_arxiv_pdf_url(pdf_url: str) -> bool:
+    return "arxiv.org/" in _clean_text(pdf_url).lower()
+
+
+def _should_attempt_pdf_enrichment(
+    paper: Dict[str, Any],
+    pdf_url: str,
+    *,
+    detail_fetch_failed: bool = False,
+) -> Tuple[bool, str]:
+    """Decide whether to download/parse the PDF for this report."""
+    if not _clean_text(pdf_url):
+        return False, "no_pdf_url"
+
+    mode = _get_pdf_enrichment_mode()
+    if mode in {"off", "false", "0", "disabled", "none"}:
+        return False, "pdf_mode_disabled"
+
+    if mode in {"always", "on", "true", "1", "force"}:
+        return True, "forced"
+
+    if not _paper_has_sufficient_metadata_for_report(paper):
+        return True, "metadata_incomplete"
+
+    if detail_fetch_failed and _is_arxiv_pdf_url(pdf_url):
+        return False, "arxiv_detail_failed"
+
+    return False, "metadata_already_sufficient"
 
 
 def _extract_source_links(paper: Dict[str, Any]) -> List[Tuple[str, str]]:
@@ -376,7 +667,13 @@ def _extract_source_links(paper: Dict[str, Any]) -> List[Tuple[str, str]]:
     if doi:
         links.append(("DOI", f"https://doi.org/{doi}"))
 
-    paper_url = _clean_text((paper.get("metadata") or {}).get("paper_url"))
+    paper_url = _clean_text(
+        paper.get("paper_url")
+        or paper.get("url")
+        or (paper.get("metadata") or {}).get("paper_url")
+        or (paper.get("metadata") or {}).get("url")
+        or (paper.get("metadata") or {}).get("link")
+    )
     if paper_url and all(paper_url != url for _, url in links):
         links.append(("原始链接", paper_url))
 
@@ -390,6 +687,11 @@ def _download_pdf(pdf_url: str, title: str) -> str:
         headers=DEFAULT_REQUEST_HEADERS,
     )
     response.raise_for_status()
+    content_type = str(response.headers.get("Content-Type") or "").lower()
+    if "application/pdf" not in content_type and not response.content.startswith(b"%PDF"):
+        raise ValueError(
+            f"Resolved URL did not return a PDF (content-type={content_type or 'unknown'})"
+        )
 
     safe_prefix = re.sub(r"[^A-Za-z0-9]+", "_", title or "paper").strip("_")[:40] or "paper"
     with tempfile.NamedTemporaryFile(prefix=f"{safe_prefix}_", suffix=".pdf", delete=False) as temp_file:
@@ -413,13 +715,19 @@ def enrich_paper_for_reading_report(paper: Dict[str, Any]) -> Tuple[Dict[str, An
     enriched = _normalize_paper(paper)
     pdf_error: Optional[str] = None
     parsed_pdf: Optional[Dict[str, Any]] = None
+    detail_fetch_failed = False
 
     arxiv_id = _clean_text(enriched.get("arxiv_id"))
     if arxiv_id:
         try:
-            detail = _load_arxiv_fetcher().get_paper_detail(arxiv_id)
+            fetcher = _load_arxiv_fetcher()
+            try:
+                detail = fetcher.get_paper_detail(arxiv_id, timeout=ARXIV_DETAIL_TIMEOUT)
+            except TypeError:
+                detail = fetcher.get_paper_detail(arxiv_id)
         except Exception as exc:
             detail = None
+            detail_fetch_failed = True
             print(f"Failed to fetch arXiv detail for {arxiv_id}: {exc}")
         if detail:
             enriched = _merge_paper_details(enriched, detail)
@@ -429,10 +737,20 @@ def enrich_paper_for_reading_report(paper: Dict[str, Any]) -> Tuple[Dict[str, An
         enriched["pdf_url"] = pdf_url
 
     temp_pdf_path: Optional[str] = None
-    if pdf_url:
+    should_parse_pdf, skip_reason = _should_attempt_pdf_enrichment(
+        enriched,
+        pdf_url,
+        detail_fetch_failed=detail_fetch_failed,
+    )
+    if pdf_url and not should_parse_pdf:
+        print(f"  Skipping PDF enrichment ({skip_reason})")
+
+    if pdf_url and should_parse_pdf:
         try:
+            print(f"  Downloading PDF for enrichment: {pdf_url[:120]}")
             temp_pdf_path = _download_pdf(pdf_url, enriched.get("title", "paper"))
             parsed_pdf = _parse_pdf_for_report(temp_pdf_path)
+            print("  PDF enrichment parsed successfully")
         except Exception as exc:
             pdf_error = str(exc)
             print(f"PDF enrichment failed for {enriched.get('title', 'Unknown')}: {exc}")
@@ -687,6 +1005,53 @@ def format_short_summary(paper: Dict) -> str:
     return "\n".join(lines)
 
 
+def _infer_section_from_abstract(abstract: str, section_type: str) -> str:
+    """
+    从摘要中推断特定部分的内容
+
+    Args:
+        abstract: 论文摘要
+        section_type: 要推断的部分类型 (background, method, results)
+
+    Returns:
+        推断出的部分内容
+    """
+    if not abstract:
+        return ""
+
+    sentences = _split_sentences(abstract)
+    if not sentences:
+        return ""
+
+    # 根据部分类型选择不同的线索词
+    section_cues = {
+        "background": ("we address", "we tackle", "challenge", "problem", "limitation", "however", "despite", "existing", "prior work"),
+        "method": ("we propose", "we present", "we introduce", "we develop", "our approach", "our method", "framework", "model", "architecture"),
+        "results": ("outperform", "improve", "achieve", "demonstrate", "results show", "experimental", "evaluation", "gain", "better than", "superior"),
+    }
+
+    cues = section_cues.get(section_type, ())
+
+    # 优先选择包含线索词的句子
+    matched = []
+    for sentence in sentences:
+        lowered = sentence.lower()
+        if any(cue in lowered for cue in cues):
+            matched.append(sentence)
+
+    if matched:
+        return " ".join(matched[:2])
+
+    # 如果没有匹配的，根据位置返回
+    if section_type == "background":
+        return " ".join(sentences[:2]) if len(sentences) >= 2 else sentences[0] if sentences else ""
+    elif section_type == "results":
+        return " ".join(sentences[-2:]) if len(sentences) >= 2 else sentences[-1] if sentences else ""
+    else:  # method
+        mid = len(sentences) // 2
+        return " ".join(sentences[mid:mid+2]) if len(sentences) > 2 else sentences[mid] if sentences else ""
+
+
 def build_heuristic_report_payload(
     paper: Dict[str, Any],
     user_profile: Dict[str, Any],
@@ -704,27 +1069,29 @@ def build_heuristic_report_payload(
     discussion = _truncate_text(sections.get("discussion"), MAX_SECTION_CHARS)
     conclusion = _truncate_text(sections.get("conclusion"), MAX_SECTION_CHARS)
 
+    # 使用 PDF 解析的章节内容，或者从摘要推断
+    bg_from_pdf = " ".join(_pick_sentences(introduction, limit=2)) if introduction else ""
+    bg_from_abstract = _infer_section_from_abstract(abstract, "background")
+    research_background = _first_non_empty(bg_from_pdf, bg_from_abstract)
+    if not research_background:
+        research_background = "建议先查看原文摘要和引言部分以了解研究背景。"
+
+    method_from_pdf = " ".join(_pick_sentences(method, limit=2, cues=CONTRIBUTION_CUES)) if method else ""
+    method_from_abstract = _infer_section_from_abstract(abstract, "method")
+    core_method = _first_non_empty(method_from_pdf, method_from_abstract)
+    if not core_method:
+        core_method = "方法细节建议重点查看原文的 Method / Approach 部分。"
+
+    results_from_pdf = " ".join(_pick_sentences(results, limit=2, cues=RESULT_CUES)) if results else ""
+    results_from_abstract = _infer_section_from_abstract(abstract, "results")
+    key_results = _first_non_empty(results_from_pdf, results_from_abstract)
+    if not key_results:
+        key_results = "实验结果和建议重点核对原文表格和主要指标。"
+
     summary_candidates = _pick_sentences(abstract, limit=1, cues=CONTRIBUTION_CUES + RESULT_CUES)
     if not summary_candidates:
         summary_candidates = _pick_sentences(introduction or abstract, limit=1)
     one_sentence_summary = summary_candidates[0] if summary_candidates else "本文的核心信息仍建议结合原文进一步核对。"
-
-    research_background = _first_non_empty(
-        " ".join(_pick_sentences(introduction, limit=2)),
-        " ".join(_pick_sentences(abstract, limit=2)),
-        "当前可用信息不足，建议先查看原文的摘要和引言部分。",
-    )
-    core_method = _first_non_empty(
-        " ".join(_pick_sentences(method, limit=2, cues=CONTRIBUTION_CUES)),
-        " ".join(_pick_sentences(abstract, limit=2, cues=CONTRIBUTION_CUES)),
-        "方法细节尚未成功解析，建议重点查看原文的 Method / Approach 部分。",
-    )
-    key_results = _first_non_empty(
-        " ".join(_pick_sentences(results, limit=2, cues=RESULT_CUES)),
-        " ".join(_pick_sentences(conclusion or discussion, limit=2, cues=RESULT_CUES)),
-        " ".join(_pick_sentences(abstract, limit=2, cues=RESULT_CUES)),
-        "目前没有提炼到足够明确的结果句子，建议重点核对实验表格和主要指标。",
-    )
 
     main_contributions = _unique_preserve_order(
         _pick_sentences(abstract, limit=3, cues=CONTRIBUTION_CUES)
@@ -763,6 +1130,14 @@ def build_heuristic_report_payload(
         item for item in [paper.get("title"), abstract, introduction, method, results, conclusion, discussion] if item
     )
 
+    analysis_note = (
+        "本报告已结合 PDF 全文结构做自动提炼。"
+        if parsed_pdf
+        else "本报告当前基于摘要和元数据自动生成，方法与实验细节建议回到原文核对。"
+    )
+    if pdf_error:
+        analysis_note = _append_analysis_note(analysis_note, _describe_pdf_fallback(pdf_error))
+
     return {
         "abstract": abstract,
         "one_sentence_summary": one_sentence_summary,
@@ -775,11 +1150,7 @@ def build_heuristic_report_payload(
         "reading_focus": _unique_preserve_order(reading_focus)[:4],
         "estimated_reading_minutes": _estimate_reading_minutes(parsed_pdf, abstract),
         "analysis_source": "pdf" if parsed_pdf else "abstract",
-        "analysis_note": (
-            "本报告已结合 PDF 全文结构做自动提炼。"
-            if parsed_pdf
-            else "本报告当前基于摘要和元数据自动生成，方法与实验细节建议回到原文核对。"
-        ),
+        "analysis_note": analysis_note,
         "recommendation_label": _recommendation_label(paper),
     }
 
@@ -806,26 +1177,31 @@ def _synthesize_report_with_llm(
     parsed_pdf: Optional[Dict[str, Any]],
     heuristic_payload: Dict[str, Any],
 ) -> Optional[Dict[str, Any]]:
+    fallback_note = "生成式精读补充本次未返回，当前内容仍按精读模板基于已拿到的摘要、元数据和可用 PDF 片段生成。"
+
     try:
         llm_parser = _load_llm_parser()
     except Exception as exc:
         print(f"Unable to load llm parser for reading report: {exc}")
-        return None
+        return {"analysis_note": fallback_note}
 
     helper = getattr(llm_parser, "synthesize_reading_report_with_llm", None)
     if not callable(helper):
-        return None
+        return {"analysis_note": fallback_note}
 
     try:
-        return helper(
+        result = helper(
             paper=paper,
             user_profile=user_profile,
             parsed_pdf=parsed_pdf,
             heuristic_payload=heuristic_payload,
         )
+        if isinstance(result, dict) and result:
+            return result
+        return {"analysis_note": fallback_note}
     except Exception as exc:
         print(f"LLM reading synthesis failed: {exc}")
-        return None
+        return {"analysis_note": fallback_note}
 
 
 def _merge_report_payload(base: Dict[str, Any], llm_payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -833,10 +1209,14 @@ def _merge_report_payload(base: Dict[str, Any], llm_payload: Optional[Dict[str, 
         return base
 
     merged = dict(base)
-    for key in ("one_sentence_summary", "research_background", "core_method", "key_results", "analysis_note"):
+    for key in ("one_sentence_summary", "research_background", "core_method", "key_results"):
         value = _clean_text(llm_payload.get(key))
         if value:
             merged[key] = value
+
+    analysis_note = _clean_text(llm_payload.get("analysis_note"))
+    if analysis_note:
+        merged["analysis_note"] = _append_analysis_note(merged.get("analysis_note"), analysis_note)
 
     for key in ("main_contributions", "limitations", "relevance_points", "reading_focus"):
         values = _normalize_string_list(llm_payload.get(key))
@@ -874,8 +1254,9 @@ def _resolve_doc_url_from_meta(doc_token: Optional[str]) -> Optional[str]:
                     candidates.extend([item.get("url"), item.get("doc_url")])
 
     for candidate in candidates:
-        if isinstance(candidate, str) and candidate.strip():
-            return candidate.strip()
+        text = str(candidate or "").strip()
+        if text.startswith("http://") or text.startswith("https://"):
+            return text
     return None
 
 
@@ -889,6 +1270,13 @@ def generate_reading_report(
     abstract = payload.get("abstract") or _clean_text(paper.get("abstract")) or "暂无摘要。"
     arxiv_id = _clean_text(paper.get("arxiv_id"))
     doi = _clean_text(paper.get("doi"))
+    recommendation_label = payload.get("recommendation_label") or _recommendation_label(paper)
+    recommendation_score = _recommendation_score(recommendation_label)
+    recommendation_stars = "★" * recommendation_score + "☆" * (5 - recommendation_score)
+    analysis_source_label = "PDF 全文 + 元数据" if payload.get("analysis_source") == "pdf" else "摘要 + 元数据"
+    analysis_note = _clean_text(payload.get("analysis_note"))
+    resource_items = _build_resource_items(paper)
+    recommendation_reason = _build_recommendation_reason(payload)
 
     lines = []
     lines.append(f"# {title}")
@@ -897,11 +1285,11 @@ def generate_reading_report(
     lines.append("")
     lines.append(f"- 作者：{_format_authors(paper.get('authors'))}")
     lines.append(f"- 机构：{_clean_text(paper.get('institution')) or '未提供'}")
-    lines.append(f"- 期刊 / 会议：{_clean_text(paper.get('venue')) or '未知'}")
-    lines.append(f"- 发表日期：{_clean_text(paper.get('publish_date')) or '未知'}")
-    lines.append(f"- 推荐级别：**{payload.get('recommendation_label') or _recommendation_label(paper)}**")
+    lines.append(f"- 来源：{_clean_text(paper.get('venue') or paper.get('journal') or paper.get('source')) or '未知'}")
+    lines.append(f"- 日期：{_clean_text(paper.get('publish_date')) or '未知'}")
+    lines.append(f"- 推荐级别：**{recommendation_label}**")
     lines.append(f"- 预计阅读时间：约 {int(payload.get('estimated_reading_minutes') or 8)} 分钟")
-    lines.append(f"- 解析来源：{'PDF 全文 + 元数据' if payload.get('analysis_source') == 'pdf' else '摘要 + 元数据'}")
+    lines.append(f"- 解析来源：{analysis_source_label}")
     if arxiv_id:
         lines.append(f"- arXiv ID：`{arxiv_id}`")
     if doi:
@@ -920,7 +1308,7 @@ def generate_reading_report(
             lines.append(f"> {paragraph.strip()}")
     lines.append("")
 
-    lines.append("## 研究背景与问题")
+    lines.append("## 研究背景")
     lines.append("")
     lines.append(payload.get("research_background") or "建议先回到原文摘要和引言确认研究问题。")
     lines.append("")
@@ -930,24 +1318,24 @@ def generate_reading_report(
     lines.append(payload.get("core_method") or "当前未成功提炼方法细节，请重点阅读 Method / Approach 部分。")
     lines.append("")
 
-    lines.append("## 关键结果")
+    lines.append("## 主要结果")
     lines.append("")
     lines.append(payload.get("key_results") or "当前没有提炼出明确结果，请重点核对实验表格和主要指标。")
     lines.append("")
 
-    lines.append("## 主要贡献")
+    lines.append("## 创新点")
     lines.append("")
-    for item in payload.get("main_contributions") or []:
-        lines.append(f"- {item}")
+    for index, item in enumerate(payload.get("main_contributions") or [], start=1):
+        lines.append(f"{index}. {item}")
     lines.append("")
 
-    lines.append("## 可能局限 / 阅读时重点关注")
+    lines.append("## 局限性")
     lines.append("")
     for item in payload.get("limitations") or []:
         lines.append(f"- {item}")
     lines.append("")
 
-    lines.append("## 与你的研究画像关联")
+    lines.append("## 与我的研究的关系")
     lines.append("")
     for item in payload.get("relevance_points") or []:
         lines.append(f"- {item}")
@@ -955,19 +1343,25 @@ def generate_reading_report(
 
     lines.append("## 建议怎么读")
     lines.append("")
-    if _clean_text(payload.get("analysis_note")):
-        lines.append(f"- {payload['analysis_note']}")
+    if analysis_note:
+        lines.append(f"- {analysis_note}")
     for item in payload.get("reading_focus") or []:
         lines.append(f"- {item}")
     lines.append("")
 
-    source_links = _extract_source_links(paper)
-    if source_links:
-        lines.append("## 原文与资源")
-        lines.append("")
-        for label, url in source_links:
-            lines.append(f"- {label}：{url}")
-        lines.append("")
+    lines.append("## 代码与资源")
+    lines.append("")
+    for label, value in resource_items:
+        lines.append(f"- {label}：{value}")
+    if analysis_note:
+        lines.append(f"- 解析说明：{analysis_note}")
+    lines.append("")
+
+    lines.append("## 推荐指数")
+    lines.append("")
+    lines.append(f"{recommendation_stars}（{recommendation_score}/5）")
+    lines.append(f"- 推荐理由：{recommendation_reason}")
+    lines.append("")
 
     lines.append("## 我的笔记")
     lines.append("")
@@ -997,10 +1391,7 @@ def resolve_selected_papers(paper_refs: List[int], papers: List[Dict]) -> List[D
 
         idx = int(paper_ref) - 1
         if 0 <= idx < len(papers):
-            candidate = papers[idx]
-            candidate_id = candidate.get("id")
-            if candidate_id is None or int(candidate_id) == int(paper_ref):
-                paper = candidate
+            paper = papers[idx]
 
         if paper is None:
             paper = papers_by_id.get(int(paper_ref))
