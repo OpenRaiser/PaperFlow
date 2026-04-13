@@ -1,0 +1,78 @@
+# SciTaste 期刊源配置
+#
+# 字段说明：
+#   name: 期刊名称
+#   source: 数据源 API/RSS
+#   filter: 过滤条件描述
+#   keywords: 关键词列表（用于过滤）
+#   enabled: 是否启用
+
+journals:
+  # AI/CV 专业期刊 - 每周扫描
+  weekly_scan:
+    - name: Nature Biotechnology
+      source: Nature API / RSS
+      filter: AI + computational biology + protein / genomics 相关
+      enabled: true
+
+    - name: TPAMI
+      source: IEEE Xplore API
+      filter: early access + latest issue
+      enabled: true
+
+    - name: IJCV
+      source: Springer API
+      filter: online first + latest issue
+      enabled: true
+
+    - name: Nature Machine Intelligence
+      source: Nature API / RSS
+      filter: all articles
+      enabled: true
+
+    - name: Nature Computational Science
+      source: Nature API / RSS
+      filter: all articles
+      enabled: true
+
+    - name: Nature Methods
+      source: Nature API / RSS
+      filter: AI/computational 相关
+      keywords: [AI, computational, machine learning, data]
+      enabled: true
+
+    - name: Cell
+      source: Cell RSS
+      filter: computational + AI for biology 相关
+      enabled: true
+
+    - name: PNAS
+      source: PNAS RSS
+      filter: AI + biology + computational + data 相关
+      enabled: true
+
+  # 顶级综合期刊 - 每周扫描
+  weekly_scan_top:
+    - name: Nature
+      source: Nature API / RSS
+      filter: AI + biology + computational + data 相关
+      keywords: [artificial intelligence, machine learning, computational biology, data science]
+      enabled: true
+
+    - name: Science
+      source: Science RSS
+      filter: AI + biology + computational + data 相关
+      keywords: [artificial intelligence, machine learning, computational biology, data science]
+      enabled: true
+
+    - name: Science Advances
+      source: Science RSS
+      filter: AI + biology + computational 相关
+      keywords: [artificial intelligence, machine learning, computational biology]
+      enabled: true
+
+    - name: Nature Communications
+      source: Nature API / RSS
+      filter: AI + biology + computational 相关
+      keywords: [artificial intelligence, machine learning, computational biology]
+      enabled: true

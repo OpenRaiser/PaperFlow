@@ -1,0 +1,87 @@
+# SciTaste 会议源配置
+#
+# 字段说明：
+#   name: 会议简称
+#   venue_type: 领域类型 (ML/CV/NLP/Multimedia)
+#   acceptance_timeline: 论文接受公布时间
+#   conference_date: 会议举办时间
+#   source: 数据源 API
+#   venue_id: OpenReview venue ID
+#   enabled: 是否启用
+
+conferences:
+  # ML 会议
+  - name: ICLR
+    venue_type: ML
+    acceptance_timeline: 1 月底
+    conference_date: 4-5 月
+    source: openreview.net API
+    venue_id: ICLR.cc
+    enabled: true
+
+  - name: ICML
+    venue_type: ML
+    acceptance_timeline: 5 月初
+    conference_date: 7 月
+    source: openreview.net API
+    venue_id: ICML.cc
+    enabled: true
+
+  - name: NeurIPS
+    venue_type: ML
+    acceptance_timeline: 9 月底
+    conference_date: 12 月
+    source: openreview.net API
+    venue_id: NeurIPS.cc
+    enabled: true
+
+  # CV 会议
+  - name: CVPR
+    venue_type: CV
+    acceptance_timeline: 2 月底
+    conference_date: 6 月
+    source: CVF Open Access
+    venue_id: CVPR.org
+    enabled: true
+
+  - name: ICCV
+    venue_type: CV
+    acceptance_timeline: 7 月（奇数年）
+    conference_date: 10 月
+    source: CVF Open Access
+    venue_id: ICCV.org
+    enabled: true
+
+  - name: ECCV
+    venue_type: CV
+    acceptance_timeline: 7 月（偶数年）
+    conference_date: 10 月
+    source: ECVA papers.php
+    venue_id: ECCV.org
+    enabled: true
+
+  # NLP 会议
+  - name: ACL
+    venue_type: NLP
+    acceptance_timeline: 5 月
+    conference_date: 7-8 月
+    source: openreview / aclanthology
+    venue_id: ACL.org
+    enabled: true
+
+  - name: EMNLP
+    venue_type: NLP
+    acceptance_timeline: 9 月
+    conference_date: 11 月
+    source: openreview / aclanthology
+    venue_id: EMNLP.org
+    enabled: true
+
+  # 多媒体会议
+  - name: ACM MM
+    venue_type: Multimedia
+    acceptance_timeline: 7 月
+    conference_date: 10 月
+    source: DBLP proceedings TOC
+    venue_id: db/conf/mm/mm{year}.bht
+    enabled: true

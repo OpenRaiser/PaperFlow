@@ -1,0 +1,25 @@
+{
+  "roles": {
+    "rolea": {
+      "user_id": "user_rolea",
+      "description": "direction: data-native scientific discovery, bio-molecular data infrastructure, gui agent",
+      "feishu_chat_id": ""
+    },
+    "roleb": {
+      "user_id": "user_roleb",
+      "description": "direction: multimodal reasoning, vision-language model, evaluation",
+      "feishu_chat_id": ""
+    },
+    "rolec": {
+      "user_id": "user_rolec",
+      "description": "direction: protein language model, bioinformatics, molecular representation learning",
+      "feishu_chat_id": ""
+    },
+    "roled": {
+      "user_id": "user_roled",
+      "description": "direction: embodied ai, reinforcement learning, robotics",
+      "feishu_chat_id": ""
+    }
+  },
+  "current_role": "rolea"
+}

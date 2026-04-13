@@ -1,0 +1,68 @@
+# 排序权重配置
+# 用于计算论文综合得分
+
+# 基础权重
+w1_interest_vector: 0.35    # 兴趣向量相似度（余弦相似度）
+w2_topic_weight: 0.25       # 主题权重匹配
+w3_author_institution: 0.20 # 作者/机构热度
+w4_quality_signal: 0.20     # 论文质量信号（venue 声誉、引用预期等）
+
+# 必读清单加成
+bonus_must_read: 1.0        # 必读清单命中直接置顶
+
+# 分类阈值
+# 注意：冷启动阶段 interest_vector 为零向量，分数主要依赖 topic_match 和 quality_signal
+# 典型分数范围：0.10（无匹配）~ 0.45（主题匹配）+ bonus
+threshold_high_relevant: 0.40    # 🔴 高度相关 (score >= 0.40)
+threshold_maybe_interested: 0.25 # 🟡 可能感兴趣 (0.25 <= score < 0.40)
+threshold_edge_relevant: 0.15    # 🔵 边缘相关 (0.15 <= score < 0.25)
+min_relevance_signal: 0.08       # 先满足个人相关性下限，再让 venue 质量分参与推送
+rank_high_fraction: 0.10         # 允许提升到高相关的相关论文比例
+rank_maybe_fraction: 0.40        # 允许提升到可能感兴趣的相关论文比例
+# score < 0.15 → 过滤不推送
+
+# 兴趣向量更新参数
+ema_alpha: 0.1              # EMA 学习率（缓慢漂移，避免被单日偏好带偏）
+
+# 主题权重更新参数
+topic_positive_delta: 0.02  # 正向增量（用户选择了相关论文）
+topic_negative_delta: 0.01  # 负向减量（用户跳过了相关论文）
+# 注意：负向增量小于正向，因为不选择可能是没时间而非不感兴趣
+
+# 时间衰减参数
+time_decay_rate: 0.01       # 每天衰减率（1%）
+time_decay_min_weight: 0.1  # 最小权重（不低于 0.1）
+
+# 新主题检测参数
+new_topic_threshold: 3          # 连续出现多少次视为新兴趣
+new_topic_init_weight: 0.4      # 新主题初始权重
+new_topic_cooldown_days: 30     # 新主题冷却期（30 天内不重复检测）
+
+# 作者/机构热度更新参数
+author_heat_positive_delta: 0.05   # 选择一次增加的热度
+author_heat_negative_delta: 0.02   # 跳过一次降低的热度
+author_heat_decay_rate: 0.005      # 每日自然衰减率
+author_heat_min: 0.1               # 最小热度
+author_heat_max: 1.0               # 最大热度
+
+# 质量信号计算参数
+quality_venue_weights:
+  Nature/Science: 1.0
+  Nature subjournals: 0.9
+  TPAMI/IJCV: 0.85
+  NeurIPS/ICML/ICLR: 0.8
+  CVPR/ICCV/ECCV: 0.75
+  ACL/EMNLP: 0.7
+  arXiv: 0.5
+
+push_target_count: 50
+push_max_count: 100
+push_min_count: 20
+source_diversity_min_total: 12
+source_diversity_min_per_bucket: 3
+source_diversity_max_share: 0.70
+
+# 推送参数
+push_target_count: 50       # 目标推送论文数量
+push_max_count: 100         # 最大推送数量
+push_min_count: 20          # 最少推送数量（过少时降低阈值）

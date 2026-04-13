@@ -1,0 +1,43 @@
+{
+  "user_id": "{{user_id}}",
+  "version": "0.1",
+  "created_at": "{{created_at}}",
+  "updated_at": "{{updated_at}}",
+  "core_directions": {
+    "Data-native Scientific Discovery": 0.80,
+    "Bio-molecular Data Infrastructure": 0.70,
+    "GUI Agent": 0.60,
+    "Optimizer/Training Methods": 0.50
+  },
+  "methodology_preferences": {
+    "preference_data_driven_over_theory": true,
+    "preference_systematic_work_over_incremental": true,
+    "preference_open_source_code": true,
+    "preference_bio_science_application": true
+  },
+  "must_read": {
+    "authors": [],
+    "institutions": [],
+    "keywords": []
+  },
+  "topic_weights": {
+    "data-native": 0.80,
+    "bio-molecular": 0.70,
+    "gui-agent": 0.60,
+    "optimizer": 0.50
+  },
+  "author_heat": {},
+  "institution_heat": {},
+  "interest_vector": [],
+  "taste_profile": {
+    "preferred_work_type": ["empirical", "systematic", "applied"],
+    "dispreferred_work_type": ["pure_theory", "incremental"]
+  },
+  "reading_history": [],
+  "behavior_logs_summary": {
+    "total_pushes": 0,
+    "total_selected": 0,
+    "total_skipped": 0,
+    "selection_rate": 0.0
+  }
+}
