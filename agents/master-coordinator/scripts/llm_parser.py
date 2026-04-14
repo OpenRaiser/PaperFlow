@@ -1209,6 +1209,88 @@ def _clean_generated_list(value: Any, limit: int = 4) -> List[str]:
     return cleaned[:limit]
 
 
+def _summarize_retrieved_evidence_for_prompt(
+    heuristic_payload: Optional[Dict[str, Any]],
+    *,
+    items_per_bucket: int = 2,
+    max_chars: int = 240,
+) -> Dict[str, Any]:
+    heuristic_payload = heuristic_payload or {}
+    retrieved_evidence = heuristic_payload.get("retrieved_evidence") or {}
+    if not isinstance(retrieved_evidence, dict):
+        return {}
+
+    matches = retrieved_evidence.get("matches") or {}
+    if not isinstance(matches, dict):
+        return {}
+
+    summary: Dict[str, Any] = {}
+    descriptor = str(retrieved_evidence.get("descriptor") or "").strip()
+    chunk_count = retrieved_evidence.get("chunk_count")
+    if descriptor:
+        summary["descriptor"] = descriptor
+    if isinstance(chunk_count, int) and chunk_count > 0:
+        summary["chunk_count"] = chunk_count
+
+    buckets: Dict[str, List[str]] = {}
+    for bucket in ("background", "method", "results", "limitations", "relevance"):
+        bucket_matches = matches.get(bucket) or []
+        if not isinstance(bucket_matches, list):
+            continue
+
+        items: List[str] = []
+        for match in bucket_matches[:items_per_bucket]:
+            if not isinstance(match, dict):
+                continue
+            section = str(match.get("section") or "").strip() or "pdf"
+            score = match.get("score")
+            score_text = ""
+            if isinstance(score, (int, float)):
+                score_text = f" score={float(score):.3f}"
+            text = _truncate_prompt_text(match.get("text"), max_chars)
+            if not text:
+                continue
+            items.append(f"[{section}{score_text}] {text}")
+
+        if items:
+            buckets[bucket] = items
+
+    if buckets:
+        summary["matches"] = buckets
+    return summary
+
+
+def _summarize_field_evidence_map_for_prompt(
+    heuristic_payload: Optional[Dict[str, Any]],
+    *,
+    items_per_field: int = 2,
+    max_chars: int = 220,
+) -> Dict[str, List[str]]:
+    heuristic_payload = heuristic_payload or {}
+    field_evidence_map = heuristic_payload.get("field_evidence_map") or {}
+    if not isinstance(field_evidence_map, dict):
+        return {}
+
+    summary: Dict[str, List[str]] = {}
+    for field in (
+        "one_sentence_summary",
+        "research_background",
+        "core_method",
+        "key_results",
+        "main_contributions",
+        "limitations",
+        "relevance_points",
+        "reading_focus",
+    ):
+        values = field_evidence_map.get(field) or []
+        if not isinstance(values, list):
+            continue
+        items = [_truncate_prompt_text(value, max_chars) for value in values[:items_per_field] if str(value).strip()]
+        if items:
+            summary[field] = items
+    return summary
+
+
 def synthesize_reading_report_with_llm(
     paper: Dict[str, Any],
     user_profile: Optional[Dict[str, Any]] = None,
@@ -1225,6 +1307,8 @@ def synthesize_reading_report_with_llm(
         key=lambda item: float(item[1]),
         reverse=True,
     )[:3]
+    retrieved_evidence = _summarize_retrieved_evidence_for_prompt(heuristic_payload)
+    field_evidence_map = _summarize_field_evidence_map_for_prompt(heuristic_payload)
     preference_summary = json.dumps(
         user_profile.get("methodology_preferences") or {},
         ensure_ascii=False,
@@ -1263,6 +1347,8 @@ def synthesize_reading_report_with_llm(
                 "relevance_points": heuristic_payload.get("relevance_points"),
                 "reading_focus": heuristic_payload.get("reading_focus"),
             },
+            "retrieved_evidence": retrieved_evidence,
+            "field_evidence_map": field_evidence_map,
         },
         ensure_ascii=False,
     )
@@ -1270,10 +1356,16 @@ def synthesize_reading_report_with_llm(
     system_prompt = (
         "你是科研论文精读助手。请基于提供的论文元数据、摘要、可用章节摘录和用户画像，"
         "生成一份适合飞书文档使用的结构化中文精读内容。"
+        "如果提供了 retrieved_evidence，请优先参考这些 PDF 语义检索命中的证据片段，"
+        "再结合 heuristic_draft 做润色和补全；当二者冲突时，优先采用 retrieved_evidence。"
+        "如果提供了 field_evidence_map，请让每个输出字段优先参考它对应的证据锚点，"
+        "不要把 results 证据写到 research_background，也不要把 background 证据误写成方法贡献。"
         "不要编造具体实验数值；如果信息不足，请保持克制并明确指出需要回原文核对。"
+        "可以改写证据，不要大段逐字复制。"
         "输出 JSON，字段包括："
         "one_sentence_summary, research_background, core_method, key_results, "
-        "main_contributions, limitations, relevance_points, reading_focus, recommendation_label。"
+        "main_contributions, limitations, relevance_points, reading_focus, recommendation_label, analysis_note。"
+        "analysis_note 用一句话说明本次生成是否参考了 PDF 检索证据。"
         "其中 recommendation_label 只能是“强烈推荐”“推荐阅读”“值得快速浏览”“按需阅读”之一。"
     )
 
@@ -1287,7 +1379,7 @@ def synthesize_reading_report_with_llm(
         return None
 
     normalized: Dict[str, Any] = {}
-    for key in ("one_sentence_summary", "research_background", "core_method", "key_results", "recommendation_label"):
+    for key in ("one_sentence_summary", "research_background", "core_method", "key_results", "recommendation_label", "analysis_note"):
         value = str(result.get(key, "")).strip()
         if value:
             normalized[key] = value

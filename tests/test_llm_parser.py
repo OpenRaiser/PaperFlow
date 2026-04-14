@@ -355,6 +355,156 @@ def test_synthesize_reading_report_with_llm_uses_reading_timeout_override(monkey
     assert captured["timeout_override"] == 180.0
 
 
+def test_synthesize_reading_report_with_llm_includes_retrieved_evidence_in_prompt(monkeypatch):
+    captured = {}
+
+    def fake_generate(system_prompt, user_text, max_tokens=500, timeout_override=None, **kwargs):
+        captured["system_prompt"] = system_prompt
+        captured["user_text"] = user_text
+        return {
+            "one_sentence_summary": "summary",
+            "research_background": "background",
+            "core_method": "method",
+            "key_results": "results",
+            "main_contributions": ["c1"],
+            "limitations": ["l1"],
+            "relevance_points": ["r1"],
+            "reading_focus": ["f1"],
+            "recommendation_label": "推荐阅读",
+            "analysis_note": "生成式补充已参考 PDF 检索证据。",
+        }
+
+    monkeypatch.setattr(llm_parser, "_generate_json_with_configured_llm", fake_generate)
+
+    result = llm_parser.synthesize_reading_report_with_llm(
+        paper={"title": "Paper", "abstract": "Abstract", "authors": ["Alice"]},
+        user_profile={"core_directions": {"agent": 0.8}},
+        parsed_pdf={"sections": {"method": "We propose a planner."}},
+        heuristic_payload={
+            "one_sentence_summary": "heuristic draft",
+            "retrieved_evidence": {
+                "descriptor": "openai:test:1024",
+                "chunk_count": 8,
+                "matches": {
+                    "method": [
+                        {
+                            "section": "method",
+                            "score": 0.91,
+                            "text": "We propose a two-stage planner with an evidence retriever.",
+                        }
+                    ],
+                    "results": [
+                        {
+                            "section": "results",
+                            "score": 0.88,
+                            "text": "The method improves ranking quality by 12%.",
+                        }
+                    ],
+                },
+            },
+        },
+    )
+
+    assert result["analysis_note"] == "生成式补充已参考 PDF 检索证据。"
+    assert "retrieved_evidence" in captured["user_text"]
+    assert "two-stage planner with an evidence retriever" in captured["user_text"]
+    assert "improves ranking quality by 12%" in captured["user_text"]
+    assert "优先参考这些 PDF 语义检索命中的证据片段" in captured["system_prompt"]
+
+
+def test_synthesize_reading_report_with_llm_includes_field_evidence_map_in_prompt(monkeypatch):
+    captured = {}
+
+    def fake_generate(system_prompt, user_text, max_tokens=500, timeout_override=None, **kwargs):
+        captured["system_prompt"] = system_prompt
+        captured["user_text"] = user_text
+        return {
+            "one_sentence_summary": "summary",
+            "research_background": "background",
+            "core_method": "method",
+            "key_results": "results",
+            "main_contributions": ["c1"],
+            "limitations": ["l1"],
+            "relevance_points": ["r1"],
+            "reading_focus": ["f1"],
+            "recommendation_label": "推荐阅读",
+            "analysis_note": "已按字段证据约束生成。",
+        }
+
+    monkeypatch.setattr(llm_parser, "_generate_json_with_configured_llm", fake_generate)
+
+    result = llm_parser.synthesize_reading_report_with_llm(
+        paper={"title": "Paper", "abstract": "Abstract", "authors": ["Alice"]},
+        user_profile={"core_directions": {"agent": 0.8}},
+        parsed_pdf={"sections": {"method": "We propose a planner."}},
+        heuristic_payload={
+            "field_evidence_map": {
+                "research_background": ["Introduction | score=0.901 | The main challenge is dataset shift."],
+                "core_method": ["Method | score=0.933 | We propose a two-stage planner."],
+                "key_results": ["Results | score=0.887 | The method improves ranking quality by 12%."],
+            }
+        },
+    )
+
+    assert result["analysis_note"] == "已按字段证据约束生成。"
+    assert "field_evidence_map" in captured["user_text"]
+    assert "The method improves ranking quality by 12%" in captured["user_text"]
+    assert "不要把 results 证据写到 research_background" in captured["system_prompt"]
+
+
+def test_summarize_retrieved_evidence_for_prompt_limits_and_formats_matches():
+    summary = llm_parser._summarize_retrieved_evidence_for_prompt(
+        {
+            "retrieved_evidence": {
+                "descriptor": "fake:test:4",
+                "chunk_count": 5,
+                "matches": {
+                    "method": [
+                        {
+                            "section": "method",
+                            "score": 0.91234,
+                            "text": "We propose a two-stage planner with an evidence retriever and a gating network.",
+                        },
+                        {
+                            "section": "approach",
+                            "score": 0.83456,
+                            "text": "The gating network ranks candidate papers.",
+                        },
+                        {
+                            "section": "extra",
+                            "score": 0.81234,
+                            "text": "This third item should be truncated by count limit.",
+                        },
+                    ]
+                },
+            }
+        }
+    )
+
+    assert summary["descriptor"] == "fake:test:4"
+    assert summary["chunk_count"] == 5
+    assert len(summary["matches"]["method"]) == 2
+    assert summary["matches"]["method"][0].startswith("[method score=0.912]")
+    assert "two-stage planner" in summary["matches"]["method"][0]
+
+
+def test_summarize_field_evidence_map_for_prompt_limits_items():
+    summary = llm_parser._summarize_field_evidence_map_for_prompt(
+        {
+            "field_evidence_map": {
+                "core_method": [
+                    "Method | score=0.912 | We propose a two-stage planner.",
+                    "Approach | score=0.851 | A gating network ranks candidate papers.",
+                    "Extra | score=0.801 | This third item should be trimmed.",
+                ]
+            }
+        }
+    )
+
+    assert len(summary["core_method"]) == 2
+    assert "two-stage planner" in summary["core_method"][0]
+
+
 def test_local_llm_cuda_oom_falls_back_to_cpu(monkeypatch):
     monkeypatch.setattr(llm_parser, "LOCAL_LLM_DEVICE_OVERRIDE", None)
 

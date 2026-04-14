@@ -16,13 +16,21 @@ import sys
 import os
 import json
 import re
+import hashlib
 import tempfile
+from html import unescape
 from datetime import datetime
 from typing import Dict, List, Optional, Any, Tuple
 from pathlib import Path
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import requests
+from requests.adapters import HTTPAdapter
+
+try:
+    from urllib3.util.retry import Retry
+except ImportError:
+    Retry = None
 
 try:
     from dotenv import load_dotenv
@@ -46,13 +54,42 @@ get_drive_meta = getattr(feishu_reporter, "get_drive_meta", None)
 db_ops = importlib.import_module("skills.storage-helper.scripts.db_ops")
 get_profile = db_ops.get_profile
 log_behavior = db_ops.log_behavior
+get_existing_reading_reports_for_papers = getattr(
+    db_ops,
+    "get_existing_reading_reports_for_papers",
+    lambda user_id, paper_ids: {},
+)
+get_recent_created_report_by_source = getattr(
+    db_ops,
+    "get_recent_created_report_by_source",
+    lambda user_id, source_type, source_key, days=30: None,
+)
 
 
 PDF_DOWNLOAD_TIMEOUT = float(os.environ.get("READING_REPORT_PDF_TIMEOUT", "60"))
 ARXIV_DETAIL_TIMEOUT = float(os.environ.get("READING_REPORT_ARXIV_TIMEOUT", "12"))
 MAX_ABSTRACT_CHARS = int(os.environ.get("READING_REPORT_ABSTRACT_CHARS", "1200"))
 MAX_SECTION_CHARS = int(os.environ.get("READING_REPORT_SECTION_CHARS", "1800"))
-DEFAULT_REQUEST_HEADERS = {"User-Agent": "SciTaste/0.1 ReadingAgent"}
+READING_REPORT_CHUNK_CHARS = int(os.environ.get("READING_REPORT_CHUNK_CHARS", "1200"))
+READING_REPORT_CHUNK_OVERLAP = int(os.environ.get("READING_REPORT_CHUNK_OVERLAP", "180"))
+READING_REPORT_EVIDENCE_TOP_K = int(os.environ.get("READING_REPORT_EVIDENCE_TOP_K", "3"))
+READING_REPORT_EVIDENCE_CACHE_ENABLED = os.environ.get("READING_REPORT_EVIDENCE_CACHE_ENABLED", "1").strip().lower() not in {"0", "false", "off", "no"}
+READING_REPORT_OUTPUT_VERSION = os.environ.get("READING_REPORT_OUTPUT_VERSION", "2026-04-14-v1").strip() or "2026-04-14-v1"
+HTTP_RETRY_TOTAL = int(os.environ.get("SCITASTE_HTTP_RETRIES", "2"))
+HTTP_RETRY_BACKOFF = float(os.environ.get("SCITASTE_HTTP_BACKOFF", "0.8"))
+DEFAULT_REQUEST_HEADERS = {
+    "User-Agent": os.environ.get(
+        "SCITASTE_HTTP_USER_AGENT",
+        (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/135.0.0.0 Safari/537.36"
+        ),
+    ),
+    "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+}
 
 CONTRIBUTION_CUES = (
     "we propose",
@@ -87,6 +124,34 @@ LIMITATION_CUES = (
     "remaining",
     "challenge",
     "beyond the scope",
+)
+
+NON_RESEARCH_TITLE_PATTERNS = (
+    "author correction",
+    "publisher correction",
+    "correction:",
+    "daily briefing",
+    "in other journals",
+    "editorial",
+    "world view",
+    "research highlight",
+    "career column",
+    "book review",
+    "podcast",
+    "video abstract",
+    "news feature",
+    "news & views",
+    "news and views",
+)
+
+FEED_METADATA_PREFIX_RE = re.compile(
+    r"^(?:"
+    r"nature(?: communications| biotechnology| methods| machine intelligence| computational science)?"
+    r"|science(?: advances)?"
+    r"|cell"
+    r"|pnas"
+    r")\s*,\s*published online:\s*[^;]{1,160}(?:;\s*doi:\s*10\.\S+)?\s*",
+    flags=re.I,
 )
 
 DIRECTION_LABELS = {
@@ -173,8 +238,16 @@ def _load_arxiv_fetcher():
     return importlib.import_module("skills.arxiv-fetcher.scripts.fetch_arxiv")
 
 
+def _load_journal_fetcher():
+    return importlib.import_module("skills.journal-fetcher.scripts.fetch_journal")
+
+
 def _load_pdf_parser():
     return importlib.import_module("skills.pdf-parser.scripts.parse_pdf")
+
+
+def _load_embedding_module():
+    return importlib.import_module("skills.embedding.scripts.embed")
 
 
 def _load_llm_parser():
@@ -182,6 +255,63 @@ def _load_llm_parser():
         return importlib.import_module("agents.master-coordinator.scripts.llm_parser")
     except Exception:
         return importlib.import_module("agents.master_coordinator.main").llm_parser
+
+
+def _build_request_headers(*, referer: Optional[str] = None, accept_pdf: bool = False) -> Dict[str, str]:
+    headers = dict(DEFAULT_REQUEST_HEADERS)
+    if accept_pdf:
+        headers["Accept"] = "application/pdf,application/octet-stream;q=0.9,*/*;q=0.8"
+    else:
+        headers["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"
+        headers["Upgrade-Insecure-Requests"] = "1"
+    if referer:
+        headers["Referer"] = referer
+    return headers
+
+
+def _create_http_session() -> requests.Session:
+    session = requests.Session()
+    session.trust_env = True
+
+    if Retry is not None and HTTP_RETRY_TOTAL > 0:
+        retry = Retry(
+            total=HTTP_RETRY_TOTAL,
+            connect=HTTP_RETRY_TOTAL,
+            read=HTTP_RETRY_TOTAL,
+            status=HTTP_RETRY_TOTAL,
+            backoff_factor=HTTP_RETRY_BACKOFF,
+            allowed_methods=frozenset({"GET", "HEAD"}),
+            status_forcelist=(408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 524),
+            respect_retry_after_header=True,
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retry)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+
+    return session
+
+
+def _http_get(
+    url: str,
+    *,
+    timeout: float,
+    referer: Optional[str] = None,
+    accept_pdf: bool = False,
+    allow_redirects: bool = True,
+) -> requests.Response:
+    session = _create_http_session()
+    try:
+        response = session.get(
+            url,
+            timeout=timeout,
+            headers=_build_request_headers(referer=referer, accept_pdf=accept_pdf),
+            allow_redirects=allow_redirects,
+        )
+        response.raise_for_status()
+        return response
+    finally:
+        session.close()
 
 
 def _parse_jsonish_list(value: Any) -> List[str]:
@@ -209,6 +339,27 @@ def _clean_text(text: Any) -> str:
     normalized = re.sub(r"\n{3,}", "\n\n", normalized)
     normalized = re.sub(r"[ \t]+", " ", normalized)
     return normalized.strip()
+
+
+def _strip_html_markup(text: Any) -> str:
+    normalized = unescape(str(text or ""))
+    normalized = re.sub(r"(?i)<br\s*/?>", "\n", normalized)
+    normalized = re.sub(r"(?i)</p\s*>", "\n", normalized)
+    normalized = re.sub(r"(?i)<p\b[^>]*>", "", normalized)
+    normalized = re.sub(r"<[^>]+>", " ", normalized)
+    normalized = normalized.replace("\xa0", " ")
+    return _clean_text(normalized)
+
+
+def _looks_like_feed_metadata_abstract(text: Any) -> bool:
+    normalized = _strip_html_markup(text).lower()
+    return bool(normalized and "published online:" in normalized)
+
+
+def _clean_abstract_text(text: Any) -> str:
+    normalized = _strip_html_markup(text)
+    normalized = FEED_METADATA_PREFIX_RE.sub("", normalized).strip(" \n\t;,:-")
+    return _clean_text(normalized)
 
 
 def _truncate_text(text: Any, max_chars: int) -> str:
@@ -270,11 +421,11 @@ def _append_analysis_note(base: Any, extra: Any) -> str:
     return f"{base_text} {extra_text}"
 
 
-def _describe_pdf_fallback(pdf_error: Optional[str]) -> str:
+def _describe_pdf_fallback(pdf_error: Optional[str], *, fallback_mode: str = "abstract") -> str:
     lowered = _clean_text(pdf_error).lower()
     if not lowered:
-        return "未能拿到 PDF 全文，本次报告改为按模板基于摘要和元数据生成；方法与实验细节建议回原文核对。"
-    if "403" in lowered or "forbidden" in lowered:
+        reason = "未能拿到 PDF 全文"
+    elif "403" in lowered or "forbidden" in lowered:
         reason = "源站拒绝了 PDF 访问"
     elif "timed out" in lowered or "timeout" in lowered:
         reason = "PDF 抓取超时"
@@ -284,6 +435,8 @@ def _describe_pdf_fallback(pdf_error: Optional[str]) -> str:
         reason = "源站没有直接返回 PDF 文件"
     else:
         reason = "PDF 抓取或解析失败"
+    if fallback_mode == "source_page":
+        return f"{reason}，本次报告已回退为基于源站正文和元数据生成；方法与实验细节仍建议回原文核对。"
     return f"{reason}，本次报告改为按模板基于摘要和元数据生成；方法与实验细节建议回原文核对。"
 
 
@@ -347,7 +500,17 @@ def _get_direct_pdf_url(paper: Dict[str, Any]) -> str:
 def _build_resource_items(paper: Dict[str, Any]) -> List[Tuple[str, str]]:
     code_url = _get_first_url(paper, "code_url", "github_url", "repo_url", "repository_url")
     dataset_url = _get_first_url(paper, "dataset_url", "data_url")
-    project_url = _get_first_url(paper, "project_url", "paper_url", "openreview_url", "url")
+    project_url = _get_first_url(
+        paper,
+        "project_url",
+        "paper_url",
+        "openreview_url",
+        "cvf_url",
+        "ecva_url",
+        "dblp_url",
+        "doi_url",
+        "url",
+    )
     pdf_url = _get_direct_pdf_url(paper)
 
     items: List[Tuple[str, str]] = []
@@ -429,7 +592,6 @@ def _normalize_paper(paper: Dict[str, Any]) -> Dict[str, Any]:
 
     for field in (
         "title",
-        "abstract",
         "institution",
         "venue",
         "publish_date",
@@ -440,12 +602,18 @@ def _normalize_paper(paper: Dict[str, Any]) -> Dict[str, Any]:
         "paper_url",
         "doi_url",
         "openreview_url",
+        "cvf_url",
+        "ecva_url",
+        "dblp_url",
         "journal",
         "source",
         "category",
     ):
         if field in normalized:
             normalized[field] = _clean_text(normalized.get(field))
+
+    if "abstract" in normalized:
+        normalized["abstract"] = _clean_abstract_text(normalized.get("abstract"))
 
     score = normalized.get("score")
     try:
@@ -476,9 +644,62 @@ def format_created_docs_summary(created_docs: List[Dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def _build_reused_doc_entry(
+    paper: Dict[str, Any],
+    report_record: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Convert a stored created_report record into the runtime doc payload shape."""
+    paper_title = (
+        _clean_text(paper.get("title"))
+        or _clean_text(report_record.get("paper_title"))
+        or "Unknown"
+    )
+    doc_title = _clean_text(report_record.get("doc_title")) or f"[精读] {paper_title[:80]}"
+    return {
+        "paper": {**paper, "title": paper_title},
+        "doc_info": {},
+        "title": doc_title,
+        "url": _clean_text(report_record.get("doc_url")) or None,
+        "doc_token": _clean_text(report_record.get("doc_token")) or None,
+        "report_payload": None,
+        "reused": True,
+        "created_at": report_record.get("timestamp"),
+    }
+
+
+def _is_report_record_current(report_record: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(report_record, dict):
+        return False
+    metadata = report_record.get("metadata") or {}
+    if not isinstance(metadata, dict):
+        return False
+    return _clean_text(metadata.get("report_version")) == READING_REPORT_OUTPUT_VERSION
+
+
+def _lookup_existing_pdf_report(
+    user_id: str,
+    request_metadata: Dict[str, Any],
+    fallback_paper: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Find an already-created PDF reading report by its stable source key."""
+    source_type = _clean_text(request_metadata.get("report_source_type"))
+    source_key = _clean_text(request_metadata.get("report_source_key"))
+    if not source_type or not source_key:
+        return None
+
+    report_record = get_recent_created_report_by_source(user_id, source_type, source_key)
+    if not report_record:
+        return None
+    if not _is_report_record_current(report_record):
+        return None
+
+    return _build_reused_doc_entry(fallback_paper, report_record)
+
+
 def _merge_paper_details(base: Dict[str, Any], detail: Dict[str, Any]) -> Dict[str, Any]:
     merged = dict(base)
     detail = _normalize_paper(detail)
+    prefer_detail_abstract = bool(base.get("_prefer_detail_abstract"))
 
     for key in ("arxiv_id", "doi", "pdf_url", "publish_date", "venue", "institution"):
         if not _clean_text(merged.get(key)):
@@ -490,14 +711,137 @@ def _merge_paper_details(base: Dict[str, Any], detail: Dict[str, Any]) -> Dict[s
     if not merged.get("authors"):
         merged["authors"] = detail.get("authors", [])
 
-    if not _clean_text(merged.get("abstract")) and detail.get("abstract"):
+    current_abstract_raw = merged.get("abstract")
+    current_abstract = _clean_abstract_text(current_abstract_raw)
+    detail_abstract = _clean_abstract_text(detail.get("abstract"))
+    if detail_abstract and (
+        prefer_detail_abstract
+        or
+        not current_abstract
+        or _looks_like_feed_metadata_abstract(current_abstract_raw)
+        or len(detail_abstract) > len(current_abstract) + 40
+    ):
         merged["abstract"] = detail["abstract"]
+    elif current_abstract:
+        merged["abstract"] = current_abstract
 
     existing_metadata = dict(merged.get("metadata") or {})
     detail_metadata = dict(detail.get("metadata") or {})
-    merged["metadata"] = {**detail_metadata, **existing_metadata}
+    if detail_metadata:
+        merged["metadata"] = {**existing_metadata, **detail_metadata}
+    else:
+        merged["metadata"] = existing_metadata
+    merged.pop("_prefer_detail_abstract", None)
 
     return merged
+
+
+def _normalize_source_page_document(document: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if not isinstance(document, dict):
+        return None
+
+    sections = document.get("sections") or {}
+    normalized_sections: Dict[str, str] = {}
+    if isinstance(sections, dict):
+        for key, value in sections.items():
+            cleaned_key = _clean_text(key).lower()
+            cleaned_value = _clean_text(value)
+            if cleaned_key and cleaned_value:
+                normalized_sections[cleaned_key] = cleaned_value
+
+    normalized_document = {
+        "source_kind": "source_page",
+        "source_url": _clean_text(document.get("source_url")),
+        "abstract": _clean_text(document.get("abstract")),
+        "sections": normalized_sections,
+        "full_text": _clean_text(document.get("full_text")),
+    }
+
+    if not (
+        normalized_document["abstract"]
+        or normalized_document["sections"]
+        or normalized_document["full_text"]
+    ):
+        return None
+
+    if not normalized_document["full_text"]:
+        ordered_parts: List[str] = []
+        if normalized_document["abstract"]:
+            ordered_parts.append(normalized_document["abstract"])
+        for section_name in (
+            "introduction",
+            "background",
+            "method",
+            "results",
+            "experiments",
+            "discussion",
+            "limitations",
+            "conclusion",
+        ):
+            section_text = normalized_document["sections"].get(section_name)
+            if section_text and section_text not in ordered_parts:
+                ordered_parts.append(section_text)
+        for section_text in normalized_document["sections"].values():
+            if section_text and section_text not in ordered_parts:
+                ordered_parts.append(section_text)
+        normalized_document["full_text"] = " ".join(ordered_parts).strip()
+
+    return normalized_document
+
+
+def _get_source_page_document(paper: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    metadata = paper.get("metadata") or {}
+    source_page = metadata.get("source_page")
+    normalized = _normalize_source_page_document(source_page)
+    if normalized:
+        if not normalized.get("abstract"):
+            normalized["abstract"] = _clean_text(paper.get("abstract"))
+        return normalized
+    return None
+
+
+def _backfill_metadata_from_source_page(paper: Dict[str, Any]) -> Dict[str, Any]:
+    if _paper_has_sufficient_metadata_for_report(paper) and not paper.get("_prefer_detail_abstract"):
+        return paper
+
+    source_urls = _collect_source_page_urls(paper)
+    if not source_urls:
+        return paper
+
+    try:
+        journal_fetcher = _load_journal_fetcher()
+    except Exception as exc:
+        print(f"Unable to load journal fetcher for metadata backfill: {exc}")
+        return paper
+
+    fetch_detail = getattr(journal_fetcher, "_fetch_article_detail", None)
+    if not callable(fetch_detail):
+        return paper
+
+    enriched = dict(paper)
+    for source_url in source_urls:
+        try:
+            detail = fetch_detail(source_url)
+        except Exception as exc:
+            print(f"  Metadata backfill failed for {source_url[:120]}: {exc}")
+            continue
+
+        if not isinstance(detail, dict) or detail.get("_skip"):
+            continue
+
+        merged = _merge_paper_details(enriched, detail)
+        improved = (
+            _clean_text(merged.get("abstract")) != _clean_text(enriched.get("abstract"))
+            or _parse_jsonish_list(merged.get("authors")) != _parse_jsonish_list(enriched.get("authors"))
+            or _clean_text(merged.get("pdf_url")) != _clean_text(enriched.get("pdf_url"))
+        )
+        enriched = merged
+        if improved:
+            print(f"  Metadata backfilled from source page: {source_url[:120]}")
+        if _paper_has_sufficient_metadata_for_report(enriched):
+            break
+
+    return enriched
 
 
 def _looks_like_pdf_url(candidate: Any) -> bool:
@@ -515,16 +859,24 @@ def _looks_like_pdf_url(candidate: Any) -> bool:
 
 def _collect_source_page_urls(paper: Dict[str, Any]) -> List[str]:
     metadata = paper.get("metadata") or {}
+    source_page_metadata = metadata.get("source_page") or {}
     candidates = [
         paper.get("paper_url"),
         paper.get("url"),
         paper.get("doi_url"),
         paper.get("openreview_url"),
+        paper.get("cvf_url"),
+        paper.get("ecva_url"),
+        paper.get("dblp_url"),
         metadata.get("paper_url"),
         metadata.get("url"),
         metadata.get("link"),
         metadata.get("doi_url"),
         metadata.get("openreview_url"),
+        metadata.get("cvf_url"),
+        metadata.get("ecva_url"),
+        metadata.get("dblp_url"),
+        source_page_metadata.get("source_url"),
     ]
 
     urls: List[str] = []
@@ -539,14 +891,84 @@ def _collect_source_page_urls(paper: Dict[str, Any]) -> List[str]:
     return urls
 
 
+def _build_pdf_url_candidates_from_source_url(source_url: str) -> List[str]:
+    normalized = _clean_text(source_url)
+    if not normalized.startswith(("http://", "https://")):
+        return []
+
+    parsed = urlparse(normalized)
+    host = (parsed.netloc or "").lower()
+    path = parsed.path or ""
+    query = parsed.query or ""
+    candidates: List[str] = []
+
+    def add(candidate: str) -> None:
+        cleaned = _clean_text(candidate)
+        if cleaned.startswith(("http://", "https://")) and cleaned not in candidates:
+            candidates.append(cleaned)
+
+    if "nature.com" in host and path.startswith("/articles/") and not path.lower().endswith(".pdf"):
+        add(urljoin(f"{parsed.scheme}://{parsed.netloc}", f"{path}_reference.pdf"))
+        add(urljoin(f"{parsed.scheme}://{parsed.netloc}", f"{path}.pdf"))
+
+    if "science.org" in host and "/doi/" in path:
+        doi_match = re.search(r"/doi/(?:abs|full|epdf|pdf)/(.+)$", path, flags=re.I)
+        if doi_match:
+            doi_suffix = doi_match.group(1).strip("/")
+            add(f"{parsed.scheme}://{parsed.netloc}/doi/pdf/{doi_suffix}?download=true")
+            add(f"{parsed.scheme}://{parsed.netloc}/doi/pdf/{doi_suffix}")
+            add(f"{parsed.scheme}://{parsed.netloc}/doi/epdf/{doi_suffix}")
+
+    if "openreview.net" in host:
+        forum_id = ""
+        if parsed.query:
+            query_match = re.search(r"(?:^|&)id=([^&]+)", parsed.query)
+            if query_match:
+                forum_id = query_match.group(1)
+        if not forum_id:
+            forum_match = re.search(r"/forum", path, flags=re.I)
+            if forum_match and parsed.query:
+                query_match = re.search(r"(?:^|&)id=([^&]+)", parsed.query)
+                if query_match:
+                    forum_id = query_match.group(1)
+        if forum_id:
+            add(f"{parsed.scheme}://{parsed.netloc}/pdf?id={forum_id}")
+
+    if "openaccess.thecvf.com" in host and path.lower().endswith("_paper.html"):
+        add(f"{parsed.scheme}://{parsed.netloc}{path[:-5]}.pdf")
+
+    if "link.springer.com" in host:
+        article_match = re.search(r"^/(?:article|chapter)/(.+)$", path, flags=re.I)
+        if article_match:
+            doi_suffix = article_match.group(1).strip("/")
+            add(f"{parsed.scheme}://{parsed.netloc}/content/pdf/{doi_suffix}.pdf")
+            add(f"{parsed.scheme}://{parsed.netloc}/content/pdf/{doi_suffix}.pdf?download=1")
+
+    if any(token in host for token in ("biorxiv.org", "medrxiv.org")) and "/content/" in path:
+        if not path.lower().endswith(".pdf"):
+            suffix = ".full.pdf"
+            if path.lower().endswith(".full"):
+                suffix = ".pdf"
+            candidate = f"{parsed.scheme}://{parsed.netloc}{path}{suffix}"
+            if query:
+                candidate = f"{candidate}?{query}"
+            add(candidate)
+
+    if "pnas.org" in host and "/doi/" in path:
+        doi_match = re.search(r"/doi/(?:full|abs|pdf)/(.+)$", path, flags=re.I)
+        if doi_match:
+            doi_suffix = doi_match.group(1).strip("/")
+            add(f"{parsed.scheme}://{parsed.netloc}/doi/pdf/{doi_suffix}")
+
+    return candidates
+
+
 def _resolve_pdf_url_from_source_page(source_url: str) -> str:
-    response = requests.get(
+    response = _http_get(
         source_url,
         timeout=PDF_DOWNLOAD_TIMEOUT,
-        headers=DEFAULT_REQUEST_HEADERS,
         allow_redirects=True,
     )
-    response.raise_for_status()
 
     final_url = _clean_text(response.url) or _clean_text(source_url)
     content_type = str(response.headers.get("Content-Type") or "").lower()
@@ -569,7 +991,41 @@ def _resolve_pdf_url_from_source_page(source_url: str) -> str:
         if candidate:
             return candidate
 
+    heuristic_candidates = _build_pdf_url_candidates_from_source_url(final_url)
+    if heuristic_candidates:
+        return heuristic_candidates[0]
+
     return ""
+
+
+def _pick_download_referer(paper: Dict[str, Any], pdf_url: str) -> Optional[str]:
+    source_urls = _collect_source_page_urls(paper)
+    if not source_urls:
+        return None
+
+    pdf_host = (urlparse(_clean_text(pdf_url)).netloc or "").lower()
+    if pdf_host:
+        for source_url in source_urls:
+            if (urlparse(source_url).netloc or "").lower() == pdf_host:
+                return source_url
+
+    return source_urls[0]
+
+
+def _build_pdf_download_candidates(paper: Dict[str, Any], primary_pdf_url: str) -> List[str]:
+    candidates: List[str] = []
+
+    def add(candidate: Any) -> None:
+        text = _clean_text(candidate)
+        if _looks_like_pdf_url(text) and text not in candidates:
+            candidates.append(text)
+
+    add(primary_pdf_url)
+    for source_url in _collect_source_page_urls(paper):
+        for candidate in _build_pdf_url_candidates_from_source_url(source_url):
+            add(candidate)
+
+    return candidates
 
 
 def _extract_pdf_url(paper: Dict[str, Any]) -> str:
@@ -597,6 +1053,10 @@ def _extract_pdf_url(paper: Dict[str, Any]) -> str:
             resolved = _resolve_pdf_url_from_source_page(source_url)
         except Exception as exc:
             print(f"  Failed to resolve PDF from source page {source_url[:120]}: {exc}")
+            heuristic_candidates = _build_pdf_url_candidates_from_source_url(source_url)
+            if heuristic_candidates:
+                print(f"  Falling back to heuristic PDF URL: {heuristic_candidates[0][:120]}")
+                return heuristic_candidates[0]
             continue
         if _clean_text(resolved):
             return resolved
@@ -616,7 +1076,8 @@ def _get_pdf_enrichment_mode() -> str:
 def _paper_has_sufficient_metadata_for_report(paper: Dict[str, Any]) -> bool:
     """Whether the existing paper payload is already enough for a solid abstract-based report."""
     return bool(
-        _clean_text(paper.get("abstract"))
+        _clean_abstract_text(paper.get("abstract"))
+        and not _looks_like_feed_metadata_abstract(paper.get("abstract"))
         and _parse_jsonish_list(paper.get("authors"))
         and not _looks_like_placeholder_title(_clean_text(paper.get("title")))
     )
@@ -624,6 +1085,70 @@ def _paper_has_sufficient_metadata_for_report(paper: Dict[str, Any]) -> bool:
 
 def _is_arxiv_pdf_url(pdf_url: str) -> bool:
     return "arxiv.org/" in _clean_text(pdf_url).lower()
+
+
+def _is_research_journal_article_for_pdf_evidence(paper: Dict[str, Any]) -> bool:
+    title = _clean_text(paper.get("title")).lower()
+    if any(pattern in title for pattern in NON_RESEARCH_TITLE_PATTERNS):
+        return False
+
+    venue = _clean_text(paper.get("venue") or paper.get("journal") or paper.get("source")).lower()
+    source_url = _get_first_url(paper, "paper_url", "url", "doi_url", "openreview_url").lower()
+
+    if "nature.com/articles/d" in source_url:
+        return False
+
+    return any(
+        token in venue or token in source_url
+        for token in (
+            "nature",
+            "science",
+            "cell",
+            "pnas",
+            "springer",
+            "journal",
+        )
+    )
+
+
+def _is_research_conference_article_for_pdf_evidence(paper: Dict[str, Any], pdf_url: str) -> bool:
+    title = _clean_text(paper.get("title")).lower()
+    if any(pattern in title for pattern in NON_RESEARCH_TITLE_PATTERNS):
+        return False
+
+    venue = _clean_text(paper.get("venue") or paper.get("journal") or paper.get("source")).lower()
+    category = _clean_text(paper.get("category")).lower()
+    source_url = _get_first_url(
+        paper,
+        "paper_url",
+        "url",
+        "openreview_url",
+        "cvf_url",
+        "ecva_url",
+        "dblp_url",
+        "doi_url",
+    ).lower()
+    pdf_host = (urlparse(_clean_text(pdf_url)).netloc or "").lower()
+
+    conference_tokens = (
+        "openreview",
+        "cvf",
+        "ecva",
+        "conference",
+        "iclr",
+        "neurips",
+        "icml",
+        "acl",
+        "emnlp",
+        "cvpr",
+        "iccv",
+        "eccv",
+        "acm mm",
+    )
+    return any(
+        token in venue or token in category or token in source_url or token in pdf_host
+        for token in conference_tokens
+    )
 
 
 def _should_attempt_pdf_enrichment(
@@ -645,6 +1170,12 @@ def _should_attempt_pdf_enrichment(
 
     if not _paper_has_sufficient_metadata_for_report(paper):
         return True, "metadata_incomplete"
+
+    if _is_research_journal_article_for_pdf_evidence(paper):
+        return True, "journal_pdf_evidence"
+
+    if _is_research_conference_article_for_pdf_evidence(paper, pdf_url):
+        return True, "conference_pdf_evidence"
 
     if detail_fetch_failed and _is_arxiv_pdf_url(pdf_url):
         return False, "arxiv_detail_failed"
@@ -669,8 +1200,16 @@ def _extract_source_links(paper: Dict[str, Any]) -> List[Tuple[str, str]]:
 
     paper_url = _clean_text(
         paper.get("paper_url")
+        or paper.get("openreview_url")
+        or paper.get("cvf_url")
+        or paper.get("ecva_url")
+        or paper.get("dblp_url")
         or paper.get("url")
         or (paper.get("metadata") or {}).get("paper_url")
+        or (paper.get("metadata") or {}).get("openreview_url")
+        or (paper.get("metadata") or {}).get("cvf_url")
+        or (paper.get("metadata") or {}).get("ecva_url")
+        or (paper.get("metadata") or {}).get("dblp_url")
         or (paper.get("metadata") or {}).get("url")
         or (paper.get("metadata") or {}).get("link")
     )
@@ -680,13 +1219,13 @@ def _extract_source_links(paper: Dict[str, Any]) -> List[Tuple[str, str]]:
     return links
 
 
-def _download_pdf(pdf_url: str, title: str) -> str:
-    response = requests.get(
+def _download_pdf(pdf_url: str, title: str, referer: Optional[str] = None) -> str:
+    response = _http_get(
         pdf_url,
         timeout=PDF_DOWNLOAD_TIMEOUT,
-        headers=DEFAULT_REQUEST_HEADERS,
+        referer=referer,
+        accept_pdf=True,
     )
-    response.raise_for_status()
     content_type = str(response.headers.get("Content-Type") or "").lower()
     if "application/pdf" not in content_type and not response.content.startswith(b"%PDF"):
         raise ValueError(
@@ -712,10 +1251,45 @@ def _parse_pdf_for_report(pdf_path: str) -> Dict[str, Any]:
 
 
 def enrich_paper_for_reading_report(paper: Dict[str, Any]) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]], Optional[str]]:
+    """
+    Enrich paper data for reading report generation.
+
+    If paper has 'pdf_path' key, use local PDF directly instead of downloading.
+    """
+    prefer_detail_abstract = _looks_like_feed_metadata_abstract((paper or {}).get("abstract"))
     enriched = _normalize_paper(paper)
+    if prefer_detail_abstract:
+        enriched["_prefer_detail_abstract"] = True
     pdf_error: Optional[str] = None
     parsed_pdf: Optional[Dict[str, Any]] = None
     detail_fetch_failed = False
+
+    if prefer_detail_abstract or not _paper_has_sufficient_metadata_for_report(enriched):
+        enriched = _backfill_metadata_from_source_page(enriched)
+
+    source_page_document = _get_source_page_document(enriched)
+
+    # If paper has local pdf_path, use it directly
+    local_pdf_path = enriched.get("pdf_path")
+    if local_pdf_path and os.path.exists(local_pdf_path):
+        try:
+            print(f"  Parsing local PDF: {local_pdf_path}")
+            parsed_pdf = _parse_pdf_for_report(local_pdf_path)
+            parsed_pdf["source_kind"] = "pdf"
+            print("  Local PDF parsed successfully")
+
+            # Enrich metadata from parsed PDF
+            if _looks_like_placeholder_title(enriched.get("title", "")) and _clean_text(parsed_pdf.get("title")):
+                enriched["title"] = _clean_text(parsed_pdf.get("title"))
+            if not _clean_text(enriched.get("abstract")) and _clean_text(parsed_pdf.get("abstract")):
+                enriched["abstract"] = _clean_text(parsed_pdf.get("abstract"))
+            if not enriched.get("authors"):
+                enriched["authors"] = _parse_jsonish_list(parsed_pdf.get("authors"))
+
+            return enriched, parsed_pdf, None
+        except Exception as exc:
+            pdf_error = str(exc)
+            print(f"Local PDF parsing failed: {exc}")
 
     arxiv_id = _clean_text(enriched.get("arxiv_id"))
     if arxiv_id:
@@ -746,14 +1320,33 @@ def enrich_paper_for_reading_report(paper: Dict[str, Any]) -> Tuple[Dict[str, An
         print(f"  Skipping PDF enrichment ({skip_reason})")
 
     if pdf_url and should_parse_pdf:
+        download_candidates = _build_pdf_download_candidates(enriched, pdf_url) or [pdf_url]
+        last_exception: Optional[Exception] = None
         try:
-            print(f"  Downloading PDF for enrichment: {pdf_url[:120]}")
-            temp_pdf_path = _download_pdf(pdf_url, enriched.get("title", "paper"))
-            parsed_pdf = _parse_pdf_for_report(temp_pdf_path)
-            print("  PDF enrichment parsed successfully")
-        except Exception as exc:
-            pdf_error = str(exc)
-            print(f"PDF enrichment failed for {enriched.get('title', 'Unknown')}: {exc}")
+            for download_candidate in download_candidates:
+                try:
+                    download_referer = _pick_download_referer(enriched, download_candidate)
+                    print(f"  Downloading PDF for enrichment: {download_candidate[:120]}")
+                    temp_pdf_path = _download_pdf(
+                        download_candidate,
+                        enriched.get("title", "paper"),
+                        referer=download_referer,
+                    )
+                    parsed_pdf = _parse_pdf_for_report(temp_pdf_path)
+                    parsed_pdf["source_kind"] = "pdf"
+                    enriched["pdf_url"] = download_candidate
+                    pdf_error = None
+                    print("  PDF enrichment parsed successfully")
+                    break
+                except Exception as exc:
+                    last_exception = exc
+                    pdf_error = str(exc)
+                    print(
+                        f"  PDF download attempt failed ({download_candidate[:120]}): {exc}"
+                    )
+                    continue
+            if parsed_pdf is None and last_exception is not None:
+                print(f"PDF enrichment failed for {enriched.get('title', 'Unknown')}: {last_exception}")
         finally:
             if temp_pdf_path:
                 try:
@@ -768,6 +1361,9 @@ def enrich_paper_for_reading_report(paper: Dict[str, Any]) -> Tuple[Dict[str, An
             enriched["abstract"] = _clean_text(parsed_pdf.get("abstract"))
         if not enriched.get("authors"):
             enriched["authors"] = _parse_jsonish_list(parsed_pdf.get("authors"))
+
+    if parsed_pdf is None and source_page_document:
+        parsed_pdf = source_page_document
 
     return enriched, parsed_pdf, pdf_error
 
@@ -789,6 +1385,383 @@ def _pick_sentences(text: str, *, limit: int, cues: Tuple[str, ...] = ()) -> Lis
 
     unique_ranked = _unique_preserve_order(ranked)
     return [_truncate_text(sentence, 180) for sentence in unique_ranked[:limit]]
+
+
+def _format_pdf_section_label(section: str) -> str:
+    normalized = _clean_text(section).replace("_", " ").replace("-", " ")
+    if not normalized:
+        return "PDF"
+    return normalized.title()
+
+
+def _summarize_profile_for_embedding(user_profile: Dict[str, Any]) -> str:
+    core_directions = user_profile.get("core_directions", {}) or {}
+    sorted_directions = sorted(
+        core_directions.items(),
+        key=lambda item: float(item[1]),
+        reverse=True,
+    )
+    direction_parts = [
+        f"{_format_direction_label(direction)} ({float(weight):.2f})"
+        for direction, weight in sorted_directions[:4]
+    ]
+
+    preferences = user_profile.get("methodology_preferences", {}) or {}
+    preference_parts: List[str] = []
+    if preferences.get("preference_data_driven_over_theory"):
+        preference_parts.append("data-driven empirical work")
+    if preferences.get("preference_systematic_work_over_incremental"):
+        preference_parts.append("systematic end-to-end frameworks")
+    if preferences.get("preference_bio_science_application"):
+        preference_parts.append("bio and science applications")
+
+    blocks: List[str] = []
+    if direction_parts:
+        blocks.append("Research directions: " + ", ".join(direction_parts))
+    if preference_parts:
+        blocks.append("Method preferences: " + ", ".join(preference_parts))
+    return ". ".join(blocks)
+
+
+def _get_reading_evidence_cache_dir() -> Path:
+    configured = os.environ.get("READING_REPORT_EVIDENCE_CACHE_DIR", "").strip()
+    if configured:
+        cache_dir = Path(configured).expanduser()
+        if not cache_dir.is_absolute():
+            cache_dir = (Path(__file__).resolve().parents[2] / cache_dir).resolve()
+    else:
+        cache_dir = (Path(__file__).resolve().parents[2] / "data" / "cache" / "reading_evidence").resolve()
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir
+
+
+def _build_evidence_cache_key(
+    paper: Dict[str, Any],
+    user_profile: Dict[str, Any],
+    parsed_pdf: Optional[Dict[str, Any]],
+    descriptor: str,
+) -> str:
+    sections = dict((parsed_pdf or {}).get("sections") or {})
+    payload = {
+        "paper": {
+            "id": paper.get("id"),
+            "title": _clean_text(paper.get("title")),
+            "arxiv_id": _clean_text(paper.get("arxiv_id")),
+            "doi": _clean_text(paper.get("doi")),
+        },
+        "profile_summary": _summarize_profile_for_embedding(user_profile),
+        "profile_preferences": user_profile.get("methodology_preferences") or {},
+        "descriptor": descriptor,
+        "chunk_chars": READING_REPORT_CHUNK_CHARS,
+        "chunk_overlap": READING_REPORT_CHUNK_OVERLAP,
+        "top_k": READING_REPORT_EVIDENCE_TOP_K,
+        "pdf": {
+            "abstract": _clean_text((parsed_pdf or {}).get("abstract")),
+            "full_text": _clean_text((parsed_pdf or {}).get("full_text")),
+            "sections": {key: _clean_text(value) for key, value in sections.items()},
+        },
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _load_cached_retrieved_evidence(cache_key: str) -> Optional[Dict[str, Any]]:
+    if not READING_REPORT_EVIDENCE_CACHE_ENABLED:
+        return None
+    cache_path = _get_reading_evidence_cache_dir() / f"{cache_key}.json"
+    if not cache_path.exists():
+        return None
+    try:
+        data = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _save_cached_retrieved_evidence(cache_key: str, evidence: Dict[str, Any]) -> None:
+    if not READING_REPORT_EVIDENCE_CACHE_ENABLED or not isinstance(evidence, dict) or not evidence:
+        return
+    cache_path = _get_reading_evidence_cache_dir() / f"{cache_key}.json"
+    try:
+        cache_path.write_text(json.dumps(evidence, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        return
+
+
+def _chunk_text_with_overlap(
+    text: str,
+    section: str,
+    max_chars: int = READING_REPORT_CHUNK_CHARS,
+    overlap: int = READING_REPORT_CHUNK_OVERLAP,
+) -> List[Dict[str, Any]]:
+    normalized = _clean_text(text)
+    if not normalized:
+        return []
+
+    if max_chars <= 0:
+        max_chars = READING_REPORT_CHUNK_CHARS
+    overlap = max(0, min(overlap, max_chars // 2 if max_chars > 1 else 0))
+
+    chunks: List[Dict[str, Any]] = []
+    start = 0
+    text_length = len(normalized)
+    while start < text_length:
+        end = min(text_length, start + max_chars)
+        if end < text_length:
+            window = normalized[start:end]
+            boundary_candidates = [
+                window.rfind("\n\n"),
+                window.rfind(". "),
+                window.rfind("? "),
+                window.rfind("! "),
+                window.rfind("; "),
+                window.rfind("。"),
+                window.rfind("！"),
+                window.rfind("？"),
+                window.rfind("；"),
+            ]
+            boundary = max(boundary_candidates)
+            if boundary >= max_chars // 2:
+                boundary_len = 2 if window[boundary:boundary + 2] in {". ", "? ", "! ", "; ", "\n\n"} else 1
+                end = start + boundary + boundary_len
+
+        chunk_text = normalized[start:end].strip()
+        if chunk_text:
+            chunks.append(
+                {
+                    "section": _clean_text(section) or "full_text",
+                    "text": chunk_text,
+                    "start": start,
+                    "end": end,
+                    "chunk_index": len(chunks),
+                }
+            )
+
+        if end >= text_length:
+            break
+
+        next_start = max(end - overlap, start + 1)
+        if next_start <= start:
+            next_start = end
+        start = next_start
+
+    return chunks
+
+
+def _build_pdf_chunks(parsed_pdf: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not isinstance(parsed_pdf, dict):
+        return []
+
+    chunks: List[Dict[str, Any]] = []
+    abstract = _clean_text(parsed_pdf.get("abstract"))
+    if abstract:
+        chunks.extend(_chunk_text_with_overlap(abstract, "abstract"))
+
+    sections = parsed_pdf.get("sections") or {}
+    if isinstance(sections, dict):
+        preferred_order = [
+            "introduction",
+            "background",
+            "method",
+            "approach",
+            "model",
+            "results",
+            "experiments",
+            "evaluation",
+            "discussion",
+            "limitations",
+            "conclusion",
+        ]
+        ordered_keys = preferred_order + [key for key in sections.keys() if key not in preferred_order]
+        for section_name in ordered_keys:
+            section_text = _clean_text(sections.get(section_name))
+            if section_text:
+                chunks.extend(_chunk_text_with_overlap(section_text, section_name))
+
+    if not chunks:
+        full_text = _clean_text(parsed_pdf.get("full_text"))
+        if full_text:
+            chunks.extend(_chunk_text_with_overlap(full_text, "full_text"))
+
+    deduped: List[Dict[str, Any]] = []
+    seen_texts = set()
+    for chunk in chunks:
+        key = chunk["text"].casefold()
+        if key in seen_texts:
+            continue
+        seen_texts.add(key)
+        deduped.append(chunk)
+    return deduped
+
+
+def _collect_evidence_sentences(
+    evidence: Dict[str, Any],
+    bucket: str,
+    *,
+    limit: int,
+    cues: Tuple[str, ...] = (),
+) -> List[str]:
+    matches = ((evidence or {}).get("matches") or {}).get(bucket) or []
+    collected: List[str] = []
+    for match in matches:
+        text = _clean_text(match.get("text"))
+        if not text:
+            continue
+        picked = _pick_sentences(text, limit=limit, cues=cues)
+        if picked:
+            collected.extend(picked)
+        else:
+            collected.append(_truncate_text(text, 180))
+        unique = _unique_preserve_order(collected)
+        if len(unique) >= limit:
+            return unique[:limit]
+    return _unique_preserve_order(collected)[:limit]
+
+
+def _collect_evidence_sections(evidence: Dict[str, Any], bucket: str, *, limit: int = 3) -> List[str]:
+    matches = ((evidence or {}).get("matches") or {}).get(bucket) or []
+    labels = [
+        _format_pdf_section_label(match.get("section", ""))
+        for match in matches
+        if _clean_text(match.get("section"))
+    ]
+    return _unique_preserve_order(labels)[:limit]
+
+
+def _format_evidence_anchor(match: Dict[str, Any]) -> str:
+    section = _format_pdf_section_label(match.get("section", ""))
+    text = _truncate_text(match.get("text"), 180)
+    score = match.get("score")
+    score_text = f" | score={float(score):.3f}" if isinstance(score, (int, float)) else ""
+    return f"{section}{score_text} | {text}"
+
+
+def _build_field_evidence_map(retrieved_evidence: Dict[str, Any]) -> Dict[str, List[str]]:
+    matches = (retrieved_evidence or {}).get("matches") or {}
+
+    def anchor_list(*buckets: str, limit: int = 2) -> List[str]:
+        anchors: List[str] = []
+        for bucket in buckets:
+            for match in matches.get(bucket) or []:
+                anchors.append(_format_evidence_anchor(match))
+        return _unique_preserve_order(anchors)[:limit]
+
+    return {
+        "one_sentence_summary": anchor_list("method", "results", limit=2),
+        "research_background": anchor_list("background", limit=2),
+        "core_method": anchor_list("method", limit=2),
+        "key_results": anchor_list("results", limit=2),
+        "main_contributions": anchor_list("method", "results", limit=3),
+        "limitations": anchor_list("limitations", limit=2),
+        "relevance_points": anchor_list("relevance", limit=2),
+        "reading_focus": anchor_list("relevance", "method", "results", limit=3),
+    }
+
+
+def _build_report_evidence_anchors(retrieved_evidence: Dict[str, Any]) -> Dict[str, List[str]]:
+    matches = (retrieved_evidence or {}).get("matches") or {}
+    anchors: Dict[str, List[str]] = {}
+    for bucket in ("background", "method", "results", "limitations", "relevance"):
+        bucket_matches = matches.get(bucket) or []
+        items = [_format_evidence_anchor(match) for match in bucket_matches if isinstance(match, dict)]
+        if items:
+            anchors[bucket] = _unique_preserve_order(items)[:READING_REPORT_EVIDENCE_TOP_K]
+    return anchors
+
+
+def _retrieve_report_evidence(
+    paper: Dict[str, Any],
+    user_profile: Dict[str, Any],
+    parsed_pdf: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    chunks = _build_pdf_chunks(parsed_pdf)
+    if not chunks:
+        return {}
+
+    profile_summary = _summarize_profile_for_embedding(user_profile)
+    title = _clean_text(paper.get("title"))
+    abstract = _clean_text(paper.get("abstract"))
+
+    query_specs = [
+        {
+            "bucket": "background",
+            "query": f"{title}\n{abstract}\nresearch background motivation problem challenge prior work",
+            "preferred_sections": ("abstract", "introduction", "background"),
+        },
+        {
+            "bucket": "method",
+            "query": f"{title}\n{abstract}\ncore method approach model framework algorithm training pipeline",
+            "preferred_sections": ("method", "approach", "model", "full_text"),
+        },
+        {
+            "bucket": "results",
+            "query": f"{title}\n{abstract}\nmain results experiments evaluation outperform improvement benchmark ablation",
+            "preferred_sections": ("results", "experiments", "evaluation"),
+        },
+        {
+            "bucket": "limitations",
+            "query": f"{title}\n{abstract}\nlimitations future work discussion challenge failure case",
+            "preferred_sections": ("discussion", "limitations", "conclusion"),
+        },
+        {
+            "bucket": "relevance",
+            "query": (
+                f"{title}\n{abstract}\n"
+                f"reader research interests relevance use cases methodology overlap {profile_summary}"
+            ),
+            "preferred_sections": ("abstract", "introduction", "method", "results"),
+        },
+    ]
+
+    try:
+        embedding_module = _load_embedding_module()
+        service = embedding_module.get_embedding_service()
+        descriptor = getattr(service, "descriptor", "")
+        cache_key = _build_evidence_cache_key(paper, user_profile, parsed_pdf, descriptor)
+        cached = _load_cached_retrieved_evidence(cache_key)
+        if cached:
+            return cached
+        query_texts = [item["query"] for item in query_specs]
+        chunk_texts = [chunk["text"] for chunk in chunks]
+        vectors = service.embed_batch(query_texts + chunk_texts)
+        query_vectors = vectors[: len(query_specs)]
+        chunk_vectors = vectors[len(query_specs):]
+
+        matches: Dict[str, List[Dict[str, Any]]] = {}
+        for query_spec, query_vector in zip(query_specs, query_vectors):
+            preferred_sections = set(query_spec["preferred_sections"])
+            ranked: List[Dict[str, Any]] = []
+            for chunk, chunk_vector in zip(chunks, chunk_vectors):
+                score = float(service.cosine_similarity(query_vector, chunk_vector))
+                if chunk.get("section") in preferred_sections:
+                    score += 0.08
+                elif chunk.get("section") == "abstract":
+                    score += 0.03
+                ranked.append({**chunk, "score": score})
+
+            ranked.sort(key=lambda item: item["score"], reverse=True)
+            selected: List[Dict[str, Any]] = []
+            seen_texts = set()
+            for item in ranked:
+                key = item["text"].casefold()
+                if key in seen_texts:
+                    continue
+                seen_texts.add(key)
+                selected.append(item)
+                if len(selected) >= READING_REPORT_EVIDENCE_TOP_K:
+                    break
+            matches[query_spec["bucket"]] = selected
+
+        result = {
+            "descriptor": getattr(service, "descriptor", ""),
+            "chunk_count": len(chunks),
+            "matches": matches,
+        }
+        _save_cached_retrieved_evidence(cache_key, result)
+        return result
+    except Exception as exc:
+        print(f"PDF evidence retrieval failed: {exc}")
+        return {}
 
 
 def _estimate_reading_minutes(parsed_pdf: Optional[Dict[str, Any]], abstract: str) -> int:
@@ -1059,6 +2032,7 @@ def build_heuristic_report_payload(
     pdf_error: Optional[str] = None,
 ) -> Dict[str, Any]:
     sections = dict((parsed_pdf or {}).get("sections") or {})
+    parsed_source_kind = _clean_text((parsed_pdf or {}).get("source_kind")).lower() or ("pdf" if parsed_pdf else "abstract")
     abstract = _truncate_text(
         _first_non_empty((parsed_pdf or {}).get("abstract"), paper.get("abstract")),
         MAX_ABSTRACT_CHARS,
@@ -1068,33 +2042,60 @@ def build_heuristic_report_payload(
     results = _truncate_text(sections.get("results"), MAX_SECTION_CHARS)
     discussion = _truncate_text(sections.get("discussion"), MAX_SECTION_CHARS)
     conclusion = _truncate_text(sections.get("conclusion"), MAX_SECTION_CHARS)
+    retrieved_evidence = _retrieve_report_evidence(paper, user_profile, parsed_pdf)
 
-    # 使用 PDF 解析的章节内容，或者从摘要推断
+    # 优先使用 PDF 切块后的语义检索证据，其次回退到章节摘要/abstract 启发式
+    bg_from_evidence = " ".join(_collect_evidence_sentences(retrieved_evidence, "background", limit=2))
     bg_from_pdf = " ".join(_pick_sentences(introduction, limit=2)) if introduction else ""
     bg_from_abstract = _infer_section_from_abstract(abstract, "background")
-    research_background = _first_non_empty(bg_from_pdf, bg_from_abstract)
+    research_background = _first_non_empty(bg_from_evidence, bg_from_pdf, bg_from_abstract)
     if not research_background:
         research_background = "建议先查看原文摘要和引言部分以了解研究背景。"
 
+    method_from_evidence = " ".join(
+        _collect_evidence_sentences(
+            retrieved_evidence,
+            "method",
+            limit=2,
+            cues=CONTRIBUTION_CUES,
+        )
+    )
     method_from_pdf = " ".join(_pick_sentences(method, limit=2, cues=CONTRIBUTION_CUES)) if method else ""
     method_from_abstract = _infer_section_from_abstract(abstract, "method")
-    core_method = _first_non_empty(method_from_pdf, method_from_abstract)
+    core_method = _first_non_empty(method_from_evidence, method_from_pdf, method_from_abstract)
     if not core_method:
         core_method = "方法细节建议重点查看原文的 Method / Approach 部分。"
 
+    results_from_evidence = " ".join(
+        _collect_evidence_sentences(
+            retrieved_evidence,
+            "results",
+            limit=2,
+            cues=RESULT_CUES,
+        )
+    )
     results_from_pdf = " ".join(_pick_sentences(results, limit=2, cues=RESULT_CUES)) if results else ""
     results_from_abstract = _infer_section_from_abstract(abstract, "results")
-    key_results = _first_non_empty(results_from_pdf, results_from_abstract)
+    key_results = _first_non_empty(results_from_evidence, results_from_pdf, results_from_abstract)
     if not key_results:
-        key_results = "实验结果和建议重点核对原文表格和主要指标。"
+        key_results = "实验结果建议重点核对原文表格、图示和主要指标。"
 
     summary_candidates = _pick_sentences(abstract, limit=1, cues=CONTRIBUTION_CUES + RESULT_CUES)
+    if not summary_candidates:
+        summary_candidates = _collect_evidence_sentences(
+            retrieved_evidence,
+            "method",
+            limit=1,
+            cues=CONTRIBUTION_CUES,
+        )
     if not summary_candidates:
         summary_candidates = _pick_sentences(introduction or abstract, limit=1)
     one_sentence_summary = summary_candidates[0] if summary_candidates else "本文的核心信息仍建议结合原文进一步核对。"
 
     main_contributions = _unique_preserve_order(
-        _pick_sentences(abstract, limit=3, cues=CONTRIBUTION_CUES)
+        _collect_evidence_sentences(retrieved_evidence, "method", limit=2, cues=CONTRIBUTION_CUES)
+        + _collect_evidence_sentences(retrieved_evidence, "results", limit=1, cues=RESULT_CUES)
+        + _pick_sentences(abstract, limit=3, cues=CONTRIBUTION_CUES)
         + _pick_sentences(method, limit=2, cues=CONTRIBUTION_CUES)
         + _pick_sentences(results, limit=1, cues=RESULT_CUES)
     )[:3]
@@ -1106,7 +2107,8 @@ def build_heuristic_report_payload(
         ]
 
     limitations = _unique_preserve_order(
-        _pick_sentences(conclusion, limit=2, cues=LIMITATION_CUES)
+        _collect_evidence_sentences(retrieved_evidence, "limitations", limit=2, cues=LIMITATION_CUES)
+        + _pick_sentences(conclusion, limit=2, cues=LIMITATION_CUES)
         + _pick_sentences(discussion, limit=2, cues=LIMITATION_CUES)
     )
     if not limitations:
@@ -1115,6 +2117,9 @@ def build_heuristic_report_payload(
             limitations.append("本次未成功抓取 PDF，方法与实验细节部分仍应以原文为准。")
 
     reading_focus = []
+    evidence_sections = _collect_evidence_sections(retrieved_evidence, "relevance")
+    if evidence_sections:
+        reading_focus.append(f"优先核对语义命中的全文片段：{' / '.join(evidence_sections)}。")
     if introduction:
         reading_focus.append("先看 Introduction，确认论文到底在补哪一块空白。")
     if method:
@@ -1132,11 +2137,30 @@ def build_heuristic_report_payload(
 
     analysis_note = (
         "本报告已结合 PDF 全文结构做自动提炼。"
-        if parsed_pdf
-        else "本报告当前基于摘要和元数据自动生成，方法与实验细节建议回到原文核对。"
+        if parsed_source_kind == "pdf"
+        else (
+            "本报告已结合源站正文结构做自动提炼。"
+            if parsed_source_kind == "source_page"
+            else "本报告当前基于摘要和元数据自动生成，方法与实验细节建议回到原文核对。"
+        )
     )
+    if retrieved_evidence:
+        analysis_note = _append_analysis_note(analysis_note, "已结合全文切块语义检索证据生成。")
     if pdf_error:
-        analysis_note = _append_analysis_note(analysis_note, _describe_pdf_fallback(pdf_error))
+        fallback_mode = "source_page" if parsed_source_kind == "source_page" else "abstract"
+        analysis_note = _append_analysis_note(
+            analysis_note,
+            _describe_pdf_fallback(pdf_error, fallback_mode=fallback_mode),
+        )
+
+    relevance_points = _build_relevance_points(paper, user_profile, combined_text, parsed_pdf)
+    if evidence_sections:
+        relevance_points = _unique_preserve_order(
+            [f"从全文语义检索命中的片段看，相关信息主要落在 {' / '.join(evidence_sections)} 部分。"]
+            + list(relevance_points)
+        )[:4]
+    field_evidence_map = _build_field_evidence_map(retrieved_evidence)
+    report_evidence_anchors = _build_report_evidence_anchors(retrieved_evidence)
 
     return {
         "abstract": abstract,
@@ -1146,12 +2170,15 @@ def build_heuristic_report_payload(
         "key_results": key_results,
         "main_contributions": main_contributions,
         "limitations": limitations[:3],
-        "relevance_points": _build_relevance_points(paper, user_profile, combined_text, parsed_pdf),
+        "relevance_points": relevance_points,
         "reading_focus": _unique_preserve_order(reading_focus)[:4],
         "estimated_reading_minutes": _estimate_reading_minutes(parsed_pdf, abstract),
-        "analysis_source": "pdf" if parsed_pdf else "abstract",
+        "analysis_source": "pdf" if parsed_source_kind == "pdf" else ("source_page" if parsed_source_kind == "source_page" else "abstract"),
         "analysis_note": analysis_note,
         "recommendation_label": _recommendation_label(paper),
+        "retrieved_evidence": retrieved_evidence,
+        "field_evidence_map": field_evidence_map,
+        "report_evidence_anchors": report_evidence_anchors,
     }
 
 
@@ -1267,16 +2294,38 @@ def generate_reading_report(
 ) -> str:
     payload = report_payload or build_heuristic_report_payload(paper, user_profile)
     title = _clean_text(paper.get("title")) or "Untitled Paper"
-    abstract = payload.get("abstract") or _clean_text(paper.get("abstract")) or "暂无摘要。"
+    abstract = _clean_abstract_text(payload.get("abstract") or paper.get("abstract"))
+    if not _clean_text(abstract):
+        fallback_source = _get_direct_pdf_url(paper) or _get_first_url(
+            paper,
+            "paper_url",
+            "openreview_url",
+            "cvf_url",
+            "ecva_url",
+            "dblp_url",
+            "doi_url",
+            "url",
+        )
+        if fallback_source:
+            abstract = f"源站暂未返回可用摘要。请直接查看原文链接：{fallback_source}"
+        else:
+            abstract = "源站暂未返回可用摘要，建议直接查看原文 PDF 或论文主页。"
     arxiv_id = _clean_text(paper.get("arxiv_id"))
     doi = _clean_text(paper.get("doi"))
     recommendation_label = payload.get("recommendation_label") or _recommendation_label(paper)
     recommendation_score = _recommendation_score(recommendation_label)
     recommendation_stars = "★" * recommendation_score + "☆" * (5 - recommendation_score)
-    analysis_source_label = "PDF 全文 + 元数据" if payload.get("analysis_source") == "pdf" else "摘要 + 元数据"
+    analysis_source = _clean_text(payload.get("analysis_source"))
+    analysis_source_label = (
+        "PDF 全文 + 元数据"
+        if analysis_source == "pdf"
+        else ("源站正文 + 元数据" if analysis_source == "source_page" else "摘要 + 元数据")
+    )
     analysis_note = _clean_text(payload.get("analysis_note"))
     resource_items = _build_resource_items(paper)
     recommendation_reason = _build_recommendation_reason(payload)
+    report_evidence_anchors = payload.get("report_evidence_anchors") or {}
+    field_evidence_map = payload.get("field_evidence_map") or {}
 
     lines = []
     lines.append(f"# {title}")
@@ -1349,12 +2398,38 @@ def generate_reading_report(
         lines.append(f"- {item}")
     lines.append("")
 
+    if report_evidence_anchors:
+        bucket_labels = {
+            "background": "研究背景",
+            "method": "核心方法",
+            "results": "主要结果",
+            "limitations": "局限性",
+            "relevance": "相关性",
+        }
+        evidence_heading = "## PDF 证据定位" if analysis_source == "pdf" else "## 全文证据定位"
+        lines.append(evidence_heading)
+        lines.append("")
+        for bucket in ("background", "method", "results", "limitations", "relevance"):
+            items = report_evidence_anchors.get(bucket) or []
+            if not items:
+                continue
+            lines.append(f"- {bucket_labels.get(bucket, bucket)}：")
+            for item in items:
+                lines.append(f"  {item}")
+        lines.append("")
+
     lines.append("## 代码与资源")
     lines.append("")
     for label, value in resource_items:
         lines.append(f"- {label}：{value}")
     if analysis_note:
         lines.append(f"- 解析说明：{analysis_note}")
+    method_evidence = field_evidence_map.get("core_method") or []
+    result_evidence = field_evidence_map.get("key_results") or []
+    if method_evidence:
+        lines.append(f"- 方法证据锚点：{method_evidence[0]}")
+    if result_evidence:
+        lines.append(f"- 结果证据锚点：{result_evidence[0]}")
     lines.append("")
 
     lines.append("## 推荐指数")
@@ -1376,7 +2451,14 @@ def generate_reading_report(
 
 
 def resolve_selected_papers(paper_refs: List[int], papers: List[Dict]) -> List[Dict]:
-    """Resolve paper references from either 1-based positions or actual paper IDs."""
+    """Resolve paper references from either 1-based positions or actual paper IDs.
+
+    If paper_refs is empty but papers is not, return all papers directly.
+    """
+    # If no refs provided but papers exist, return all papers (for direct PDF input)
+    if not paper_refs and papers:
+        return papers
+
     resolved: List[Dict] = []
     seen_keys: set[str] = set()
 
@@ -1551,12 +2633,14 @@ def create_reading_report(
     send_to_feishu: bool = True,
     feishu_user_id: Optional[str] = None,
     chat_id: Optional[str] = None,
+    request_metadata: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     print(f"Creating reading reports for user: {user_id}")
     print(f"Selected papers: {paper_ids}")
 
     target_id = chat_id or feishu_user_id
     use_chat_id = chat_id is not None
+    request_metadata = dict(request_metadata or {})
 
     profile = get_profile(user_id)
     if not profile:
@@ -1574,9 +2658,85 @@ def create_reading_report(
             )
         return []
 
-    created_docs: List[Dict[str, Any]] = []
-    for index, raw_paper in enumerate(selected_papers, start=1):
-        print(f"\n[{index}/{len(selected_papers)}] Processing: {str(raw_paper.get('title', 'Unknown'))[:60]}")
+    # 1. If this request comes from a specific uploaded PDF, reuse the existing
+    # report when the same source key has already been processed successfully.
+    existing_pdf_doc = None
+    if request_metadata.get("report_source_type") and request_metadata.get("report_source_key"):
+        existing_pdf_doc = _lookup_existing_pdf_report(user_id, request_metadata, selected_papers[0])
+        if existing_pdf_doc:
+            print(
+                "Reusing existing PDF reading report for "
+                f"{request_metadata.get('report_source_type')}={request_metadata.get('report_source_key')}"
+            )
+            if send_to_feishu and target_id:
+                summary_text = format_created_docs_summary([existing_pdf_doc])
+                try:
+                    send_text(target_id, summary_text, use_chat_id=use_chat_id)
+                    print(f"\nNotification sent to Feishu target: {target_id}")
+                except Exception as exc:
+                    print(f"\nFailed to send reused PDF doc summary to Feishu: {exc}")
+            return [existing_pdf_doc]
+
+    # 2. For pushed/selected papers, reuse already-created docs by paper_id and
+    # only generate reports for the missing subset.
+    existing_reports_by_paper_id: Dict[int, Dict[str, Any]] = {}
+    selected_paper_ids = []
+    for paper in selected_papers:
+        paper_id = paper.get("id")
+        if paper_id is None:
+            continue
+        try:
+            selected_paper_ids.append(int(paper_id))
+        except (TypeError, ValueError):
+            continue
+
+    if selected_paper_ids:
+        existing_reports_by_paper_id = get_existing_reading_reports_for_papers(user_id, selected_paper_ids)
+
+    prepared_docs: List[Optional[Dict[str, Any]]] = [None] * len(selected_papers)
+    pending_entries: List[Tuple[int, Dict[str, Any]]] = []
+    reused_count = 0
+    for index, raw_paper in enumerate(selected_papers):
+        paper_id = raw_paper.get("id")
+        try:
+            normalized_paper_id = int(paper_id) if paper_id is not None else None
+        except (TypeError, ValueError):
+            normalized_paper_id = None
+
+        report_record = (
+            existing_reports_by_paper_id.get(normalized_paper_id)
+            if normalized_paper_id is not None
+            else None
+        )
+        normalized_raw_paper = _normalize_paper(raw_paper)
+        should_reuse_report = bool(report_record)
+        if should_reuse_report and not _is_report_record_current(report_record):
+            should_reuse_report = False
+            print(
+                "Existing reading report found but it was generated by an older template version; "
+                "regenerating."
+            )
+        if should_reuse_report and not _paper_has_sufficient_metadata_for_report(normalized_raw_paper):
+            should_reuse_report = False
+            print(
+                "Existing reading report found but paper metadata is incomplete; "
+                "regenerating to backfill missing abstract/authors."
+            )
+
+        if should_reuse_report:
+            prepared_docs[index] = _build_reused_doc_entry(raw_paper, report_record)
+            reused_count += 1
+        else:
+            pending_entries.append((index, raw_paper))
+
+    if reused_count:
+        print(f"Reusing {reused_count} existing reading report(s); generating only missing ones.")
+
+    for display_index, (target_index, raw_paper) in enumerate(pending_entries, start=1):
+        print(
+            f"\n[{display_index}/{len(pending_entries)}] Processing: "
+            f"{str(raw_paper.get('title', 'Unknown'))[:60]}"
+        )
 
         try:
             enriched_paper, parsed_pdf, pdf_error = enrich_paper_for_reading_report(raw_paper)
@@ -1606,16 +2766,35 @@ def create_reading_report(
             if not doc_url and doc_token:
                 doc_url = _resolve_doc_url_from_meta(doc_token)
 
-            created_docs.append(
-                {
-                    "paper": enriched_paper,
-                    "doc_info": doc_info,
-                    "title": doc_title,
-                    "url": doc_url,
-                    "doc_token": doc_token,
-                    "report_payload": report_payload,
-                }
-            )
+            created_doc = {
+                "paper": enriched_paper,
+                "doc_info": doc_info,
+                "title": doc_title,
+                "url": doc_url,
+                "doc_token": doc_token,
+                "report_payload": report_payload,
+            }
+            prepared_docs[target_index] = created_doc
+
+            behavior_metadata = {
+                "arxiv_id": enriched_paper.get("arxiv_id"),
+                "doc_title": doc_title,
+                "paper_title": enriched_paper.get("title"),
+                "doc_token": doc_token,
+                "doc_url": doc_url,
+                "analysis_source": report_payload.get("analysis_source"),
+                "report_version": READING_REPORT_OUTPUT_VERSION,
+            }
+            for key in (
+                "report_source_type",
+                "report_source_key",
+                "report_source_name",
+                "report_source_message_id",
+                "selection_push_id",
+            ):
+                value = request_metadata.get(key)
+                if value not in (None, "", [], {}):
+                    behavior_metadata[key] = value
 
             log_behavior(
                 user_id=user_id,
@@ -1624,16 +2803,13 @@ def create_reading_report(
                 action="created_report",
                 action_type="reading",
                 category="reading_agent",
-                metadata={
-                    "arxiv_id": enriched_paper.get("arxiv_id"),
-                    "doc_token": doc_token,
-                    "doc_url": doc_url,
-                    "analysis_source": report_payload.get("analysis_source"),
-                },
+                metadata=behavior_metadata,
             )
             print(f"  Created reading doc: {doc_url or doc_token or '[no link yet]'}")
         except Exception as exc:
             print(f"  Error creating reading report: {exc}")
+
+    created_docs = [doc for doc in prepared_docs if doc]
 
     if send_to_feishu and created_docs and target_id:
         summary_text = format_created_docs_summary(created_docs)

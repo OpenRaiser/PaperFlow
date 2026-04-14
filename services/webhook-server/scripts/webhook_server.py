@@ -56,8 +56,11 @@ BOT_MESSAGE_PREFIXES = (
     "📰 今日论文",
     "📋 你的学术画像",
     "📊 你的学术画像周度报告",
+    "📫 精读报告已生成",
+    "📚 精读报告已生成",
     "SciTaste 学术画像确认",
     "收到，",
+    "收到 PDF，",
     "当前已有一个",
     "当前已有相同任务在处理中",
     "📊 今日反馈已记录",
@@ -85,6 +88,7 @@ ASYNC_INTENT_DUPLICATE_ACKS = {
     "reading_report": "当前已有一个精读报告任务在处理中，请稍候查看本群结果。",
     "weekly_report": "当前已有一个周报任务在处理中，请稍候查看本群结果。",
 }
+PDF_ASYNC_ACK = "收到 PDF，正在生成精读报告，请稍候..."
 INFLIGHT_COORDINATOR_TASKS: set[str] = set()
 INFLIGHT_COORDINATOR_TASKS_LOCK = threading.Lock()
 ASYNC_TASK_LOCK_DIR = PROJECT_ROOT_PATH / "data" / "webhook_task_locks"
@@ -217,6 +221,21 @@ def is_likely_bot_echo(text: str) -> bool:
     if "Reading reports created (" in normalized and "doc_token:" in normalized:
         return True
 
+    if normalized.startswith("精读报告已生成："):
+        return True
+
+    if normalized.startswith("收到 PDF，") and "正在生成精读报告" in normalized:
+        return True
+
+    if "精读任务已执行，但这次没有成功生成文档链接" in normalized:
+        return True
+
+    if normalized.startswith("[精读]"):
+        return True
+
+    if "[精读]" in normalized and "本群成员" in normalized and "可阅读" in normalized:
+        return True
+
     if "必读清单" in normalized and "添加方式：" in normalized and "移除方式：" in normalized:
         return True
 
@@ -290,6 +309,24 @@ def is_duplicate_text_message(chat_id: str, open_id: str, text: str) -> bool:
     return False
 
 
+def looks_like_pdf_attachment(msg_type: str, content: Dict[str, Any]) -> bool:
+    """Only route genuine user-uploaded PDF files into the PDF reading flow."""
+    file_name = str(content.get("file_name") or content.get("name") or content.get("title") or "").strip()
+    file_type = str(content.get("file_type") or content.get("type") or "").strip().lower()
+    file_url = str(content.get("file_url") or "").strip().lower()
+
+    if file_name.lower().endswith(".pdf"):
+        return True
+    if file_type == "pdf":
+        return True
+    if ".pdf" in file_url:
+        return True
+
+    # Be conservative: if Feishu is sending a generic file card/share without a
+    # clear PDF suffix, do not recurse into the reading-report pipeline.
+    return False
+
+
 class FeishuEventHandler:
     """飞书事件处理器"""
 
@@ -297,6 +334,28 @@ class FeishuEventHandler:
         self.app_id = os.environ.get("FEISHU_APP_ID", "")
         self.app_secret = os.environ.get("FEISHU_APP_SECRET", "")
         self.verification_token = os.environ.get("FEISHU_VERIFICATION_TOKEN", "")
+
+    def _resolve_user_id_for_chat(self, chat_id: str, open_id: str) -> str:
+        """Resolve the stable user_id used by the coordinator / reading flows."""
+        role_name = self._find_role_by_chat_id(chat_id)
+        if role_name:
+            return f"user_{role_name}"
+        return open_id
+
+    def _find_existing_pdf_report(self, user_id: str, source_type: str, source_key: str) -> Optional[Dict[str, Any]]:
+        """Check whether the same uploaded PDF has already produced a report."""
+        if not user_id or not source_type or not source_key:
+            return None
+
+        try:
+            db_ops = importlib.import_module("skills.storage-helper.scripts.db_ops")
+            finder = getattr(db_ops, "get_recent_created_report_by_source", None)
+            if not callable(finder):
+                return None
+            return finder(user_id, source_type, source_key)
+        except Exception as exc:
+            logger.warning(f"Failed to look up existing PDF report: {exc}")
+            return None
 
     def verify_url(self, token: str, challenge: str) -> str:
         """
@@ -426,11 +485,63 @@ class FeishuEventHandler:
             logger.info("Ignoring likely bot echo based on message content")
             return {"status": "ignored", "reason": "likely_bot_message"}
 
-        # 检测文件消息（PDF 冷启动）
+        # 检测文件消息：只有明确的 PDF 才进入精读报告流程
         if file_key or file_url:
-            logger.info(f"File message detected: file_key={file_key}, file_name={file_name}, file_url={file_url}")
-            # 下载文件并触发冷启动
-            return self._handle_pdf_coldstart(message_id, file_key, file_name, chat_id, open_id)
+            if looks_like_pdf_attachment(msg_type, content):
+                logger.info(
+                    "PDF file message detected: msg_type=%s, file_key=%s, file_name=%s, file_url=%s",
+                    msg_type,
+                    file_key,
+                    file_name,
+                    file_url,
+                )
+                source_type = "feishu_file_key" if file_key else "feishu_file_url"
+                source_key = file_key or file_url
+                resolved_user_id = self._resolve_user_id_for_chat(chat_id, open_id)
+                existing_report = self._find_existing_pdf_report(resolved_user_id, source_type, source_key)
+                if existing_report:
+                    logger.info(
+                        "Ignoring already-processed PDF upload event: user_id=%s, %s=%s",
+                        resolved_user_id,
+                        source_type,
+                        source_key,
+                    )
+                    return {
+                        "status": "ignored",
+                        "reason": "duplicate_pdf_file_message",
+                        "source": "pdf",
+                        "chat_id": chat_id,
+                    }
+
+                file_identity = file_key or file_url or message_id
+                task_key = f"pdf:{chat_id}:{open_id}:{file_identity}"
+                if not self._register_async_task(task_key):
+                    logger.info(f"Ignoring duplicate in-flight async PDF task for {task_key}")
+                    return {
+                        "status": "ignored",
+                        "reason": "duplicate_pdf_inflight",
+                        "source": "pdf",
+                        "chat_id": chat_id,
+                    }
+
+                self._send_async_ack_async(chat_id, open_id, PDF_ASYNC_ACK)
+                self._route_pdf_reading_report_async(task_key, message_id, file_key, file_name, chat_id, open_id)
+                return {
+                    "status": "accepted",
+                    "mode": "async",
+                    "intent": "reading_report",
+                    "source": "pdf",
+                    "chat_id": chat_id,
+                }
+
+            logger.info(
+                "Ignoring non-PDF file-like message: msg_type=%s, file_key=%s, file_name=%s, file_url=%s",
+                msg_type,
+                file_key,
+                file_name,
+                file_url,
+            )
+            return {"status": "ignored", "reason": "non_pdf_file_message"}
 
         logger.info(f"Message {message_id} from {open_id} in chat {chat_id}: {text[:50]}...")
 
@@ -569,7 +680,7 @@ class FeishuEventHandler:
 
         return {"status": "success", "action": value_data}
 
-    def _handle_pdf_coldstart(
+    def _handle_pdf_reading_report(
         self,
         message_id: str,
         file_key: str,
@@ -578,11 +689,12 @@ class FeishuEventHandler:
         open_id: str,
     ) -> Dict[str, Any]:
         """
-        处理 PDF 文件消息，触发冷启动流程
+        处理 PDF 文件消息，生成精读报告
 
         Args:
             message_id: 消息 ID
             file_key: 文件 key（用于下载）
+            file_name: 文件名
             chat_id: 聊天 ID
             open_id: 用户 open_id
 
@@ -590,13 +702,14 @@ class FeishuEventHandler:
             处理结果
         """
         try:
-            # 导入 feishu-reporter 下载文件
+            # 导入 feishu-reporter 下载文件和发送消息
             feishu_reporter = importlib.import_module("skills.feishu-reporter.scripts.feishu_reporter")
             download_file = feishu_reporter.download_file_from_feishu
+            send_text = feishu_reporter.send_text
 
-            # 导入 coldstart-agent 执行冷启动
-            coldstart_agent = importlib.import_module("agents.coldstart-agent.main")
-            cold_start = coldstart_agent.cold_start
+            # 导入 reading-agent 生成精读报告
+            reading_agent = importlib.import_module("agents.reading-agent.main")
+            create_reading_report = reading_agent.create_reading_report
 
             # 根据 chat_id 查找角色
             role_name = self._find_role_by_chat_id(chat_id)
@@ -615,23 +728,44 @@ class FeishuEventHandler:
             pdf_path = download_file(message_id, file_key, file_name=file_name)
             logger.info(f"PDF downloaded to: {pdf_path}")
 
-            # 执行冷启动
-            logger.info(f"Executing cold start with PDF: {pdf_path}")
-            cold_start(
+            # 执行精读报告生成
+            logger.info(f"Executing reading report with PDF: {pdf_path}")
+            source_type = "feishu_file_key" if file_key else "feishu_message_id"
+            source_key = file_key or message_id
+            created_docs = create_reading_report(
                 user_id=user_id,
-                pdf_paths=[pdf_path],
+                paper_ids=[],  # 空列表，使用 PDF 文件
+                papers=[{"pdf_path": pdf_path, "title": os.path.splitext(file_name)[0]}],
                 send_to_feishu=True,
                 feishu_user_id=open_id,
-                chat_id=chat_id
+                chat_id=chat_id,
+                request_metadata={
+                    "report_source_type": source_type,
+                    "report_source_key": source_key,
+                    "report_source_name": file_name,
+                    "report_source_message_id": message_id,
+                },
             )
 
             return {
                 "status": "success",
-                "message": f"PDF coldstart triggered for user {user_id}",
-                "pdf_path": pdf_path
+                "message": f"PDF reading report generated for user {user_id}",
+                "pdf_path": pdf_path,
+                "created_docs": created_docs
             }
         except Exception as e:
-            logger.error(f"Error handling PDF coldstart: {e}", exc_info=True)
+            logger.error(f"Error handling PDF reading report: {e}", exc_info=True)
+            # 发送错误通知
+            try:
+                feishu_reporter = importlib.import_module("skills.feishu-reporter.scripts.feishu_reporter")
+                send_text = feishu_reporter.send_text
+                send_text(
+                    chat_id,
+                    f"精读报告生成失败：{str(e)}",
+                    use_chat_id=True
+                )
+            except Exception:
+                pass
             return {"status": "error", "message": str(e)}
 
     def _route_to_coordinator(self, user_id: str, message: str, chat_id: str, sender_open_id: str = None) -> Dict[str, Any]:
@@ -715,6 +849,31 @@ class FeishuEventHandler:
         )
         thread.start()
 
+    def _route_pdf_reading_report_async(
+        self,
+        task_key: str,
+        message_id: str,
+        file_key: str,
+        file_name: str,
+        chat_id: str,
+        open_id: str,
+    ) -> None:
+        """Run PDF reading report generation in the background."""
+
+        def target() -> None:
+            try:
+                result = self._handle_pdf_reading_report(message_id, file_key, file_name, chat_id, open_id)
+                logger.info(f"Async PDF reading-report task finished: {result}")
+            finally:
+                self._release_async_task(task_key)
+
+        thread = threading.Thread(
+            target=target,
+            name=f"scitaste-pdf-{int(time.time())}",
+            daemon=True,
+        )
+        thread.start()
+
     def _send_async_ack(self, chat_id: str, open_id: str, text: str) -> None:
         """Send a short acknowledgement before a long-running task starts."""
         try:
@@ -727,17 +886,13 @@ class FeishuEventHandler:
             logger.warning(f"Failed to send async acknowledgement: {exc}")
 
     def _send_async_ack_async(self, chat_id: str, open_id: str, text: str) -> None:
-        """Send the acknowledgement in the background so webhook can return 200 quickly."""
+        """Send the acknowledgement before background work starts.
 
-        def target() -> None:
-            self._send_async_ack(chat_id, open_id, text)
-
-        thread = threading.Thread(
-            target=target,
-            name=f"scitaste-ack-{int(time.time())}",
-            daemon=True,
-        )
-        thread.start()
+        The actual coordinator task still runs asynchronously, but the short
+        acknowledgement is sent inline so users see "processing..." before the
+        final result rather than after it.
+        """
+        self._send_async_ack(chat_id, open_id, text)
 
     def _register_async_task(self, task_key: str) -> bool:
         """Register an async task if the same user+intent is not already running."""

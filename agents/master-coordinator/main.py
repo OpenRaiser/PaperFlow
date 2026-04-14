@@ -497,6 +497,7 @@ BOT_AUTHORED_PREFIXES = (
     "📰 今日论文",
     "📊 今日反馈已记录",
     "收到，",
+    "收到 PDF，",
     "抱歉，",
     "已增强你对",
     "已下调你对",
@@ -574,6 +575,12 @@ def looks_like_bot_authored_message(text: Any) -> bool:
     if "Reading reports created (" in normalized and "doc_token:" in normalized:
         return True
 
+    if normalized.startswith("收到 PDF，") and "正在生成精读报告" in normalized:
+        return True
+
+    if normalized.startswith("[精读]"):
+        return True
+
     if "必读清单" in normalized and "添加方式：" in normalized and "移除方式：" in normalized:
         return True
 
@@ -595,6 +602,16 @@ def safe_console_text(text: Any, max_len: int = 120) -> str:
 
 PROFILE_WEIGHT_COMMAND_RE = re.compile(
     r"(?P<verb>降低|减少|调低|下调|弱化|提高|增加|调高|上调|强化)\s*(?P<topic>.+?)(?:的?\s*权重)?(?:\s*(?:一点|一些))?$",
+    flags=re.IGNORECASE,
+)
+
+PROFILE_WEIGHT_TARGET_RE = re.compile(
+    r"(?:(?:把|将)\s*)?(?P<topic>.+?)(?:的?\s*权重)?\s*(?P<verb>降低|减少|调低|下调|弱化|提高|增加|调高|上调|强化|设为|设置为|改为|调到|提到|降到)\s*(?:到|为)?\s*(?P<weight>0(?:\.\d+)?|1(?:\.0+)?)$",
+    flags=re.IGNORECASE,
+)
+
+PROFILE_WEIGHT_TARGET_PREFIX_RE = re.compile(
+    r"(?P<verb>降低|减少|调低|下调|弱化|提高|增加|调高|上调|强化)\s*(?P<topic>.+?)(?:的?\s*权重)?\s*(?:到|为)\s*(?P<weight>0(?:\.\d+)?|1(?:\.0+)?)$",
     flags=re.IGNORECASE,
 )
 
@@ -743,16 +760,40 @@ def clean_profile_topic_text(topic: str, *, strip_domain_suffix: bool = False) -
     return cleaned
 
 
-def build_profile_update_result(action: str, direction: str, topic: str, *, strip_domain_suffix: bool = False) -> Optional[Dict[str, Any]]:
+def parse_weight_target(value: Any) -> Optional[float]:
+    """Parse an explicit target weight expressed as a 0-1 decimal."""
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = float(raw)
+    except ValueError:
+        return None
+    if 0.0 <= parsed <= 1.0:
+        return parsed
+    return None
+
+
+def build_profile_update_result(
+    action: str,
+    direction: str,
+    topic: str,
+    *,
+    strip_domain_suffix: bool = False,
+    weight_target: Optional[float] = None,
+) -> Optional[Dict[str, Any]]:
     """Build a normalized profile-update payload."""
     cleaned_topic = clean_profile_topic_text(topic, strip_domain_suffix=strip_domain_suffix)
     if not cleaned_topic:
         return None
-    return {
+    result = {
         "action": action,
         "direction": direction,
         "topic": cleaned_topic,
     }
+    if weight_target is not None:
+        result["weight_target"] = weight_target
+    return result
 
 
 def parse_profile_update_request(text: str, profile: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
@@ -772,6 +813,21 @@ def parse_profile_update_request(text: str, profile: Optional[Dict[str, Any]] = 
 
     if looks_like_cold_start_description(cleaned, profile=profile):
         return None
+
+    for pattern in (PROFILE_WEIGHT_TARGET_RE, PROFILE_WEIGHT_TARGET_PREFIX_RE):
+        weight_target_match = pattern.search(cleaned)
+        if not weight_target_match:
+            continue
+        verb = weight_target_match.group("verb")
+        target_weight = parse_weight_target(weight_target_match.group("weight"))
+        if target_weight is None:
+            continue
+        return build_profile_update_result(
+            "adjust_weight",
+            "decrease" if verb in {"降低", "减少", "调低", "下调", "弱化", "降到"} else "increase",
+            weight_target_match.group("topic"),
+            weight_target=target_weight,
+        )
 
     weight_match = PROFILE_WEIGHT_COMMAND_RE.search(cleaned)
     if weight_match:
@@ -1054,7 +1110,10 @@ class MasterCoordinator:
                 papers=papers,
                 send_to_feishu=True,
                 feishu_user_id=self.feishu_user_id,
-                chat_id=self.chat_id
+                chat_id=self.chat_id,
+                request_metadata={
+                    "selection_push_id": selected_info.get("push_id")
+                } if selected_info else None,
             )
             return {
                 "success": bool(created_docs),
@@ -1137,6 +1196,7 @@ class MasterCoordinator:
             action = slots.get("action")
             direction = slots.get("direction", "increase")
             topic_text = (slots.get("topic") or "").strip()
+            weight_target = slots.get("weight_target")
             if not topic_text:
                 msg = "我没有识别到你想调整的方向或主题。"
                 send_message(msg, chat_id=self.chat_id, user_id=self.feishu_user_id)
@@ -1220,8 +1280,11 @@ class MasterCoordinator:
                     summary = f"当前画像里没有明显匹配“{topic_text}”的核心方向，我先没有做改动。"
                 else:
                     current_weight = float(topic_weights.get(resolved_key, core_directions.get(resolved_key, 0.5)))
-                    delta = 0.15
-                    new_weight = clamp_weight(current_weight + delta if direction == "increase" else current_weight - delta)
+                    if weight_target is not None:
+                        new_weight = clamp_weight(weight_target, minimum=0.0, maximum=1.0)
+                    else:
+                        delta = 0.15
+                        new_weight = clamp_weight(current_weight + delta if direction == "increase" else current_weight - delta)
                     topic_weights[resolved_key] = new_weight
                     if resolved_key in core_directions or direction == "increase":
                         core_directions[resolved_key] = new_weight

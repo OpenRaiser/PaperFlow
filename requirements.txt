@@ -2,6 +2,7 @@
 # Install with: pip install -r requirements.txt
 
 # HTTP requests
+# Also used for DOI metadata fallback via OpenAlex / Crossref
 requests>=2.31.0
 python-dotenv>=1.0.1
 

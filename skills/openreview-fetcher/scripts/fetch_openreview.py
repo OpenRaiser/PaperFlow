@@ -250,7 +250,10 @@ def _fetch_cvf_detail(detail_url: str, title: str, venue_name: str, conference: 
             "publish_date": _approx_conference_publish_date(conference, year),
             "categories": [conference],
             "pdf_url": None,
+            "paper_url": detail_url,
+            "url": detail_url,
             "cvf_url": detail_url,
+            "source": "cvf",
         }
 
     authors_match = re.search(r'<div id="authors">(.*?)</div>', detail_html, re.I | re.S)
@@ -272,7 +275,10 @@ def _fetch_cvf_detail(detail_url: str, title: str, venue_name: str, conference: 
         "publish_date": _approx_conference_publish_date(conference, year),
         "categories": [conference],
         "pdf_url": pdf_url,
+        "paper_url": detail_url,
+        "url": detail_url,
         "cvf_url": detail_url,
+        "source": "cvf",
     }
 
 
@@ -339,7 +345,10 @@ def _fetch_ecva_detail(
             "publish_date": _approx_conference_publish_date(conference, year),
             "categories": [conference],
             "pdf_url": pdf_url,
+            "paper_url": detail_url,
+            "url": detail_url,
             "ecva_url": detail_url,
+            "source": "ecva",
         }
 
     authors_match = re.search(r'<div id="authors">(.*?)</div>', detail_html, re.I | re.S)
@@ -359,7 +368,10 @@ def _fetch_ecva_detail(
         "publish_date": _approx_conference_publish_date(conference, year),
         "categories": [conference],
         "pdf_url": pdf_url,
+        "paper_url": detail_url,
+        "url": detail_url,
         "ecva_url": detail_url,
+        "source": "ecva",
     }
 
 
@@ -529,8 +541,11 @@ def _search_dblp_toc_papers(conference: str, year: int, limit: int) -> List[Dict
                 "publish_date": _approx_conference_publish_date(conference, year),
                 "categories": [conference],
                 "pdf_url": paper_info.get("ee") if str(paper_info.get("ee", "")).lower().endswith(".pdf") else None,
+                "paper_url": paper_info.get("ee") or (record_url if str(record_url).startswith("http") else ""),
+                "url": paper_info.get("ee") or (record_url if str(record_url).startswith("http") else ""),
                 "doi_url": paper_info.get("ee"),
                 "dblp_url": record_url if str(record_url).startswith("http") else "",
+                "source": "dblp_toc",
             }
         )
         if len(papers) >= limit:
@@ -673,9 +688,12 @@ def search_papers(
                     "venue": venue_info["name"],
                     "openreview_id": note.id,
                     "openreview_url": f"https://openreview.net/forum?id={note.id}",
+                    "paper_url": f"https://openreview.net/forum?id={note.id}",
+                    "url": f"https://openreview.net/forum?id={note.id}",
                     "publish_date": datetime.fromtimestamp(note.cdate / 1000).isoformat() if note.cdate else datetime.now().isoformat(),
                     "categories": [normalized_conference],
                     "pdf_url": f"https://openreview.net/pdf?id={note.id}" if note.id else None,
+                    "source": "openreview",
                 }
                 papers.append(paper)
             except Exception as e:
@@ -708,9 +726,12 @@ def _get_mock_papers(conference: str, year: int, limit: int) -> List[Dict[str, A
             "venue": conference.upper(),
             "openreview_id": f"{conference}_{year}_{i+1}",
             "openreview_url": f"https://openreview.net/forum?id={conference}_{year}_{i+1}",
+            "paper_url": f"https://openreview.net/forum?id={conference}_{year}_{i+1}",
+            "url": f"https://openreview.net/forum?id={conference}_{year}_{i+1}",
             "publish_date": datetime.now().isoformat(),
             "categories": [conference.lower()],
             "pdf_url": None,
+            "source": "openreview",
         }
         papers.append(paper)
 

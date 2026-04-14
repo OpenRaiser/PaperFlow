@@ -54,6 +54,14 @@ def test_is_likely_bot_echo_matches_reading_report_summary():
     assert webhook_server.is_likely_bot_echo(reading_report_summary)
 
 
+def test_is_likely_bot_echo_matches_reading_doc_title_echo():
+    assert webhook_server.is_likely_bot_echo("[精读] 面向兴趣漂移驱动的序列推荐用户表示学习")
+
+
+def test_is_likely_bot_echo_matches_pdf_processing_ack():
+    assert webhook_server.is_likely_bot_echo("收到 PDF，正在生成精读报告，请稍候...")
+
+
 def test_recent_outbound_bot_text_is_ignored(monkeypatch):
     webhook_server.PROCESSED_MESSAGE_IDS.clear()
     webhook_server.RECENT_TEXT_MESSAGE_FINGERPRINTS.clear()
@@ -88,20 +96,35 @@ def test_is_duplicate_message_rejects_retries():
     assert webhook_server.is_duplicate_message("om_test_message") is True
 
 
-def test_file_message_routes_to_pdf_coldstart(monkeypatch):
+def test_pdf_file_message_routes_to_reading_report(monkeypatch):
     webhook_server.PROCESSED_MESSAGE_IDS.clear()
+    webhook_server.INFLIGHT_COORDINATOR_TASKS.clear()
     handler = webhook_server.FeishuEventHandler()
     captured = {}
 
-    def fake_pdf_coldstart(message_id, file_key, file_name, chat_id, open_id):
-        captured["message_id"] = message_id
-        captured["file_key"] = file_key
-        captured["file_name"] = file_name
-        captured["chat_id"] = chat_id
-        captured["open_id"] = open_id
-        return {"status": "success"}
-
-    monkeypatch.setattr(handler, "_handle_pdf_coldstart", fake_pdf_coldstart)
+    monkeypatch.setattr(handler, "_find_existing_pdf_report", lambda *args, **kwargs: None)
+    monkeypatch.setattr(handler, "_register_async_task", lambda task_key: captured.setdefault("task_key", task_key) or True)
+    monkeypatch.setattr(
+        handler,
+        "_send_async_ack_async",
+        lambda chat_id, open_id, text: captured.update({"ack": (chat_id, open_id, text)}),
+    )
+    monkeypatch.setattr(
+        handler,
+        "_route_pdf_reading_report_async",
+        lambda task_key, message_id, file_key, file_name, chat_id, open_id: captured.update(
+            {
+                "route": {
+                    "task_key": task_key,
+                    "message_id": message_id,
+                    "file_key": file_key,
+                    "file_name": file_name,
+                    "chat_id": chat_id,
+                    "open_id": open_id,
+                }
+            }
+        ),
+    )
 
     event = {
         "event": {
@@ -120,14 +143,139 @@ def test_file_message_routes_to_pdf_coldstart(monkeypatch):
 
     result = handler._handle_message(event)
 
-    assert result == {"status": "success"}
-    assert captured == {
+    assert result == {
+        "status": "accepted",
+        "mode": "async",
+        "intent": "reading_report",
+        "source": "pdf",
+        "chat_id": "oc_test",
+    }
+    assert captured["task_key"] == "pdf:oc_test:ou_test:file_v3_test"
+    assert captured["ack"] == ("oc_test", "ou_test", webhook_server.PDF_ASYNC_ACK)
+    assert captured["route"] == {
+        "task_key": "pdf:oc_test:ou_test:file_v3_test",
         "message_id": "om_file_test",
         "file_key": "file_v3_test",
         "file_name": "sample.pdf",
         "chat_id": "oc_test",
         "open_id": "ou_test",
     }
+
+
+def test_duplicate_pdf_file_message_is_blocked_by_async_task_lock(monkeypatch):
+    webhook_server.PROCESSED_MESSAGE_IDS.clear()
+    webhook_server.INFLIGHT_COORDINATOR_TASKS.clear()
+    handler = webhook_server.FeishuEventHandler()
+    captured = {"routes": 0}
+
+    monkeypatch.setattr(handler, "_find_existing_pdf_report", lambda *args, **kwargs: None)
+    monkeypatch.setattr(handler, "_register_async_task", lambda task_key: False)
+    monkeypatch.setattr(
+        handler,
+        "_route_pdf_reading_report_async",
+        lambda *args, **kwargs: captured.__setitem__("routes", captured["routes"] + 1),
+    )
+
+    event = {
+        "event": {
+            "message": {
+                "chat_id": "oc_test",
+                "message_id": "om_file_test_dup",
+                "msg_type": "file",
+                "content": '{"file_key":"file_v3_test","file_name":"sample.pdf"}',
+            },
+            "sender": {
+                "sender_id": {"open_id": "ou_test", "user_id": None},
+                "sender_type": "user",
+            },
+        }
+    }
+
+    result = handler._handle_message(event)
+
+    assert result == {
+        "status": "ignored",
+        "reason": "duplicate_pdf_inflight",
+        "source": "pdf",
+        "chat_id": "oc_test",
+    }
+    assert captured["routes"] == 0
+
+
+def test_completed_pdf_file_message_is_silently_ignored(monkeypatch):
+    webhook_server.PROCESSED_MESSAGE_IDS.clear()
+    webhook_server.INFLIGHT_COORDINATOR_TASKS.clear()
+    handler = webhook_server.FeishuEventHandler()
+
+    monkeypatch.setattr(
+        handler,
+        "_find_existing_pdf_report",
+        lambda user_id, source_type, source_key: {
+            "doc_url": "https://example.feishu.cn/docx/existing-pdf",
+            "doc_token": "existing_pdf_doc",
+        },
+    )
+    monkeypatch.setattr(
+        handler,
+        "_register_async_task",
+        lambda task_key: (_ for _ in ()).throw(AssertionError("should not register duplicate completed PDF task")),
+    )
+
+    event = {
+        "event": {
+            "message": {
+                "chat_id": "oc_test",
+                "message_id": "om_file_test_done",
+                "msg_type": "file",
+                "content": '{"file_key":"file_v3_done","file_name":"sample.pdf"}',
+            },
+            "sender": {
+                "sender_id": {"open_id": "ou_test", "user_id": None},
+                "sender_type": "user",
+            },
+        }
+    }
+
+    result = handler._handle_message(event)
+
+    assert result == {
+        "status": "ignored",
+        "reason": "duplicate_pdf_file_message",
+        "source": "pdf",
+        "chat_id": "oc_test",
+    }
+
+
+def test_non_pdf_file_like_message_is_ignored(monkeypatch):
+    webhook_server.PROCESSED_MESSAGE_IDS.clear()
+    handler = webhook_server.FeishuEventHandler()
+    called = {"reading_report": False}
+
+    def fake_pdf_reading_report(*args, **kwargs):
+        called["reading_report"] = True
+        return {"status": "success"}
+
+    monkeypatch.setattr(handler, "_handle_pdf_reading_report", fake_pdf_reading_report)
+
+    event = {
+        "event": {
+            "message": {
+                "chat_id": "oc_test",
+                "message_id": "om_file_echo_test",
+                "msg_type": "file",
+                "content": '{"file_key":"file_v3_echo","file_name":"[精读] 测试文档"}',
+            },
+            "sender": {
+                "sender_id": {"open_id": "ou_test", "user_id": None},
+                "sender_type": "user",
+            },
+        }
+    }
+
+    result = handler._handle_message(event)
+
+    assert result == {"status": "ignored", "reason": "non_pdf_file_message"}
+    assert called["reading_report"] is False
 
 
 def test_text_message_retry_with_new_message_id_is_deduplicated(monkeypatch, tmp_path):

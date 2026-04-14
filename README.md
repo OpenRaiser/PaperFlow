@@ -38,6 +38,9 @@ SciTaste 是一个运行在飞书群聊里的论文助手。
 - 精读报告
   - 用户选中文献后自动生成飞书文档
   - 自动回发文档链接到群聊
+  - 优先对 arXiv / OpenReview / CVF / ECVA 可用 PDF 做全文级精读
+  - 当 PDF 不可用时，尽量回退到 source page 正文分节生成完整模板
+  - 对 DOI / ACM 类受限页面，优先回退 OpenAlex / Crossref 元数据，避免精读退化成空壳
 - 周报
   - 汇总近期推送、选择率、画像变化
 - 定时任务
@@ -242,6 +245,19 @@ READING_REPORT_ABSTRACT_CHARS=1200
 READING_REPORT_SECTION_CHARS=1800
 ```
 
+说明：
+- `READING_REPORT_PDF_MODE=always` 会尽量优先解析 PDF；`smart` 会在元数据已足够时跳过部分 PDF 抓取
+- OpenAlex / Crossref 的 DOI 元数据回退默认启用，不需要额外环境变量
+- 对 ACM / 受限 publisher 页面，如果正文和 PDF 都不可得，系统会至少补回摘要、作者、DOI、PDF 链接
+
+如果你想压低网络重试 warning：
+
+```env
+SCITASTE_SUPPRESS_HTTP_RETRY_WARNINGS=true
+```
+
+默认值就是 `true`，这样像 `urllib3.connectionpool` 的可恢复 SSL / retry warning 不会刷屏。
+
 ## 6. 角色配置
 
 第一次启动时，如果 `data/roles.json` 不存在，系统会自动从 [`config/roles.example.json`](config/roles.example.json) 复制一份。
@@ -383,10 +399,30 @@ python scripts\show_profile.py --user-id user_rolea
 SCITASTE_SCHEDULER_ENABLED=false
 ```
 
+## 12. 精读增强策略
 
-## 12. 故障排查
+当前精读报告按这条优先级链路生成：
 
-### 12.1 飞书发消息没有反应
+- arXiv / OpenReview / CVF / ECVA：优先走 PDF 全文精读
+- Nature / Science / Springer 等期刊：优先 PDF，失败时尽量回退源站正文分节
+- DOI / ACM / DBLP TOC：先尝试源站详情页；如果被 403 或反爬拦截，则回退 OpenAlex / Crossref 元数据
+
+当前已实现的三种解析来源：
+
+- `pdf`：PDF 全文 + 元数据
+- `source_page`：源站正文 + 元数据
+- `abstract`：摘要 + 元数据
+
+当前已知边界：
+
+- 部分 ACM / 付费 publisher 页面会同时拦截 HTML 正文和 PDF，所以这类论文目前通常只能稳定做到摘要级完整报告
+- 某些 publisher 的 PDF 文本抽取会有断行、连字、页眉页脚混入，这是 PDF 解析层的自然限制，不影响主流程
+
+
+
+## 13. 故障排查
+
+### 13.1 飞书发消息没有反应
 
 先检查：
 
@@ -394,7 +430,7 @@ SCITASTE_SCHEDULER_ENABLED=false
 - `http://127.0.0.1:4040/api/tunnels` 是否有指向 `localhost:8080` 的隧道
 - 飞书后台 `Request URL` 是否是最新 ngrok 地址
 
-### 12.2 启动时报缺少环境变量
+### 13.2 启动时报缺少环境变量
 
 先运行：
 
@@ -404,7 +440,7 @@ python services\webhook-server\start.py --verify
 
 然后补齐缺失项。
 
-### 12.3 精读报告慢
+### 13.3 精读报告慢
 
 常见原因：
 
@@ -412,7 +448,12 @@ python services\webhook-server\start.py --verify
 - arXiv / 期刊页解析较慢
 - 当前 LLM 网关响应慢
 
-### 12.4 推送结果不稳定或全红
+如果控制台里经常看到期刊详情页失败，但最后仍能抓到论文：
+
+- 这通常不是主流程错误，而是源站详情页被拦截后，系统自动回退到了 OpenAlex / Crossref 元数据
+- 只要最终有 `Fetched X papers` 且摘要不为空，就说明 fallback 生效了
+
+### 13.4 推送结果不稳定或全红
 
 先确认：
 

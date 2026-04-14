@@ -55,6 +55,7 @@ def create_reading_reports_for_selection(
     target_id: Optional[str],
     use_chat_id: bool,
     send_to_feishu: bool,
+    selection_push_id: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Create reading reports for selected papers and route them back to the same chat."""
     if not selected or not send_to_feishu:
@@ -75,6 +76,9 @@ def create_reading_reports_for_selection(
         "paper_ids": paper_ids,
         "papers": papers,
         "send_to_feishu": True,
+        "request_metadata": {
+            "selection_push_id": selection_push_id,
+        } if selection_push_id else None,
     }
 
     if use_chat_id and target_id:
@@ -475,6 +479,7 @@ def process_feedback(
                 target_id=target_id,
                 use_chat_id=use_chat_id,
                 send_to_feishu=send_to_feishu,
+                selection_push_id=push_id,
             )
         except Exception as exc:
             reading_report_error = str(exc)

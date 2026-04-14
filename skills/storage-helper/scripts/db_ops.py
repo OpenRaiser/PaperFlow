@@ -488,6 +488,136 @@ def log_behavior(
     return log_id
 
 
+def _build_created_report_record(row: sqlite3.Row, metadata: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    """Normalize a created_report behavior row into a reusable document record."""
+    parsed_metadata = metadata or _load_json_metadata(row["metadata"])
+    doc_url = _normalize_identifier(parsed_metadata.get("doc_url") or parsed_metadata.get("url"))
+    doc_token = _normalize_identifier(parsed_metadata.get("doc_token"))
+
+    if not doc_url and not doc_token:
+        return None
+
+    paper_title = _normalize_identifier(
+        row["paper_title"]
+        if "paper_title" in row.keys()
+        else parsed_metadata.get("paper_title")
+    )
+    doc_title = _normalize_identifier(parsed_metadata.get("doc_title"))
+
+    return {
+        "paper_id": row["paper_id"] if "paper_id" in row.keys() else None,
+        "timestamp": row["timestamp"],
+        "paper_title": paper_title,
+        "doc_title": doc_title or (f"[精读] {paper_title}" if paper_title else None),
+        "doc_url": doc_url,
+        "doc_token": doc_token,
+        "metadata": parsed_metadata,
+    }
+
+
+def get_existing_reading_reports_for_papers(user_id: str, paper_ids: List[int]) -> Dict[int, Dict[str, Any]]:
+    """
+    Return the latest created reading-report document for each paper_id.
+
+    Args:
+        user_id: User ID
+        paper_ids: Paper IDs to look up
+
+    Returns:
+        Mapping: paper_id -> report record
+    """
+    normalized_paper_ids: List[int] = []
+    for paper_id in paper_ids or []:
+        try:
+            normalized_paper_ids.append(int(paper_id))
+        except (TypeError, ValueError):
+            continue
+
+    normalized_paper_ids = list(dict.fromkeys(normalized_paper_ids))
+    if not normalized_paper_ids:
+        return {}
+
+    placeholders = ",".join("?" for _ in normalized_paper_ids)
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        f"""
+        SELECT bl.paper_id, bl.timestamp, bl.metadata, p.title AS paper_title
+        FROM behavior_logs bl
+        LEFT JOIN papers p ON p.id = bl.paper_id
+        WHERE bl.user_id = ?
+          AND bl.action = 'created_report'
+          AND bl.action_type = 'reading'
+          AND bl.paper_id IN ({placeholders})
+        ORDER BY bl.timestamp DESC, bl.id DESC
+        """,
+        (user_id, *normalized_paper_ids),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+
+    results: Dict[int, Dict[str, Any]] = {}
+    for row in rows:
+        paper_id = int(row["paper_id"])
+        if paper_id in results:
+            continue
+        record = _build_created_report_record(row)
+        if record:
+            results[paper_id] = record
+
+    return results
+
+
+def get_recent_created_report_by_source(
+    user_id: str,
+    source_type: str,
+    source_key: str,
+    days: int = 30,
+) -> Optional[Dict[str, Any]]:
+    """
+    Find the latest created reading-report document for a source descriptor.
+
+    Source metadata is stored in behavior_logs.metadata under:
+    - report_source_type
+    - report_source_key
+    """
+    normalized_source_type = _normalize_identifier(source_type)
+    normalized_source_key = _normalize_identifier(source_key)
+    if not normalized_source_type or not normalized_source_key:
+        return None
+
+    since_date = (datetime.now() - timedelta(days=max(1, int(days)))).isoformat(sep=" ")
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT bl.paper_id, bl.timestamp, bl.metadata, p.title AS paper_title
+        FROM behavior_logs bl
+        LEFT JOIN papers p ON p.id = bl.paper_id
+        WHERE bl.user_id = ?
+          AND bl.action = 'created_report'
+          AND bl.action_type = 'reading'
+          AND bl.timestamp >= ?
+        ORDER BY bl.timestamp DESC, bl.id DESC
+        """,
+        (user_id, since_date),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+
+    for row in rows:
+        metadata = _load_json_metadata(row["metadata"])
+        if _normalize_identifier(metadata.get("report_source_type")) != normalized_source_type:
+            continue
+        if _normalize_identifier(metadata.get("report_source_key")) != normalized_source_key:
+            continue
+        record = _build_created_report_record(row, metadata=metadata)
+        if record:
+            return record
+
+    return None
+
+
 def get_behavior_logs(user_id: str, start_date: str, end_date: str) -> List[Dict]:
     """Get behavior logs for a date range"""
     conn = get_connection()

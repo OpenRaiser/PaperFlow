@@ -35,13 +35,16 @@
 - 精读报告完整流程已打通：用户选中文献后自动生成飞书文档并回发链接
 - 精读报告在 PDF 抓取失败或 LLM 超时时，仍按完整模板生成，不再退化成残缺内容
 - 精读报告资源区固定输出原文 / PDF / arXiv / DOI 等可用链接
+- OpenReview / CVF / ECVA 论文已接入和 arXiv 一致的全文级精读优先策略
+- 期刊与会议源已支持 source page 正文 fallback，可在无 PDF 时继续生成完整精读模板
+- DOI / ACM / DBLP TOC 论文已接入 OpenAlex / Crossref 元数据兜底，避免摘要和作者为空
+- journal-fetcher 已压低可恢复网络重试日志，控制台输出更干净
 - 飞书文档创建改为通过临时 Markdown 文件导入，修复长文档在 Windows / lark-cli 下被截断的问题
 - `.env.example` 已对齐当前实际部署所用环境变量，移除多余的 DashScope 示例配置
 
 ---
 
 ## ⏳ V0.2.0 计划
-
 ### 高优先级 P0
 1. **兴趣向量 EMA 更新** - profile-updater 增强
    - 基于反馈持续更新用户兴趣向量
@@ -65,11 +68,14 @@
 
 ### 低优先级 P2
 1. **PDF 解析增强** - 扫描版 PDF 支持（OCR）
-2. **飞书群 PDF 直传解析** - 支持用户直接在群里上传论文 PDF
+2. **ACM / 付费 publisher 全文增强**
+   - 在 DOI / metadata fallback 之外继续寻找可稳定获取的正文或作者稿链接
+   - 尽量把 ACM MM 这类论文从“摘要级精读”提升到“全文证据级精读”
+3. **飞书群 PDF 直传解析** - 支持用户直接在群里上传论文 PDF
    - 监听文件消息并下载附件
    - 复用 pdf-parser / coldstart / reading-agent 解析链路
    - 返回摘要、画像更新建议或精读入口链接
-3. **ngrok 隧道持久化** - 配置固定域名
+4. **ngrok 隧道持久化** - 配置固定域名
 
 ---
 

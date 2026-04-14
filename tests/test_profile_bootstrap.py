@@ -177,6 +177,14 @@ def test_detect_intent_ignores_reading_report_echo():
     assert intent["intent"] == "ignore"
 
 
+def test_detect_intent_ignores_reading_doc_title_echo():
+    coordinator = master_coordinator.MasterCoordinator(user_id="user_rolea")
+
+    intent = coordinator.detect_intent("[精读] 面向兴趣漂移驱动的序列推荐用户表示学习")
+
+    assert intent["intent"] == "ignore"
+
+
 def test_handle_profile_update_adjusts_existing_direction_weight(test_db_path, monkeypatch):
     db_ops.DB_PATH = test_db_path
     master_coordinator.db_ops.DB_PATH = test_db_path
@@ -195,6 +203,61 @@ def test_handle_profile_update_adjusts_existing_direction_weight(test_db_path, m
     assert result["success"] is True
     assert updated_profile["core_directions"]["gui-agent"] == 0.55
     assert updated_profile["topic_weights"]["gui-agent"] == 0.55
+
+
+def test_parse_profile_update_supports_explicit_target_weight_without_loading_llm(monkeypatch):
+    def fail_llm(*args, **kwargs):
+        raise AssertionError("explicit target-weight phrasing should not require LLM parsing")
+
+    monkeypatch.setattr(master_coordinator, "_parse_profile_update_with_llm", fail_llm)
+
+    slots = master_coordinator.parse_profile_update_request("多模态推理的权重提高到1")
+
+    assert slots["action"] == "adjust_weight"
+    assert slots["direction"] == "increase"
+    assert slots["topic"] == "多模态推理"
+    assert slots["weight_target"] == 1.0
+
+
+def test_parse_profile_update_supports_target_weight_without_explicit_weight_keyword(monkeypatch):
+    def fail_llm(*args, **kwargs):
+        raise AssertionError("direct target-weight phrasing should not require LLM parsing")
+
+    monkeypatch.setattr(master_coordinator, "_parse_profile_update_with_llm", fail_llm)
+
+    set_slots = master_coordinator.parse_profile_update_request("将视觉设为1")
+    lower_slots = master_coordinator.parse_profile_update_request("把 GUI Agent 降到0.2")
+
+    assert set_slots["action"] == "adjust_weight"
+    assert set_slots["direction"] == "increase"
+    assert set_slots["topic"] == "视觉"
+    assert set_slots["weight_target"] == 1.0
+
+    assert lower_slots["action"] == "adjust_weight"
+    assert lower_slots["direction"] == "decrease"
+    assert lower_slots["topic"] == "GUI Agent"
+    assert lower_slots["weight_target"] == 0.2
+
+
+def test_handle_profile_update_sets_explicit_target_weight(test_db_path, monkeypatch):
+    db_ops.DB_PATH = test_db_path
+    master_coordinator.db_ops.DB_PATH = test_db_path
+
+    profile = master_coordinator.build_empty_profile("user_rolea")
+    profile["core_directions"] = {"multimodal-reasoning": 0.79}
+    profile["topic_weights"] = {"multimodal-reasoning": 0.79}
+    db_ops.create_profile("user_rolea", profile)
+
+    monkeypatch.setattr(master_coordinator, "send_message", lambda *args, **kwargs: {"success": True})
+
+    coordinator = master_coordinator.MasterCoordinator(user_id="user_rolea")
+    result = coordinator.handle_profile_update("多模态推理的权重提高到1")
+    updated_profile = db_ops.get_profile("user_rolea")
+
+    assert result["success"] is True
+    assert "多模态推理" in result["updated_topics"]
+    assert updated_profile["core_directions"]["multimodal-reasoning"] == 1.0
+    assert updated_profile["topic_weights"]["multimodal-reasoning"] == 1.0
 
 
 def test_handle_profile_update_adds_interest_signal_from_free_text(test_db_path, monkeypatch):
@@ -711,3 +774,4 @@ def test_handle_reading_report_prefers_latest_selected_papers(monkeypatch):
     assert result["success"] is True
     assert captured["paper_ids"] == [1, 2]
     assert [paper["id"] for paper in captured["papers"]] == [91, 75]
+    assert captured["request_metadata"] == {"selection_push_id": "push_selected_1"}
