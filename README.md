@@ -383,51 +383,10 @@ python scripts\show_profile.py --user-id user_rolea
 SCITASTE_SCHEDULER_ENABLED=false
 ```
 
-## 12. 上传到 GitHub 前要注意什么
 
-这些内容不应该提交：
+## 12. 故障排查
 
-- `.env`
-- `data/` 下的运行时文件
-- `models/` 下的本地模型
-- 本地数据库
-- ngrok 临时 URL
-- 本地缓存、日志、`__pycache__`
-
-仓库已经通过 `.gitignore` 忽略这些内容。
-
-你在公开仓库里应该保留：
-
-- `.env.example`
-- `config/roles.example.json`
-- `environment.yml`
-- `requirements.txt`
-- `README.md`
-
-## 13. Git 提交流程
-
-验证通过后，推荐这样提交：
-
-```powershell
-git status
-git add .
-git commit -m "chore: clean repo and document deployment flow"
-git branch -M main
-git remote add origin https://github.com/YOUR_USERNAME/scitaste.git
-git push -u origin main
-```
-
-如果远程已经存在，只需要：
-
-```powershell
-git add .
-git commit -m "chore: clean repo and document deployment flow"
-git push
-```
-
-## 14. 故障排查
-
-### 14.1 飞书发消息没有反应
+### 12.1 飞书发消息没有反应
 
 先检查：
 
@@ -435,7 +394,7 @@ git push
 - `http://127.0.0.1:4040/api/tunnels` 是否有指向 `localhost:8080` 的隧道
 - 飞书后台 `Request URL` 是否是最新 ngrok 地址
 
-### 14.2 启动时报缺少环境变量
+### 12.2 启动时报缺少环境变量
 
 先运行：
 
@@ -445,7 +404,7 @@ python services\webhook-server\start.py --verify
 
 然后补齐缺失项。
 
-### 14.3 精读报告慢
+### 12.3 精读报告慢
 
 常见原因：
 
@@ -453,7 +412,7 @@ python services\webhook-server\start.py --verify
 - arXiv / 期刊页解析较慢
 - 当前 LLM 网关响应慢
 
-### 14.4 推送结果不稳定或全红
+### 12.4 推送结果不稳定或全红
 
 先确认：
 
