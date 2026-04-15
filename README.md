@@ -33,7 +33,9 @@ SciTaste 是一个运行在飞书群聊里的论文助手。
   - 按相关度分组输出到飞书
   - 支持 `all red`、`none`、编号选择
 - 反馈学习
-  - 根据选择和跳过动态更新画像
+  - 显式偏好 + 隐式反馈 + 时间衰减 + 漂移检测共同更新画像
+  - `interest_vector` 会随反馈主链路更新，并直接影响下一轮推荐排序
+  - `must_read` 已改为软规则加分，不再硬性置顶压过所有高相关论文
   - 支持“我对 XXX 不感兴趣”“我最近对 XXX 更感兴趣了”这类自然语言修正
 - 精读报告
   - 用户选中文献后自动生成飞书文档
@@ -41,11 +43,23 @@ SciTaste 是一个运行在飞书群聊里的论文助手。
   - 优先对 arXiv / OpenReview / CVF / ECVA 可用 PDF 做全文级精读
   - 当 PDF 不可用时，尽量回退到 source page 正文分节生成完整模板
   - 对 DOI / ACM 类受限页面，优先回退 OpenAlex / Crossref 元数据，避免精读退化成空壳
+  - 支持在飞书群里直接上传 PDF，并走本地解析 + 精读文档生成链路
 - 周报
   - 汇总近期推送、选择率、画像变化
+  - 展示兴趣迁移状态、漂移分数、漂移主题与更新解释
 - 定时任务
   - 默认每天 `09:00` 推送每日论文
   - 默认每周一 `10:00` 推送周报
+  - 可通过 `SCITASTE_SCHEDULER_ENABLED=false` 关闭
+
+## 当前未完成功能
+
+- Google Scholar 冷启动解析尚未实现，`coldstart-agent` 仅保留了参数入口
+- 扫描版 PDF 的 OCR 增强尚未接入
+- 部分 ACM / 付费 publisher 论文仍只能稳定做到摘要级或元数据级精读，距离“全文证据级精读”还有差距
+- Webhook 服务的生产化部署能力还缺开机自启、日志轮转、错误告警
+- 飞书表情反馈写回行为日志、菜单按钮路由到 Agent 仍未接入
+- ngrok 固定域名 / 持久化隧道尚未配置
 
 ## 项目结构
 
@@ -84,16 +98,11 @@ scitaste/
 
 ## 2. 安装步骤
 
-### 2.1 克隆仓库
+### 2.1 创建 conda 环境
 
-```powershell
-git clone https://github.com/YOUR_USERNAME/scitaste.git
-cd scitaste
-```
+先进入项目目录，再创建并激活环境。
 
-### 2.2 创建 conda 环境
-
-推荐直接使用仓库里的环境定义：
+推荐直接使用项目里的环境定义：
 
 ```powershell
 conda env create -f environment.yml
@@ -249,6 +258,32 @@ READING_REPORT_SECTION_CHARS=1800
 - `READING_REPORT_PDF_MODE=always` 会尽量优先解析 PDF；`smart` 会在元数据已足够时跳过部分 PDF 抓取
 - OpenAlex / Crossref 的 DOI 元数据回退默认启用，不需要额外环境变量
 - 对 ACM / 受限 publisher 页面，如果正文和 PDF 都不可得，系统会至少补回摘要、作者、DOI、PDF 链接
+
+### 5.4 兴趣迁移 / 漂移参数
+
+默认情况下这一组参数不用改；只有你想调兴趣迁移的敏感度、恢复速度和热度衰减速度时才需要配置：
+
+```env
+SCITASTE_DRIFT_LONG_WINDOW_SIZE=30
+SCITASTE_DRIFT_LONG_WINDOW_DAYS=60
+SCITASTE_DRIFT_SHORT_WINDOW_SIZE=8
+SCITASTE_DRIFT_SHORT_WINDOW_DAYS=14
+SCITASTE_DRIFT_THRESHOLD=0.35
+SCITASTE_DRIFT_RECOVER_THRESHOLD=0.20
+SCITASTE_DRIFT_ALPHA_BASE=0.08
+SCITASTE_DRIFT_ALPHA_MAX=0.35
+SCITASTE_TOPIC_DECAY=0.01
+SCITASTE_AUTHOR_DECAY=0.005
+SCITASTE_INSTITUTION_DECAY=0.005
+```
+
+说明：
+- `SCITASTE_DRIFT_LONG_WINDOW_*` 控制长期兴趣窗口，默认看最近 30 篇已选论文，且最多回看 60 天
+- `SCITASTE_DRIFT_SHORT_WINDOW_*` 控制短期兴趣窗口，默认看最近 8 篇已选论文，且最多回看 14 天
+- `SCITASTE_DRIFT_THRESHOLD` 是进入 `shifting` 的阈值；`SCITASTE_DRIFT_RECOVER_THRESHOLD` 是回到 `recovered` 的阈值
+- `SCITASTE_DRIFT_ALPHA_BASE` 和 `SCITASTE_DRIFT_ALPHA_MAX` 控制更新器的自适应步长，数值越大，画像响应越快
+- `SCITASTE_TOPIC_DECAY` / `SCITASTE_AUTHOR_DECAY` / `SCITASTE_INSTITUTION_DECAY` 控制未被近期命中的主题、作者、机构热度自然回落
+- 当前漂移参数第一版只影响“推荐排序 + 周报解释”，不会直接改写精读报告正文生成逻辑
 
 如果你想压低网络重试 warning：
 
@@ -417,6 +452,9 @@ SCITASTE_SCHEDULER_ENABLED=false
 
 - 部分 ACM / 付费 publisher 页面会同时拦截 HTML 正文和 PDF，所以这类论文目前通常只能稳定做到摘要级完整报告
 - 某些 publisher 的 PDF 文本抽取会有断行、连字、页眉页脚混入，这是 PDF 解析层的自然限制，不影响主流程
+- 冷启动里的 Google Scholar 链接目前还是预留接口，尚未进入实际解析流程
+- 反馈主链路已经接入漂移感知兴趣迁移，`interest_vector` 会由显式先验、长短窗反馈和混合漂移分数共同更新
+- 当前这套兴趣迁移 V1 只影响推荐排序和周报解释，还没有直接驱动精读报告正文生成
 
 
 

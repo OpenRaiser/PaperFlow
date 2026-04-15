@@ -48,6 +48,14 @@ update_profile = db_ops.update_profile
 get_latest_push = db_ops.get_latest_push
 get_latest_selected_papers = getattr(db_ops, "get_latest_selected_papers", lambda user_id: None)
 get_recent_pushes = db_ops.get_recent_pushes
+profile_updater = importlib.import_module("skills.profile-updater.scripts.update_profile")
+build_default_drift_state = profile_updater.build_default_drift_state
+direction_lexicon = importlib.import_module("config.direction_lexicon")
+confirm_pending_direction_candidate = direction_lexicon.confirm_pending_direction_candidate
+find_pending_direction_candidate = direction_lexicon.find_pending_direction_candidate
+get_direction_entry = direction_lexicon.get_direction_entry
+normalize_direction_key = direction_lexicon.normalize_direction_key
+resolve_canonical_direction = direction_lexicon.resolve_canonical_direction
 
 # 飞书报告器
 feishu_reporter = importlib.import_module("skills.feishu-reporter.scripts.feishu_reporter")
@@ -84,6 +92,32 @@ DIRECTION_TRANSLATIONS = {
     "vision-language-model": "视觉语言模型",
     "computer-vision": "计算机视觉",
     "bioinformatics": "生物信息学",
+}
+
+
+TOPIC_KEY_ALIASES = {
+    "ai-detection": {
+        "ai detection",
+        "ai-detection",
+        "ai 检测",
+        "ai检测",
+        "aigc detection",
+        "aigc-detection",
+        "aigc 检测",
+        "aigc检测",
+        "ai generated content detection",
+        "ai-generated content detection",
+        "生成内容检测",
+        "生成式内容检测",
+        "ai生成内容检测",
+        "llm detection",
+        "llm 检测",
+        "llm检测",
+        "deepfake detection",
+        "deepfake 检测",
+        "deepfake检测",
+        "synthetic media detection",
+    },
 }
 
 
@@ -126,6 +160,9 @@ def send_message(text: str, chat_id: Optional[str] = None, user_id: Optional[str
 
 def format_direction_label(direction: str) -> str:
     """Format internal topic keys into user-facing labels."""
+    entry = get_direction_entry(direction)
+    if entry:
+        return str(entry.get("name_cn") or entry.get("name") or direction)
     if direction in DIRECTION_TRANSLATIONS:
         return DIRECTION_TRANSLATIONS[direction]
     if any(separator in direction for separator in ("-", "_")):
@@ -310,12 +347,58 @@ def build_empty_profile(user_id: str) -> Dict[str, Any]:
         "taste_profile": {},
         "reading_history": [],
         "behavior_logs": [],
+        "drift_state": build_default_drift_state(now),
     }
 
 
 def normalize_topic_token(value: str) -> str:
     """Normalize topic labels for fuzzy matching."""
     return re.sub(r"[\s_\-]+", "", (value or "").strip().lower())
+
+
+def get_canonical_topic_aliases(topic_key: str) -> List[str]:
+    """Return canonical aliases for a known topic key."""
+    entry = get_direction_entry(topic_key)
+    if entry:
+        aliases = {
+            entry.get("canonical_name", topic_key),
+            entry.get("name", ""),
+            entry.get("name_cn", ""),
+            *(entry.get("aliases", []) or []),
+            *(entry.get("paper_terms", []) or []),
+        }
+        return [alias for alias in aliases if alias]
+
+    aliases = {
+        topic_key,
+        topic_key.replace("-", " "),
+        topic_key.replace("_", " "),
+        DIRECTION_TRANSLATIONS.get(topic_key, ""),
+    }
+    aliases.update(TOPIC_KEY_ALIASES.get(topic_key, set()))
+    return [alias for alias in aliases if alias]
+
+
+def resolve_canonical_topic_key(topic_text: str) -> Optional[str]:
+    """Map user-facing topic aliases onto a stable internal key when known."""
+    resolved = resolve_canonical_direction(topic_text, include_paper_terms=True)
+    if resolved:
+        return str(resolved.get("canonical_name"))
+
+    target = normalize_topic_token(topic_text)
+    if not target:
+        return None
+
+    for topic_key in DIRECTION_TRANSLATIONS.keys():
+        alias_tokens = {
+            normalize_topic_token(alias)
+            for alias in get_canonical_topic_aliases(topic_key)
+            if normalize_topic_token(alias)
+        }
+        if target in alias_tokens:
+            return topic_key
+
+    return None
 
 
 SEMANTIC_TOPIC_FAMILIES = {
@@ -350,7 +433,11 @@ def resolve_semantic_topic_family(topic_text: str) -> Optional[str]:
 def derive_topic_key(topic: str) -> str:
     """Turn free-form topic text into a stable profile key."""
     cleaned = re.sub(r"\s+", " ", (topic or "").strip().strip("“”\"'`"))
-    return cleaned.lower()
+    canonical_key = resolve_canonical_topic_key(cleaned)
+    if canonical_key:
+        return canonical_key
+    normalized = normalize_direction_key(cleaned)
+    return normalized or cleaned.lower()
 
 
 def clamp_weight(value: float, minimum: float = 0.1, maximum: float = 0.95) -> float:
@@ -360,12 +447,8 @@ def clamp_weight(value: float, minimum: float = 0.1, maximum: float = 0.95) -> f
 
 def iter_topic_aliases(topic_key: str) -> List[str]:
     """Return user-facing aliases for a topic key."""
-    aliases = {
-        topic_key,
-        format_direction_label(topic_key),
-        topic_key.replace("-", " "),
-        topic_key.replace("_", " "),
-    }
+    aliases = set(get_canonical_topic_aliases(topic_key))
+    aliases.add(format_direction_label(topic_key))
     return [alias for alias in aliases if alias]
 
 
@@ -491,6 +574,107 @@ def _parse_profile_update_with_llm(text: str, profile: Optional[Dict[str, Any]] 
         return None
 
 
+CONFIRM_DIRECTION_RE = re.compile(r"^\s*确认方向\s*[:：]?\s*(?P<topic>.+?)\s*$", flags=re.IGNORECASE)
+
+
+def parse_confirm_direction_request(text: str) -> Optional[str]:
+    """Parse a pending-direction confirmation command."""
+    cleaned = first_meaningful_line(text)
+    if not cleaned:
+        return None
+    match = CONFIRM_DIRECTION_RE.match(cleaned)
+    if not match:
+        return None
+    topic = clean_profile_topic_text(match.group("topic"), strip_domain_suffix=True)
+    return topic or None
+
+
+def normalize_profile_update_topics(topic_texts: List[str], user_id: str) -> Dict[str, Any]:
+    """Normalize one or more free-form topic texts through the shared direction layer."""
+    llm_parser = importlib.import_module("agents.master-coordinator.scripts.llm_parser")
+
+    canonical_directions: List[Dict[str, Any]] = []
+    temporary_matches: List[Dict[str, Any]] = []
+    pending_candidates: List[Dict[str, Any]] = []
+    explanations: List[str] = []
+    seen_canonical: set[str] = set()
+    seen_temporary: set[tuple[str, str]] = set()
+    seen_pending: set[str] = set()
+
+    for topic_text in topic_texts:
+        cleaned = clean_profile_topic_text(topic_text)
+        if not cleaned:
+            continue
+        normalized = llm_parser.normalize_research_directions(
+            cleaned,
+            auto_persist_known_aliases=True,
+            user_id=user_id,
+        )
+        for direction in normalized.get("canonical_directions", []):
+            direction_name = str(direction.get("name") or "").strip()
+            if not direction_name or direction_name in seen_canonical:
+                continue
+            seen_canonical.add(direction_name)
+            canonical_directions.append(direction)
+        for match in normalized.get("temporary_matches", []):
+            marker = (
+                str(match.get("source_text") or "").strip().casefold(),
+                str(match.get("canonical_name") or "").strip(),
+            )
+            if not marker[0] or marker in seen_temporary:
+                continue
+            seen_temporary.add(marker)
+            temporary_matches.append(match)
+        for candidate in normalized.get("pending_candidates", []):
+            candidate_key = str(candidate.get("candidate_key") or "").strip()
+            if not candidate_key or candidate_key in seen_pending:
+                continue
+            seen_pending.add(candidate_key)
+            pending_candidates.append(candidate)
+        for explanation in normalized.get("explanations", []):
+            note = str(explanation or "").strip()
+            if note and note not in explanations:
+                explanations.append(note)
+
+    return {
+        "canonical_directions": canonical_directions,
+        "temporary_matches": temporary_matches,
+        "pending_candidates": pending_candidates,
+        "explanations": explanations,
+    }
+
+
+def format_pending_direction_prompt(pending_candidates: List[Dict[str, Any]]) -> str:
+    """Format a short confirmation prompt for pending canonical directions."""
+    if not pending_candidates:
+        return ""
+    if len(pending_candidates) == 1:
+        candidate = pending_candidates[0]
+        label = candidate.get("name_cn") or candidate.get("name") or candidate.get("candidate_key")
+        return f"发现候选新方向：{label}，回复“确认方向：{label}”后纳入统一方向库。"
+
+    lines = ["发现候选新方向，请任选其一确认："]
+    for candidate in pending_candidates[:3]:
+        label = candidate.get("name_cn") or candidate.get("name") or candidate.get("candidate_key")
+        lines.append(f"- {label}：回复“确认方向：{label}”")
+    return "\n".join(lines)
+
+
+def merge_unique_message_sections(*sections: Any) -> str:
+    """Join message sections once while preserving their original order."""
+    merged: List[str] = []
+    seen: set[str] = set()
+
+    for section in sections:
+        text = str(section or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        merged.append(text)
+
+    return "\n".join(merged)
+
+
 BOT_AUTHORED_PREFIXES = (
     "📋 你的学术画像",
     "SciTaste 学术画像确认",
@@ -514,6 +698,8 @@ def first_meaningful_line(text: Any) -> str:
     return ""
 
 
+'''
+# legacy duplicate intent parser separator
 def detect_explicit_command_intent(text: Any) -> Optional[Dict[str, Any]]:
     """Fast-path obvious commands so they never go through the profile-update LLM."""
     cleaned = first_meaningful_line(text)
@@ -543,6 +729,190 @@ def detect_explicit_command_intent(text: Any) -> Optional[Dict[str, Any]]:
         return {"intent": "feedback", "confidence": 1.0, "slots": {"reply": cleaned}}
 
     if re.fullmatch(r"[\d\s,\-，、]+", cleaned) and re.search(r"\d", cleaned):
+        return {"intent": "feedback", "confidence": 1.0, "slots": {"reply": cleaned}}
+
+    return None
+# legacy duplicate intent parser separator
+
+# legacy duplicate intent parser separator
+def detect_explicit_command_intent(text: Any) -> Optional[Dict[str, Any]]:
+    """Fast-path obvious commands so they never go through the profile-update LLM."""
+    cleaned = first_meaningful_line(text)
+    lowered = cleaned.lower().strip()
+    if not lowered:
+        return None
+
+    confirmed_direction = parse_confirm_direction_request(cleaned)
+    if confirmed_direction:
+        return {
+            "intent": "confirm_direction",
+            "confidence": 1.0,
+            "slots": {"topic": confirmed_direction},
+        }
+
+    if lowered in {"鍐峰惎鍔?, "閲嶆柊鍐峰惎鍔?, "cold start", "cold-start"}:
+        return {"intent": "cold_start", "confidence": 1.0, "slots": {"text": cleaned}}
+
+    if lowered in {"鎺ㄩ€?, "daily push", "浠婃棩璁烘枃", "浠婂ぉ璁烘枃", "鏉ヤ竴绡?, "鏉ュ嚑绡?}:
+        return {"intent": "daily_push", "confidence": 1.0, "slots": {}}
+
+    if lowered in {"绮捐", "read this", "deep read"}:
+        return {"intent": "reading_report", "confidence": 1.0, "slots": {}}
+
+    if lowered in {"鍛ㄦ姤", "weekly report"}:
+        return {"intent": "weekly_report", "confidence": 1.0, "slots": {}}
+
+    if lowered in {"蹇呰", "蹇呰娓呭崟"}:
+        return {"intent": "must_read", "confidence": 1.0, "slots": {"command": cleaned}}
+
+    if lowered in {"鐢诲儚", "瀛︽湳鐢诲儚", "鎴戠殑鐢诲儚", "鎴戠殑瀛︽湳鐢诲儚", "鏄剧ず鐢诲儚", "鏄剧ず瀛︽湳鐢诲儚", "profile"}:
+        return {"intent": "show_profile", "confidence": 1.0, "slots": {}}
+
+    if lowered in {"all red", "all lock", "none", "鍏ㄩ儴", "娌℃湁"}:
+        return {"intent": "feedback", "confidence": 1.0, "slots": {"reply": cleaned}}
+
+    if re.fullmatch(r"[\d\s,\-锛屻€乚+", cleaned) and re.search(r"\d", cleaned):
+        return {"intent": "feedback", "confidence": 1.0, "slots": {"reply": cleaned}}
+
+    return None
+
+
+# legacy duplicate intent parser separator
+
+# legacy duplicate intent parser separator
+def detect_explicit_command_intent(text: Any) -> Optional[Dict[str, Any]]:
+    """Fast-path obvious commands so they never go through the profile-update LLM."""
+    cleaned = first_meaningful_line(text)
+    lowered = cleaned.lower().strip()
+    if not lowered:
+        return None
+
+    confirmed_direction = parse_confirm_direction_request(cleaned)
+    if confirmed_direction:
+        return {
+            "intent": "confirm_direction",
+            "confidence": 1.0,
+            "slots": {"topic": confirmed_direction},
+        }
+
+    if lowered in {"冷启动", "重新冷启动", "cold start", "cold-start"}:
+        return {"intent": "cold_start", "confidence": 1.0, "slots": {"text": cleaned}}
+
+    if lowered in {"推送", "daily push", "今日论文", "今天论文", "来一篇", "来几篇"}:
+        return {"intent": "daily_push", "confidence": 1.0, "slots": {}}
+
+    if lowered in {"精读", "read this", "deep read"}:
+        return {"intent": "reading_report", "confidence": 1.0, "slots": {}}
+
+    if lowered in {"周报", "weekly report"}:
+        return {"intent": "weekly_report", "confidence": 1.0, "slots": {}}
+
+    if lowered in {"必读", "必读清单"}:
+        return {"intent": "must_read", "confidence": 1.0, "slots": {"command": cleaned}}
+
+    if lowered in {"画像", "学术画像", "我的画像", "我的学术画像", "显示画像", "显示学术画像", "profile"}:
+        return {"intent": "show_profile", "confidence": 1.0, "slots": {}}
+
+    if lowered in {"all red", "all lock", "none", "全部", "没有"}:
+        return {"intent": "feedback", "confidence": 1.0, "slots": {"reply": cleaned}}
+
+    if re.fullmatch(r"[\d\s,\-，、]+", cleaned) and re.search(r"\d", cleaned):
+        return {"intent": "feedback", "confidence": 1.0, "slots": {"reply": cleaned}}
+
+    return None
+
+
+def detect_explicit_command_intent(text: Any) -> Optional[Dict[str, Any]]:
+    """Fast-path obvious commands so they never go through the profile-update LLM."""
+    cleaned = first_meaningful_line(text)
+    lowered = cleaned.lower().strip()
+    if not lowered:
+        return None
+
+    confirmed_direction = parse_confirm_direction_request(cleaned)
+    if confirmed_direction:
+        return {
+            "intent": "confirm_direction",
+            "confidence": 1.0,
+            "slots": {"topic": confirmed_direction},
+        }
+
+    if lowered in {"冷启动", "重新冷启动", "cold start", "cold-start"}:
+        return {"intent": "cold_start", "confidence": 1.0, "slots": {"text": cleaned}}
+
+    if lowered in {"推送", "daily push", "今日论文", "今天论文", "来一篇", "来几篇"}:
+        return {"intent": "daily_push", "confidence": 1.0, "slots": {}}
+
+    if lowered in {"精读", "read this", "deep read"}:
+        return {"intent": "reading_report", "confidence": 1.0, "slots": {}}
+
+    if lowered in {"周报", "weekly report"}:
+        return {"intent": "weekly_report", "confidence": 1.0, "slots": {}}
+
+    if lowered in {"必读", "必读清单"}:
+        return {"intent": "must_read", "confidence": 1.0, "slots": {"command": cleaned}}
+
+    if lowered in {"画像", "学术画像", "我的画像", "我的学术画像", "显示画像", "显示学术画像", "profile"}:
+        return {"intent": "show_profile", "confidence": 1.0, "slots": {}}
+
+    if lowered in {"all red", "all lock", "none", "全部", "没有"}:
+        return {"intent": "feedback", "confidence": 1.0, "slots": {"reply": cleaned}}
+
+    if re.fullmatch(r"[\d\s,\-，、]+", cleaned) and re.search(r"\d", cleaned):
+        return {"intent": "feedback", "confidence": 1.0, "slots": {"reply": cleaned}}
+
+    return None
+
+
+'''
+
+
+def detect_explicit_command_intent(text: Any) -> Optional[Dict[str, Any]]:
+    """Fast-path obvious commands so they never go through the profile-update LLM."""
+    cleaned = first_meaningful_line(text)
+    lowered = cleaned.lower().strip()
+    if not lowered:
+        return None
+
+    confirmed_direction = parse_confirm_direction_request(cleaned)
+    if confirmed_direction:
+        return {
+            "intent": "confirm_direction",
+            "confidence": 1.0,
+            "slots": {"topic": confirmed_direction},
+        }
+
+    cold_start_commands = {"cold start", "cold-start", "冷启动", "重新冷启动"}
+    daily_push_commands = {"daily push", "推送", "今日论文", "今天论文", "来一篇", "来几篇"}
+    reading_commands = {"read this", "deep read", "精读"}
+    weekly_report_commands = {"weekly report", "周报"}
+    must_read_commands = {"必读", "必读清单"}
+    profile_commands = {
+        "profile",
+        "画像",
+        "学术画像",
+        "我的画像",
+        "我的学术画像",
+        "显示画像",
+        "显示学术画像",
+    }
+    feedback_commands = {"all red", "all lock", "none", "全部", "没有"}
+
+    if lowered in cold_start_commands:
+        return {"intent": "cold_start", "confidence": 1.0, "slots": {"text": cleaned}}
+    if lowered in daily_push_commands:
+        return {"intent": "daily_push", "confidence": 1.0, "slots": {}}
+    if lowered in reading_commands:
+        return {"intent": "reading_report", "confidence": 1.0, "slots": {}}
+    if lowered in weekly_report_commands:
+        return {"intent": "weekly_report", "confidence": 1.0, "slots": {}}
+    if lowered in must_read_commands:
+        return {"intent": "must_read", "confidence": 1.0, "slots": {"command": cleaned}}
+    if lowered in profile_commands:
+        return {"intent": "show_profile", "confidence": 1.0, "slots": {}}
+    if lowered in feedback_commands:
+        return {"intent": "feedback", "confidence": 1.0, "slots": {"reply": cleaned}}
+    if re.fullmatch(r"[\d\s,\-\uFF0C\u3001]+", cleaned) and re.search(r"\d", cleaned):
         return {"intent": "feedback", "confidence": 1.0, "slots": {"reply": cleaned}}
 
     return None
@@ -989,6 +1359,59 @@ class MasterCoordinator:
         # 默认：无法识别
         return {"intent": "unknown", "confidence": 0.5, "slots": {"text": text}}
 
+    def handle_confirm_direction(self, topic: str) -> Dict[str, Any]:
+        """Promote a pending direction candidate into the shared canonical registry."""
+        print(f"Intent: Confirm Direction - {topic!r}")
+
+        try:
+            confirmed = confirm_pending_direction_candidate(topic, user_id=self.user_id)
+            if not confirmed:
+                msg = f"没有找到待确认的新方向“{topic}”。如果这是一个新词，请先再说一次它的完整方向描述。"
+                send_message(msg, chat_id=self.chat_id, user_id=self.feishu_user_id)
+                return {"success": False, "message": msg}
+
+            profile = get_profile(self.user_id)
+            if not profile:
+                profile = build_empty_profile(self.user_id)
+                create_profile(self.user_id, profile)
+
+            profile = repair_profile_from_role_description(self.user_id, profile)
+            updated_profile = dict(profile)
+            core_directions = dict(updated_profile.get("core_directions", {}) or {})
+            topic_weights = dict(updated_profile.get("topic_weights", {}) or {})
+
+            canonical_name = str(confirmed.get("canonical_name") or normalize_direction_key(topic))
+            current_weight = max(
+                float(core_directions.get(canonical_name, 0.0)),
+                float(topic_weights.get(canonical_name, 0.0)),
+            )
+            seeded_weight = max(current_weight, 0.8)
+            core_directions[canonical_name] = seeded_weight
+            topic_weights[canonical_name] = seeded_weight
+
+            updated_profile["core_directions"] = core_directions
+            updated_profile["topic_weights"] = topic_weights
+            updated_profile["interest_vector"] = (
+                importlib.import_module("agents.coldstart-agent.main").generate_interest_vector(core_directions)
+                if core_directions
+                else []
+            )
+            updated_profile["updated_at"] = datetime.now().isoformat()
+            update_profile(self.user_id, updated_profile)
+            self.profile = updated_profile
+
+            label = format_direction_label(canonical_name)
+            profile_message = format_profile_message(updated_profile)
+            summary = f"已确认新方向“{label}”，已纳入统一方向词典，并同步加入你的画像（默认权重 0.80）。"
+            send_message(f"{summary}\n\n{profile_message}", chat_id=self.chat_id, user_id=self.feishu_user_id)
+            return {
+                "success": True,
+                "confirmed_direction": canonical_name,
+                "updated_topics": [label],
+            }
+        except Exception as e:
+            return {"success": False, "message": str(e)}
+
     def handle_cold_start(self, text: str) -> Dict[str, Any]:
         """处理冷启动"""
         print("Intent: Cold Start")
@@ -1202,14 +1625,35 @@ class MasterCoordinator:
                 send_message(msg, chat_id=self.chat_id, user_id=self.feishu_user_id)
                 return {"success": False, "message": msg}
 
+            topic_candidates = [topic_text] + [
+                str(item).strip()
+                for item in (slots.get("topics") or [])
+                if str(item).strip()
+            ]
+            normalization_result = normalize_profile_update_topics(topic_candidates, self.user_id)
+            normalized_candidates = [
+                str(item.get("name") or "").strip()
+                for item in normalization_result.get("canonical_directions", [])
+                if str(item.get("name") or "").strip()
+            ]
+            normalization_notes = list(normalization_result.get("explanations", []) or [])
+            pending_candidates = list(normalization_result.get("pending_candidates", []) or [])
+            pending_prompt = format_pending_direction_prompt(pending_candidates)
+            if pending_candidates:
+                normalization_notes = [
+                    note
+                    for note in normalization_notes
+                    if not str(note or "").strip().startswith("发现候选新方向")
+                ]
+
             updated_profile = dict(profile)
             core_directions = dict(updated_profile.get("core_directions", {}) or {})
             topic_weights = dict(updated_profile.get("topic_weights", {}) or {})
 
             resolved_key = find_profile_topic_key(updated_profile, topic_text)
             resolved_topics: List[str] = []
-            use_semantic_expansion = action == "adjust_interest"
-            for candidate in [topic_text] + [str(item).strip() for item in (slots.get("topics") or []) if str(item).strip()]:
+            use_semantic_expansion = action == "adjust_interest" and direction == "decrease"
+            for candidate in topic_candidates + normalized_candidates:
                 candidate_keys = find_related_profile_topic_keys(
                     updated_profile,
                     candidate,
@@ -1219,32 +1663,14 @@ class MasterCoordinator:
                     if candidate_key not in resolved_topics:
                         resolved_topics.append(candidate_key)
             changed_labels: List[str] = []
-            inferred: Optional[Dict[str, Any]] = None
-
-            def get_inferred() -> Dict[str, Any]:
-                nonlocal inferred
-                if inferred is None:
-                    coldstart_agent = importlib.import_module("agents.coldstart-agent.main")
-                    inferred = coldstart_agent.parse_natural_language(topic_text)
-                return inferred
+            summary = ""
 
             if action == "remove_topic":
-                removal_candidates: List[str] = []
-                for candidate in resolved_topics:
-                    if candidate not in removal_candidates:
-                        removal_candidates.append(candidate)
-
-                if not removal_candidates:
-                    inferred_directions = get_inferred().get("core_directions", {}) or {}
-                    for inferred_key in inferred_directions.keys():
-                        resolved_inferred_key = find_profile_topic_key(updated_profile, inferred_key)
-                        if resolved_inferred_key and resolved_inferred_key not in removal_candidates:
-                            removal_candidates.append(resolved_inferred_key)
-
-                if not removal_candidates:
-                    derived_key = resolved_key or derive_topic_key(topic_text)
-                    if derived_key in core_directions or derived_key in topic_weights:
-                        removal_candidates.append(derived_key)
+                removal_candidates = [
+                    candidate
+                    for candidate in resolved_topics
+                    if candidate in core_directions or candidate in topic_weights
+                ]
 
                 for removal_key in removal_candidates:
                     removed_any = False
@@ -1262,96 +1688,126 @@ class MasterCoordinator:
                 else:
                     summary = f"当前画像里没有明显匹配“{topic_text}”的核心方向，我先没有做改动。"
             elif action == "adjust_weight":
-                if not resolved_key:
-                    inferred_directions = get_inferred().get("core_directions", {}) or {}
-                    for inferred_key in inferred_directions.keys():
-                        resolved_inferred_key = find_profile_topic_key(updated_profile, inferred_key)
-                        if resolved_inferred_key:
-                            resolved_key = resolved_inferred_key
+                target_key = resolved_key
+                if not target_key:
+                    for candidate in resolved_topics:
+                        if candidate in core_directions or candidate in topic_weights:
+                            target_key = candidate
                             break
-                    if not resolved_key and direction == "increase":
-                        resolved_key = (
-                            max(inferred_directions.items(), key=lambda item: item[1])[0]
-                            if inferred_directions
-                            else derive_topic_key(topic_text)
-                        )
+                if not target_key and direction == "increase" and normalized_candidates:
+                    target_key = normalized_candidates[0]
 
-                if not resolved_key:
-                    summary = f"当前画像里没有明显匹配“{topic_text}”的核心方向，我先没有做改动。"
+                if not target_key:
+                    if direction == "increase" and pending_prompt:
+                        summary = pending_prompt
+                    else:
+                        summary = f"当前画像里没有明显匹配“{topic_text}”的核心方向，我先没有做改动。"
                 else:
-                    current_weight = float(topic_weights.get(resolved_key, core_directions.get(resolved_key, 0.5)))
+                    current_weight = float(topic_weights.get(target_key, core_directions.get(target_key, 0.5)))
                     if weight_target is not None:
                         new_weight = clamp_weight(weight_target, minimum=0.0, maximum=1.0)
                     else:
                         delta = 0.15
-                        new_weight = clamp_weight(current_weight + delta if direction == "increase" else current_weight - delta)
-                    topic_weights[resolved_key] = new_weight
-                    if resolved_key in core_directions or direction == "increase":
-                        core_directions[resolved_key] = new_weight
-                    elif resolved_key in core_directions:
-                        core_directions[resolved_key] = new_weight
-                    changed_labels.append(format_direction_label(resolved_key))
-                    summary = f"已将 {format_direction_label(resolved_key)} 的权重从 {current_weight:.2f} 调整到 {new_weight:.2f}。"
+                        new_weight = clamp_weight(
+                            current_weight + delta if direction == "increase" else current_weight - delta,
+                            minimum=0.0,
+                            maximum=1.0,
+                        )
+                    topic_weights[target_key] = new_weight
+                    if target_key in core_directions or direction == "increase":
+                        core_directions[target_key] = new_weight
+                    changed_labels.append(format_direction_label(target_key))
+                    summary = (
+                        f"已将 {format_direction_label(target_key)} 的权重从 "
+                        f"{current_weight:.2f} 调整到 {new_weight:.2f}。"
+                    )
             else:
-                matched_topics = list(resolved_topics)
-                inferred_directions: Dict[str, Any] = {}
-                if not matched_topics and direction == "decrease":
-                    inferred_directions = get_inferred().get("core_directions", {}) or {}
-                    for inferred_key in inferred_directions.keys():
-                        resolved_inferred_key = find_profile_topic_key(updated_profile, inferred_key)
-                        if resolved_inferred_key and resolved_inferred_key not in matched_topics:
-                            matched_topics.append(resolved_inferred_key)
+                matched_topics = [
+                    candidate
+                    for candidate in resolved_topics
+                    if candidate in core_directions or candidate in topic_weights
+                ]
 
-                if matched_topics:
-                    for resolved_topic in matched_topics:
-                        current_weight = float(topic_weights.get(resolved_topic, core_directions.get(resolved_topic, 0.55)))
-                        base_weight = max(current_weight, 0.55) if direction == "increase" else current_weight
-                        new_weight = clamp_weight(base_weight + 0.10 if direction == "increase" else base_weight - 0.15)
-                        topic_weights[resolved_topic] = new_weight
-                        if resolved_topic in core_directions or direction == "increase":
-                            core_directions[resolved_topic] = new_weight
-                        changed_labels.append(format_direction_label(resolved_topic))
-                else:
-                    if direction == "increase":
-                        inferred_directions = inferred_directions or (get_inferred().get("core_directions", {}) or {})
-                        if inferred_directions:
-                            for inferred_key, inferred_weight in inferred_directions.items():
-                                current_weight = float(topic_weights.get(inferred_key, core_directions.get(inferred_key, inferred_weight)))
-                                base_weight = max(current_weight, float(inferred_weight), 0.55)
-                                new_weight = clamp_weight(base_weight + 0.10)
-                                topic_weights[inferred_key] = new_weight
-                                core_directions[inferred_key] = new_weight
-                                changed_labels.append(format_direction_label(inferred_key))
-                        else:
-                            resolved_key = derive_topic_key(topic_text)
-                            current_weight = float(topic_weights.get(resolved_key, core_directions.get(resolved_key, 0.4)))
-                            new_weight = clamp_weight(current_weight + 0.15)
-                            topic_weights[resolved_key] = new_weight
-                            core_directions[resolved_key] = new_weight
-                            changed_labels.append(format_direction_label(resolved_key))
-
-                if changed_labels:
-                    if direction == "increase":
-                        summary = f"已增强你对“{topic_text}”的兴趣信号。\n同步更新方向：{', '.join(changed_labels)}"
+                if direction == "decrease":
+                    if matched_topics:
+                        for resolved_topic in matched_topics:
+                            current_weight = float(
+                                topic_weights.get(resolved_topic, core_directions.get(resolved_topic, 0.55))
+                            )
+                            new_weight = clamp_weight(
+                                current_weight - 0.15,
+                                minimum=0.0,
+                                maximum=1.0,
+                            )
+                            topic_weights[resolved_topic] = new_weight
+                            if resolved_topic in core_directions:
+                                core_directions[resolved_topic] = new_weight
+                            changed_labels.append(format_direction_label(resolved_topic))
+                        summary = (
+                            f"已下调你对“{topic_text}”的兴趣信号。\n"
+                            f"同步更新方向：{', '.join(changed_labels)}"
+                        )
                     else:
-                        summary = f"已下调你对“{topic_text}”的兴趣信号。\n同步更新方向：{', '.join(changed_labels)}"
+                        summary = f"当前画像里没有明显匹配“{topic_text}”的核心方向，我先没有做改动。"
                 else:
-                    summary = f"当前画像里没有明显匹配“{topic_text}”的核心方向，我先没有做改动。"
+                    seed_targets: List[str] = []
+                    for candidate in matched_topics + normalized_candidates:
+                        if candidate not in seed_targets:
+                            seed_targets.append(candidate)
 
-            updated_profile["core_directions"] = core_directions
-            updated_profile["topic_weights"] = topic_weights
-            updated_profile["interest_vector"] = (
-                importlib.import_module("agents.coldstart-agent.main").generate_interest_vector(core_directions)
-                if core_directions
-                else []
-            )
-            updated_profile["updated_at"] = datetime.now().isoformat()
-            update_profile(self.user_id, updated_profile)
-            self.profile = updated_profile
+                    if not seed_targets:
+                        if pending_prompt:
+                            summary = pending_prompt
+                        else:
+                            summary = f"当前画像里没有明显匹配“{topic_text}”的核心方向，我先没有做改动。"
+                    else:
+                        for index, target_key in enumerate(seed_targets):
+                            current_weight = float(topic_weights.get(target_key, core_directions.get(target_key, 0.0)))
+                            if current_weight > 0:
+                                new_weight = clamp_weight(
+                                    max(current_weight, 0.55) + 0.10,
+                                    minimum=0.0,
+                                    maximum=1.0,
+                                )
+                            else:
+                                new_weight = clamp_weight(
+                                    max(0.55, 0.65 - index * 0.05),
+                                    minimum=0.0,
+                                    maximum=1.0,
+                                )
+                            topic_weights[target_key] = new_weight
+                            core_directions[target_key] = new_weight
+                            changed_labels.append(format_direction_label(target_key))
+                        summary = (
+                            f"已增强你对“{topic_text}”的兴趣信号。\n"
+                            f"同步更新方向：{', '.join(changed_labels)}"
+                        )
 
-            profile_message = format_profile_message(updated_profile)
-            send_message(f"{summary}\n\n{profile_message}", chat_id=self.chat_id, user_id=self.feishu_user_id)
-            return {"success": True, "updated_topics": changed_labels}
+            if changed_labels:
+                updated_profile["core_directions"] = core_directions
+                updated_profile["topic_weights"] = topic_weights
+                updated_profile["interest_vector"] = (
+                    importlib.import_module("agents.coldstart-agent.main").generate_interest_vector(core_directions)
+                    if core_directions
+                    else []
+                )
+                updated_profile["updated_at"] = datetime.now().isoformat()
+                update_profile(self.user_id, updated_profile)
+                self.profile = updated_profile
+                profile_message = format_profile_message(updated_profile)
+            else:
+                self.profile = profile
+                profile_message = format_profile_message(profile)
+
+            summary = merge_unique_message_sections(*(normalization_notes or []), summary)
+
+            message_text = f"{summary}\n\n{profile_message}" if summary else profile_message
+            send_message(message_text, chat_id=self.chat_id, user_id=self.feishu_user_id)
+            return {
+                "success": True,
+                "updated_topics": changed_labels,
+                "pending_candidates": pending_candidates,
+            }
         except Exception as e:
             return {"success": False, "message": str(e)}
 
@@ -1397,6 +1853,7 @@ class MasterCoordinator:
         # 路由到对应处理器
         handlers = {
             "ignore": lambda: {"success": True, "ignored": True},
+            "confirm_direction": lambda: self.handle_confirm_direction(intent["slots"].get("topic", text)),
             "cold_start": lambda: self.handle_cold_start(text),
             "daily_push": self.handle_daily_push,
             "feedback": lambda: self.handle_feedback(intent["slots"].get("reply", text)),

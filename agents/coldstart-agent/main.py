@@ -33,6 +33,8 @@ db_ops = importlib.import_module("skills.storage-helper.scripts.db_ops")
 create_profile = db_ops.create_profile
 update_profile = db_ops.update_profile
 get_profile = db_ops.get_profile
+profile_updater = importlib.import_module("skills.profile-updater.scripts.update_profile")
+build_default_drift_state = profile_updater.build_default_drift_state
 
 pdf_parser = importlib.import_module("skills.pdf-parser.scripts.parse_pdf")
 parse_paper_for_coldstart = pdf_parser.parse_paper_for_coldstart
@@ -108,6 +110,7 @@ def build_empty_profile(user_id: str) -> Dict[str, Any]:
         "taste_profile": {},
         "reading_history": [],
         "behavior_logs": [],
+        "drift_state": build_default_drift_state(now),
     }
 
 
@@ -132,6 +135,11 @@ def ensure_profile_shape(profile: Optional[Dict[str, Any]], user_id: str) -> Dic
     for key in ("interest_vector", "reading_history", "behavior_logs"):
         value = normalized.get(key)
         normalized[key] = value if isinstance(value, list) else []
+
+    drift_state = normalized.get("drift_state")
+    normalized["drift_state"] = drift_state if isinstance(drift_state, dict) else {}
+    for key, default_value in build_default_drift_state(normalized["updated_at"]).items():
+        normalized["drift_state"].setdefault(key, copy.deepcopy(default_value))
 
     return normalized
 
@@ -454,6 +462,111 @@ def _parse_directions_with_llm(text: str) -> List[Dict[str, Any]]:
         return []
 
 
+def parse_natural_language(text: str, use_llm: bool = True) -> Dict[str, Any]:
+    """Parse a natural-language self-description into a bootstrap profile fragment."""
+    normalized_text = re.sub(r"\s+", " ", (text or "").strip()).lower()
+    if normalized_text in COLD_START_COMMAND_HINTS:
+        return _empty_parsed_profile_fragment()
+
+    from config.direction_lexicon import get_lexicon_keywords
+
+    text_lower = text.lower()
+    merged_directions = get_lexicon_keywords()
+
+    core_directions: Dict[str, float] = {}
+    topic_weights: Dict[str, float] = {}
+    for direction, keywords in merged_directions.items():
+        match_count = sum(1 for keyword in keywords if keyword in text_lower or keyword in text)
+        if match_count > 0:
+            weight = min(0.5 + match_count * 0.1, 0.95)
+            core_directions[direction] = weight
+            topic_weights[direction] = weight
+
+    llm_parse_result: Dict[str, Any] = {
+        "canonical_directions": [],
+        "pending_candidates": [],
+        "explanations": [],
+    }
+    if use_llm and not core_directions:
+        llm_parse_result = _parse_directions_with_llm(text)
+
+    llm_directions = list(llm_parse_result.get("canonical_directions", []) or [])
+    for direction in llm_directions:
+        direction_key = str(direction.get("name") or "").strip()
+        if not direction_key:
+            continue
+        confidence = float(direction.get("confidence", 0.5) or 0.5)
+        if direction_key in core_directions:
+            existing = core_directions[direction_key]
+            if confidence > existing:
+                core_directions[direction_key] = confidence
+                topic_weights[direction_key] = confidence
+        else:
+            seeded_weight = min(max(confidence * 0.8, 0.4), 0.5)
+            core_directions[direction_key] = seeded_weight
+            topic_weights[direction_key] = seeded_weight
+
+    methodology_preferences = {
+        "preference_data_driven_over_theory": (
+            sum(1 for keyword in METHODOLOGY_KEYWORDS["data_driven"] if keyword in text_lower)
+            > sum(1 for keyword in METHODOLOGY_KEYWORDS["theory"] if keyword in text_lower)
+        ),
+        "preference_systematic_work_over_incremental": (
+            sum(1 for keyword in METHODOLOGY_KEYWORDS["systematic"] if keyword in text_lower)
+            > sum(1 for keyword in METHODOLOGY_KEYWORDS["incremental"] if keyword in text_lower)
+        ),
+        "preference_open_source_code": any(keyword in text_lower for keyword in METHODOLOGY_KEYWORDS["open_source"]),
+        "preference_bio_science_application": any(
+            keyword in text_lower for keyword in ("bio", "science", "scientific", "molecular", "protein")
+        ),
+    }
+
+    taste_profile = {
+        "preferred_work_type": [],
+        "dispreferred_work_type": [],
+    }
+    if methodology_preferences["preference_data_driven_over_theory"]:
+        taste_profile["preferred_work_type"].append("empirical")
+    else:
+        taste_profile["preferred_work_type"].append("theoretical")
+
+    if methodology_preferences["preference_systematic_work_over_incremental"]:
+        taste_profile["preferred_work_type"].append("systematic")
+        taste_profile["dispreferred_work_type"].append("incremental")
+    else:
+        taste_profile["dispreferred_work_type"].append("systematic")
+
+    if methodology_preferences["preference_open_source_code"]:
+        taste_profile["preferred_work_type"].append("open_source")
+
+    if methodology_preferences["preference_bio_science_application"]:
+        taste_profile["preferred_work_type"].append("applied")
+
+    return {
+        "core_directions": core_directions,
+        "methodology_preferences": methodology_preferences,
+        "topic_weights": topic_weights,
+        "interest_vector": generate_interest_vector(core_directions),
+        "taste_profile": taste_profile,
+        "inferred_topics": [d.get("name") for d in llm_directions if d.get("name")],
+        "direction_explanations": list(llm_parse_result.get("explanations", []) or []),
+        "pending_directions": list(llm_parse_result.get("pending_candidates", []) or []),
+    }
+
+
+def _parse_directions_with_llm(text: str) -> Dict[str, Any]:
+    """Use the shared canonical direction normalizer as the LLM-backed fallback."""
+    try:
+        llm_parser = importlib.import_module("agents.master-coordinator.scripts.llm_parser")
+        return llm_parser.normalize_research_directions(
+            text,
+            auto_persist_known_aliases=True,
+        )
+    except Exception as e:
+        print(f"LLM direction parsing failed: {e}")
+        return {"canonical_directions": [], "pending_candidates": [], "explanations": []}
+
+
 def generate_interest_vector(core_directions: Dict[str, float]) -> List[float]:
     """Generate a deterministic pseudo-vector from the detected directions."""
     try:
@@ -595,6 +708,7 @@ def cold_start(
         profile = build_empty_profile(user_id)
 
     baseline_pdf_path = None
+    cold_start_notes: List[str] = []
     try:
         baseline_pdf_path = _seed_profile_from_baseline_pdf(profile, user_id)
         if baseline_pdf_path:
@@ -606,6 +720,7 @@ def cold_start(
         print("Parsing natural language...")
         parsed = parse_natural_language(natural_language)
         merge_parsed_profile_into_profile(profile, parsed)
+        cold_start_notes.extend(parsed.get("direction_explanations", []) or [])
 
     if pdf_paths:
         print(f"Parsing {len(pdf_paths)} PDF file(s)...")
@@ -650,6 +765,8 @@ def cold_start(
         print(f"Sending to Feishu - target: {target_id[:20]}..., use_chat_id: {use_chat}")
 
         card_text = format_profile_card(profile, user_id)
+        if cold_start_notes:
+            card_text = "\n".join(cold_start_notes + ["", card_text])
         try:
             if use_chat:
                 feishu_reporter.send_text_to_chat(target_id, card_text)

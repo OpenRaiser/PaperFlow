@@ -1,0 +1,776 @@
+{
+  "agent": {
+    "aliases": [
+      "agent",
+      "智能体",
+      "agents",
+      "autonomous agent",
+      "agentic system"
+    ],
+    "canonical_name": "agent",
+    "keywords": [
+      "agent",
+      "agents",
+      "autonomous",
+      "agentic"
+    ],
+    "name": "Agent",
+    "name_cn": "智能体",
+    "paper_terms": [
+      "agent",
+      "agents",
+      "autonomous",
+      "agentic"
+    ]
+  },
+  "ai-detection": {
+    "aliases": [
+      "ai-detection",
+      "ai detection",
+      "ai 检测",
+      "ai检测",
+      "ai generated content detection",
+      "aigc detection",
+      "aigc 检测",
+      "aigc检测",
+      "生成式内容检测",
+      "生成内容检测",
+      "llm detection",
+      "deepfake detection",
+      "synthetic media detection"
+    ],
+    "canonical_name": "ai-detection",
+    "keywords": [
+      "ai detection",
+      "ai 检测",
+      "aigc detection",
+      "aigc 检测",
+      "deepfake detection",
+      "synthetic media detection",
+      "machine-generated content detection"
+    ],
+    "name": "AI Detection",
+    "name_cn": "AI Detection",
+    "paper_terms": [
+      "ai detection",
+      "ai 检测",
+      "aigc detection",
+      "aigc 检测",
+      "deepfake detection",
+      "synthetic media detection",
+      "machine-generated content detection"
+    ]
+  },
+  "bio-molecular": {
+    "aliases": [
+      "bio-molecular",
+      "bio molecular",
+      "生物分子",
+      "biomolecular",
+      "molecular biology",
+      "protein science"
+    ],
+    "canonical_name": "bio-molecular",
+    "keywords": [
+      "protein",
+      "molecular",
+      "dna",
+      "rna",
+      "gene",
+      "cell",
+      "bio",
+      "molecule",
+      "bio molecular",
+      "Bio-Molecular"
+    ],
+    "name": "Bio-Molecular",
+    "name_cn": "生物分子",
+    "paper_terms": [
+      "protein",
+      "molecular",
+      "dna",
+      "rna",
+      "gene",
+      "cell",
+      "bio",
+      "molecule",
+      "bio molecular",
+      "Bio-Molecular"
+    ]
+  },
+  "bioinformatics": {
+    "aliases": [
+      "bioinformatics",
+      "生物信息学",
+      "computational biology"
+    ],
+    "canonical_name": "bioinformatics",
+    "keywords": [
+      "bioinformatics",
+      "computational biology",
+      "genome",
+      "genomic",
+      "single-cell",
+      "multiomic"
+    ],
+    "name": "Bioinformatics",
+    "name_cn": "生物信息学",
+    "paper_terms": [
+      "bioinformatics",
+      "computational biology",
+      "genome",
+      "genomic",
+      "single-cell",
+      "multiomic"
+    ]
+  },
+  "comparison": {
+    "aliases": [
+      "comparison",
+      "对比分析"
+    ],
+    "canonical_name": "comparison",
+    "keywords": [
+      "comparison",
+      "comparative study"
+    ],
+    "name": "Comparison",
+    "name_cn": "Comparison",
+    "paper_terms": [
+      "comparison",
+      "comparative study"
+    ]
+  },
+  "computer-vision": {
+    "aliases": [
+      "computer-vision",
+      "computer vision",
+      "计算机视觉",
+      "cv"
+    ],
+    "canonical_name": "computer-vision",
+    "keywords": [
+      "computer vision",
+      "cv",
+      "visual recognition"
+    ],
+    "name": "Computer Vision",
+    "name_cn": "计算机视觉",
+    "paper_terms": [
+      "computer vision",
+      "cv",
+      "visual recognition"
+    ]
+  },
+  "cross-modal": {
+    "aliases": [
+      "cross-modal",
+      "cross modal",
+      "Cross-Modal Learning",
+      "跨模态学习"
+    ],
+    "canonical_name": "cross-modal",
+    "keywords": [
+      "cross-modal",
+      "cross modal",
+      "Cross-Modal Learning"
+    ],
+    "name": "Cross-Modal Learning",
+    "name_cn": "跨模态学习",
+    "paper_terms": [
+      "cross-modal",
+      "cross modal",
+      "Cross-Modal Learning"
+    ]
+  },
+  "data-native": {
+    "aliases": [
+      "data-native",
+      "data native",
+      "数据原生",
+      "data-centric",
+      "data centric"
+    ],
+    "canonical_name": "data-native",
+    "keywords": [
+      "data-native",
+      "data native",
+      "data-centric",
+      "infrastructure"
+    ],
+    "name": "Data-Native",
+    "name_cn": "数据原生",
+    "paper_terms": [
+      "data-native",
+      "data native",
+      "data-centric",
+      "infrastructure"
+    ]
+  },
+  "deep-learning": {
+    "aliases": [
+      "deep-learning",
+      "deep learning",
+      "深度学习",
+      "neural network",
+      "neural networks"
+    ],
+    "canonical_name": "deep-learning",
+    "keywords": [
+      "deep learning",
+      "neural",
+      "cnn",
+      "transformer"
+    ],
+    "name": "Deep Learning",
+    "name_cn": "深度学习",
+    "paper_terms": [
+      "deep learning",
+      "neural",
+      "cnn",
+      "transformer"
+    ]
+  },
+  "detection": {
+    "aliases": [
+      "detection",
+      "检测",
+      "detector"
+    ],
+    "canonical_name": "detection",
+    "keywords": [
+      "detection",
+      "detect",
+      "detector"
+    ],
+    "name": "Detection",
+    "name_cn": "检测",
+    "paper_terms": [
+      "detection",
+      "detect",
+      "detector"
+    ]
+  },
+  "explanation": {
+    "aliases": [
+      "explanation",
+      "可解释性",
+      "interpretability",
+      "explainability"
+    ],
+    "canonical_name": "explanation",
+    "keywords": [
+      "explanation",
+      "explainable",
+      "interpretability",
+      "explainability"
+    ],
+    "name": "Explanation",
+    "name_cn": "可解释性",
+    "paper_terms": [
+      "explanation",
+      "explainable",
+      "interpretability",
+      "explainability"
+    ]
+  },
+  "generation": {
+    "aliases": [
+      "generation",
+      "生成",
+      "generative model",
+      "content generation"
+    ],
+    "canonical_name": "generation",
+    "keywords": [
+      "generation",
+      "generate",
+      "diffusion",
+      "generative"
+    ],
+    "name": "Generation",
+    "name_cn": "生成",
+    "paper_terms": [
+      "generation",
+      "generate",
+      "diffusion",
+      "generative"
+    ]
+  },
+  "gui-agent": {
+    "aliases": [
+      "gui-agent",
+      "gui agent",
+      "computer use",
+      "computer use agent",
+      "computer-use agent",
+      "screen agent",
+      "interface agent",
+      "ui agent",
+      "agentic ui automation",
+      "computer use agents"
+    ],
+    "canonical_name": "gui-agent",
+    "keywords": [
+      "gui agent",
+      "computer use",
+      "interface automation",
+      "desktop automation",
+      "ui automation"
+    ],
+    "name": "GUI Agent",
+    "name_cn": "GUI Agent",
+    "paper_terms": [
+      "gui agent",
+      "computer use",
+      "interface automation",
+      "desktop automation",
+      "ui automation"
+    ]
+  },
+  "language": {
+    "aliases": [
+      "language",
+      "语言",
+      "natural language",
+      "language modeling"
+    ],
+    "canonical_name": "language",
+    "keywords": [
+      "language",
+      "text",
+      "transformer",
+      "llm",
+      "language model"
+    ],
+    "name": "Language",
+    "name_cn": "语言",
+    "paper_terms": [
+      "language",
+      "text",
+      "transformer",
+      "llm",
+      "language model"
+    ]
+  },
+  "machine-learning": {
+    "aliases": [
+      "machine-learning",
+      "machine learning",
+      "机器学习",
+      "ml"
+    ],
+    "canonical_name": "machine-learning",
+    "keywords": [
+      "machine learning",
+      "ml",
+      "classification",
+      "regression"
+    ],
+    "name": "Machine Learning",
+    "name_cn": "机器学习",
+    "paper_terms": [
+      "machine learning",
+      "ml",
+      "classification",
+      "regression"
+    ]
+  },
+  "multimodal-learning": {
+    "aliases": [
+      "multimodal-learning",
+      "multimodal learning",
+      "多模态学习",
+      "multi-modal learning"
+    ],
+    "canonical_name": "multimodal-learning",
+    "keywords": [
+      "multimodal learning",
+      "multimodal"
+    ],
+    "name": "Multimodal Learning",
+    "name_cn": "多模态学习",
+    "paper_terms": [
+      "multimodal learning",
+      "multimodal"
+    ]
+  },
+  "multimodal-reasoning": {
+    "aliases": [
+      "multimodal-reasoning",
+      "multimodal reasoning",
+      "多模态推理",
+      "multi-modal reasoning",
+      "vision-language reasoning"
+    ],
+    "canonical_name": "multimodal-reasoning",
+    "keywords": [
+      "multimodal reasoning",
+      "multimodal",
+      "vision-language reasoning"
+    ],
+    "name": "Multimodal Reasoning",
+    "name_cn": "多模态推理",
+    "paper_terms": [
+      "multimodal reasoning",
+      "multimodal",
+      "vision-language reasoning"
+    ]
+  },
+  "nlp": {
+    "aliases": [
+      "nlp",
+      "Natural Language Processing",
+      "自然语言处理"
+    ],
+    "canonical_name": "nlp",
+    "keywords": [
+      "nlp",
+      "natural language processing"
+    ],
+    "name": "Natural Language Processing",
+    "name_cn": "自然语言处理",
+    "paper_terms": [
+      "nlp",
+      "natural language processing"
+    ]
+  },
+  "optimization": {
+    "aliases": [
+      "optimization",
+      "优化",
+      "optimizer"
+    ],
+    "canonical_name": "optimization",
+    "keywords": [
+      "optimization",
+      "optimize",
+      "efficient",
+      "optimizer"
+    ],
+    "name": "Optimization",
+    "name_cn": "优化",
+    "paper_terms": [
+      "optimization",
+      "optimize",
+      "efficient",
+      "optimizer"
+    ]
+  },
+  "privacy": {
+    "aliases": [
+      "privacy",
+      "隐私"
+    ],
+    "canonical_name": "privacy",
+    "keywords": [
+      "privacy",
+      "private"
+    ],
+    "name": "Privacy",
+    "name_cn": "隐私",
+    "paper_terms": [
+      "privacy",
+      "private"
+    ]
+  },
+  "protein-folding": {
+    "aliases": [
+      "protein-folding",
+      "protein folding",
+      "蛋白折叠",
+      "protein structure",
+      "protein structure prediction"
+    ],
+    "canonical_name": "protein-folding",
+    "keywords": [
+      "protein folding",
+      "protein structure",
+      "structural biology"
+    ],
+    "name": "Protein Folding",
+    "name_cn": "蛋白折叠",
+    "paper_terms": [
+      "protein folding",
+      "protein structure",
+      "structural biology"
+    ]
+  },
+  "protein-language-model": {
+    "aliases": [
+      "protein-language-model",
+      "protein language model",
+      "蛋白语言模型",
+      "protein lm",
+      "plm"
+    ],
+    "canonical_name": "protein-language-model",
+    "keywords": [
+      "protein language model",
+      "protein lm",
+      "plm"
+    ],
+    "name": "Protein Language Model",
+    "name_cn": "蛋白语言模型",
+    "paper_terms": [
+      "protein language model",
+      "protein lm",
+      "plm"
+    ]
+  },
+  "reasoning": {
+    "aliases": [
+      "reasoning",
+      "推理",
+      "chain of thought",
+      "cot",
+      "reasoning model"
+    ],
+    "canonical_name": "reasoning",
+    "keywords": [
+      "reasoning",
+      "chain of thought",
+      "cot"
+    ],
+    "name": "Reasoning",
+    "name_cn": "推理",
+    "paper_terms": [
+      "reasoning",
+      "chain of thought",
+      "cot"
+    ]
+  },
+  "reinforcement-learning": {
+    "aliases": [
+      "reinforcement-learning",
+      "reinforcement learning",
+      "强化学习",
+      "rl"
+    ],
+    "canonical_name": "reinforcement-learning",
+    "keywords": [
+      "reinforcement learning",
+      "rl",
+      "reward",
+      "policy"
+    ],
+    "name": "Reinforcement Learning",
+    "name_cn": "强化学习",
+    "paper_terms": [
+      "reinforcement learning",
+      "rl",
+      "reward",
+      "policy"
+    ]
+  },
+  "retrieval": {
+    "aliases": [
+      "retrieval",
+      "检索",
+      "rag",
+      "retriever"
+    ],
+    "canonical_name": "retrieval",
+    "keywords": [
+      "retrieval",
+      "retrieve",
+      "search",
+      "rag"
+    ],
+    "name": "Retrieval",
+    "name_cn": "检索",
+    "paper_terms": [
+      "retrieval",
+      "retrieve",
+      "search",
+      "rag"
+    ]
+  },
+  "safety": {
+    "aliases": [
+      "safety",
+      "安全"
+    ],
+    "canonical_name": "safety",
+    "keywords": [
+      "safety",
+      "safe",
+      "robust",
+      "adversarial"
+    ],
+    "name": "Safety",
+    "name_cn": "安全",
+    "paper_terms": [
+      "safety",
+      "safe",
+      "robust",
+      "adversarial"
+    ]
+  },
+  "science-discovery": {
+    "aliases": [
+      "science-discovery",
+      "science discovery",
+      "Scientific Discovery",
+      "科学发现"
+    ],
+    "canonical_name": "science-discovery",
+    "keywords": [
+      "scientific",
+      "science",
+      "discovery",
+      "hypothesis",
+      "experiment",
+      "science discovery",
+      "Scientific Discovery"
+    ],
+    "name": "Scientific Discovery",
+    "name_cn": "科学发现",
+    "paper_terms": [
+      "scientific",
+      "science",
+      "discovery",
+      "hypothesis",
+      "experiment",
+      "science discovery",
+      "Scientific Discovery"
+    ]
+  },
+  "segmentation": {
+    "aliases": [
+      "segmentation",
+      "分割"
+    ],
+    "canonical_name": "segmentation",
+    "keywords": [
+      "segmentation",
+      "segment"
+    ],
+    "name": "Segmentation",
+    "name_cn": "分割",
+    "paper_terms": [
+      "segmentation",
+      "segment"
+    ]
+  },
+  "vision": {
+    "aliases": [
+      "vision",
+      "视觉",
+      "computer vision",
+      "visual understanding",
+      "image understanding"
+    ],
+    "canonical_name": "vision",
+    "keywords": [
+      "vision",
+      "visual",
+      "image",
+      "video",
+      "computer vision"
+    ],
+    "name": "Vision",
+    "name_cn": "视觉",
+    "paper_terms": [
+      "vision",
+      "visual",
+      "image",
+      "video",
+      "computer vision"
+    ]
+  },
+  "vision-language": {
+    "aliases": [
+      "vision-language",
+      "vision language",
+      "视觉语言",
+      "vision and language",
+      "visual language"
+    ],
+    "canonical_name": "vision-language",
+    "keywords": [
+      "vision-language",
+      "vision and language",
+      "visual language",
+      "vision language"
+    ],
+    "name": "Vision-Language",
+    "name_cn": "视觉语言",
+    "paper_terms": [
+      "vision-language",
+      "vision and language",
+      "visual language",
+      "vision language"
+    ]
+  },
+  "vision-language-model": {
+    "aliases": [
+      "vision-language-model",
+      "vision language model",
+      "Vision-Language Model",
+      "视觉语言模型",
+      "vlm",
+      "multimodal llm"
+    ],
+    "canonical_name": "vision-language-model",
+    "keywords": [
+      "vision-language model",
+      "visual language model",
+      "vlm",
+      "vision language model"
+    ],
+    "name": "Vision-Language Model",
+    "name_cn": "视觉语言模型",
+    "paper_terms": [
+      "vision-language model",
+      "visual language model",
+      "vlm",
+      "vision language model"
+    ]
+  },
+  "护理学": {
+    "aliases": [
+      "护理学"
+    ],
+    "canonical_name": "护理学",
+    "keywords": [
+      "护理学"
+    ],
+    "name": "护理学",
+    "name_cn": "护理学",
+    "paper_terms": [
+      "护理学"
+    ],
+    "source_text": "护理学"
+  },
+  "智能制造": {
+    "aliases": [
+      "智能制造"
+    ],
+    "canonical_name": "智能制造",
+    "keywords": [
+      "智能制造"
+    ],
+    "name": "智能制造",
+    "name_cn": "智能制造",
+    "paper_terms": [
+      "智能制造"
+    ],
+    "source_text": "智能制造"
+  },
+  "机器人工程": {
+    "aliases": [
+      "机器人工程"
+    ],
+    "canonical_name": "机器人工程",
+    "keywords": [
+      "机器人工程"
+    ],
+    "name": "机器人工程",
+    "name_cn": "机器人工程",
+    "paper_terms": [
+      "机器人工程"
+    ],
+    "source_text": "机器人工程"
+  }
+}

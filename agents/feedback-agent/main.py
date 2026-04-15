@@ -34,6 +34,12 @@ db_ops = importlib.import_module("skills.storage-helper.scripts.db_ops")
 log_behavior = db_ops.log_behavior
 get_profile = db_ops.get_profile
 update_profile = db_ops.update_profile
+get_recent_selected_papers = getattr(db_ops, "get_recent_selected_papers", lambda *args, **kwargs: [])
+
+profile_updater = importlib.import_module("skills.profile-updater.scripts.update_profile")
+update_profile_with_feedback = profile_updater.update_profile_with_feedback
+ensure_profile_schema = profile_updater.ensure_profile_schema
+get_drift_blend_weights = profile_updater.get_drift_blend_weights
 
 # 飞书报告器
 feishu_reporter = importlib.import_module("skills.feishu-reporter.scripts.feishu_reporter")
@@ -186,6 +192,19 @@ def normalize_authors(authors: Any) -> List[str]:
     return [str(authors).strip()]
 
 
+def _build_interest_vector_descriptor(profile: Dict[str, Any]) -> str:
+    """Compact descriptor for drift-aware interest fusion."""
+    drift_state = (profile or {}).get("drift_state", {}) or {}
+    status = str(drift_state.get("status", "stable"))
+    weights = get_drift_blend_weights(status)
+    return (
+        f"status={status}|"
+        f"explicit:{weights['explicit']:.2f},"
+        f"long:{weights['long']:.2f},"
+        f"short:{weights['short']:.2f}"
+    )
+
+
 def format_number_ranges(numbers: Set[int]) -> str:
     """Format selected numbers as compact ranges such as 01-03, 07, 09."""
     if not numbers:
@@ -295,76 +314,45 @@ def format_selection_summary(
 def update_profile_based_on_selection(
     user_id: str,
     selected_paper_ids: List[int],
-    papers: List[Dict]
+    papers: List[Dict],
+    skipped_paper_ids: Optional[List[int]] = None,
+    historical_selected_papers: Optional[List[Dict[str, Any]]] = None,
+    current_timestamp: Optional[datetime] = None,
 ) -> Dict:
-    """
-    基于用户选择更新画像
-
-    Args:
-        user_id: 用户 ID
-        selected_paper_ids: 选中的论文编号列表
-        papers: 论文列表
-
-    Returns:
-        更新后的画像
-    """
+    """Update the profile via the unified drift-aware updater."""
     profile = get_profile(user_id)
-
     if not profile:
         print(f"Warning: No profile found for user {user_id}")
         return {}
 
-    # 初始化必要字段
-    if "topic_weights" not in profile:
-        profile["topic_weights"] = {}
-    if "author_heat" not in profile:
-        profile["author_heat"] = {}
-    if "institution_heat" not in profile:
-        profile["institution_heat"] = {}
-    if "reading_history" not in profile:
-        profile["reading_history"] = []
+    now = current_timestamp or datetime.now()
+    normalized_profile = ensure_profile_schema(profile, now=now)
 
-    # 获取选中的论文
-    selected_papers = []
-    for paper_id in selected_paper_ids:
-        idx = paper_id - 1
+    selected_papers: List[Dict[str, Any]] = []
+    for paper_number in selected_paper_ids:
+        idx = paper_number - 1
         if 0 <= idx < len(papers):
-            selected_papers.append(papers[idx])
+            selected_paper = dict(papers[idx])
+            selected_paper["authors"] = normalize_authors(selected_paper.get("authors", []))
+            selected_papers.append(selected_paper)
 
-    # 更新作者热度
-    for paper in selected_papers:
-        authors = normalize_authors(paper.get("authors", []))
-        for author in authors:
-            if author:
-                current_heat = profile["author_heat"].get(author, 0)
-                profile["author_heat"][author] = current_heat + 0.1
+    skipped_papers: List[Dict[str, Any]] = []
+    for paper_number in skipped_paper_ids or []:
+        idx = paper_number - 1
+        if 0 <= idx < len(papers):
+            skipped_paper = dict(papers[idx])
+            skipped_paper["authors"] = normalize_authors(skipped_paper.get("authors", []))
+            skipped_papers.append(skipped_paper)
 
-    # 更新机构热度
-    for paper in selected_papers:
-        institution = paper.get("institution")
-        if institution:
-            current_heat = profile["institution_heat"].get(institution, 0)
-            profile["institution_heat"][institution] = current_heat + 0.1
-
-    # 更新阅读历史
-    for paper in selected_papers:
-        arxiv_id = paper.get("arxiv_id")
-        paper_id = paper.get("id")
-        # 优先使用 arxiv_id，没有时使用数据库 ID
-        identifier = arxiv_id or f"paper_{paper_id}"
-        if identifier:
-            profile["reading_history"].append({
-                "arxiv_id": arxiv_id,
-                "paper_id": paper_id,
-                "selected_at": datetime.now().isoformat(),
-                "action": "selected"
-            })
-
-    # 更新画像
-    profile["updated_at"] = datetime.now().isoformat()
-    update_profile(user_id, profile)
-
-    return profile
+    updated_profile = update_profile_with_feedback(
+        normalized_profile,
+        selected_papers,
+        skipped_papers,
+        historical_selected_papers=historical_selected_papers or [],
+        current_time=now,
+    )
+    update_profile(user_id, updated_profile)
+    return updated_profile
 
 
 def process_feedback(
@@ -411,6 +399,13 @@ def process_feedback(
         return {"status": "error", "message": message}
 
     print(f"Selected paper numbers: {sorted(selected)}")
+    current_timestamp = datetime.now()
+    history_before_update = get_recent_selected_papers(
+        user_id,
+        limit=60,
+        days=60,
+        before_timestamp=current_timestamp.isoformat(sep=" "),
+    )
 
     # 2. 记录行为日志
     for paper_num in selected:
@@ -457,7 +452,33 @@ def process_feedback(
             )
 
     # 3. 更新画像
-    update_profile_based_on_selection(user_id, list(selected), papers)
+    updated_profile = update_profile_based_on_selection(
+        user_id,
+        list(selected),
+        papers,
+        skipped_paper_ids=list(skipped),
+        historical_selected_papers=history_before_update,
+        current_timestamp=current_timestamp,
+    )
+    drift_state = (updated_profile or {}).get("drift_state", {}) or {}
+    log_behavior(
+        user_id=user_id,
+        push_id=push_id,
+        paper_id=None,
+        action="profile_updated",
+        action_type="drift_update",
+        category=drift_state.get("status", "stable"),
+        metadata={
+            "drift_status": drift_state.get("status", "stable"),
+            "drift_score": drift_state.get("score", 0.0),
+            "adaptive_alpha": drift_state.get("adaptive_alpha", 0.0),
+            "top_shift_topics": drift_state.get("top_shift_topics", []),
+            "interest_vector_descriptor": _build_interest_vector_descriptor(updated_profile or {}),
+            "selected_count": len(selected),
+            "skipped_count": len(skipped),
+            "explanation": drift_state.get("explanation", ""),
+        },
+    )
 
     # 4. 发送确认消息
     summary = format_selection_summary(selected, len(papers), papers)

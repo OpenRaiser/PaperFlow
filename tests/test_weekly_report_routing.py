@@ -89,4 +89,48 @@ def test_send_weekly_report_routes_to_role_chat_when_chat_id_missing(monkeypatch
 
     assert "error" not in result
     assert captured["chat_id"] == "oc_rolea_test"
-    assert "你的学术画像周度报告" in captured["text"]
+    assert "学术画像周度报告" in captured["text"]
+
+
+def test_send_weekly_report_includes_drift_section(monkeypatch):
+    monkeypatch.setattr(profile_report_agent, "get_profile", lambda user_id: {})
+    monkeypatch.setattr(
+        profile_report_agent,
+        "generate_weekly_report",
+        lambda user_id, days: {
+            "period": "2026-04-05 ~ 2026-04-12",
+            "direction_changes": [],
+            "stats": {"total": 5, "selected": 2, "selection_rate": 0.4},
+            "stats_by_category": {},
+            "top_authors": [],
+            "top_institutions": [],
+            "missed_papers": [],
+            "drift_summary": {
+                "status": "shifting",
+                "status_label": "迁移中",
+                "max_score": 0.58,
+                "detected_at": "2026-04-12T09:30:00",
+                "top_shift_topics": ["multimodal-reasoning", "protein-language-model"],
+                "explanation": "近期在多模态推理上的选择显著偏离历史窗口，因此系统提高了短期兴趣权重。",
+            },
+        },
+    )
+
+    captured = {}
+
+    def fake_send_text_to_chat(chat_id, text):
+        captured["chat_id"] = chat_id
+        captured["text"] = text
+        return {"success": True}
+
+    monkeypatch.setattr(profile_report_agent, "send_text_to_chat", fake_send_text_to_chat)
+
+    profile_report_agent.send_weekly_report(
+        user_id="user_rolea",
+        feishu_chat_id="oc_rolea_test",
+        send_to_feishu=True,
+    )
+
+    assert "兴趣迁移状态" in captured["text"]
+    assert "迁移中" in captured["text"]
+    assert "本周最高漂移分数" in captured["text"]

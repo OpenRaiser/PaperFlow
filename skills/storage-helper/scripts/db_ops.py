@@ -71,6 +71,7 @@ def _build_paper_dict(
     """Convert a joined paper row into a normalized dict."""
     paper = dict(row)
     paper["authors"] = _deserialize_json_list(paper.get("authors"))
+    paper["embedding"] = _deserialize_json_list(paper.get("embedding"))
 
     metadata: Dict[str, Any] = {}
     for extra_key in extra_metadata_keys or []:
@@ -95,6 +96,9 @@ def _build_paper_dict(
         for key, value in metadata.items():
             if key not in paper or paper.get(key) in (None, "", [], {}):
                 paper[key] = value
+
+    for list_key in ("categories", "keywords", "topics"):
+        paper[list_key] = _deserialize_json_list(paper.get(list_key))
 
     return paper
 
@@ -327,7 +331,7 @@ def get_paper_by_arxiv_id(arxiv_id: str) -> Optional[Dict]:
     row = cursor.fetchone()
     conn.close()
     if row:
-        return dict(row)
+        return _build_paper_dict(row)
     return None
 
 
@@ -414,7 +418,7 @@ def get_paper_by_arxiv(arxiv_id: str) -> Optional[Dict]:
     row = cursor.fetchone()
     conn.close()
     if row:
-        return dict(row)
+        return _build_paper_dict(row)
     return None
 
 
@@ -428,7 +432,7 @@ def get_paper_by_doi(doi: str) -> Optional[Dict]:
     row = cursor.fetchone()
     conn.close()
     if row:
-        return dict(row)
+        return _build_paper_dict(row)
     return None
 
 
@@ -924,6 +928,130 @@ def get_latest_selected_papers(user_id: str) -> Optional[Dict]:
         "selection_time": selection_time,
         "papers": papers,
     }
+
+
+def get_recent_selected_papers(
+    user_id: str,
+    limit: int = 30,
+    days: int = 60,
+    before_timestamp: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Return recent selected papers with paper data and selected timestamp.
+
+    Args:
+        user_id: User ID
+        limit: Max number of selected papers to fetch
+        days: Max lookback window in days
+        before_timestamp: Optional upper-bound timestamp (exclusive)
+
+    Returns:
+        Most recent selected papers ordered from old to new.
+    """
+    normalized_limit = max(1, int(limit))
+    normalized_days = max(1, int(days))
+    since_timestamp = (datetime.now() - timedelta(days=normalized_days)).isoformat(sep=" ")
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    sql = """
+        SELECT p.*,
+               bl.id AS behavior_log_id,
+               bl.timestamp AS selected_at,
+               bl.metadata AS selected_metadata,
+               push_bl.metadata AS push_metadata
+        FROM behavior_logs bl
+        JOIN papers p ON p.id = bl.paper_id
+        LEFT JOIN behavior_logs push_bl
+          ON push_bl.user_id = bl.user_id
+         AND push_bl.push_id = bl.push_id
+         AND push_bl.paper_id = bl.paper_id
+         AND push_bl.action = 'pushed'
+        WHERE bl.user_id = ?
+          AND bl.action = 'selected'
+          AND bl.action_type = 'selected'
+          AND bl.timestamp >= ?
+    """
+    params: List[Any] = [user_id, since_timestamp]
+
+    if before_timestamp:
+        sql += " AND bl.timestamp < ?"
+        params.append(before_timestamp)
+
+    sql += """
+        ORDER BY bl.timestamp DESC, bl.id DESC
+        LIMIT ?
+    """
+    params.append(normalized_limit)
+
+    cursor.execute(sql, params)
+    rows = cursor.fetchall()
+    conn.close()
+
+    papers = [
+        _build_paper_dict(
+            row,
+            metadata_key="selected_metadata",
+            extra_metadata_keys=["push_metadata"],
+        )
+        for row in rows
+    ]
+    for paper in papers:
+        paper["selected_at"] = paper.get("selected_at")
+
+    papers.reverse()
+    return papers
+
+
+def get_recent_drift_updates(user_id: str, days: int = 7) -> List[Dict[str, Any]]:
+    """
+    Return recent drift-update behavior logs for a user.
+
+    Args:
+        user_id: User ID
+        days: Lookback days
+
+    Returns:
+        Parsed drift update records ordered from old to new.
+    """
+    since_timestamp = (datetime.now() - timedelta(days=max(1, int(days)))).isoformat(sep=" ")
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT id, user_id, push_id, paper_id, action, action_type, category, timestamp, metadata
+        FROM behavior_logs
+        WHERE user_id = ?
+          AND action = 'profile_updated'
+          AND action_type = 'drift_update'
+          AND timestamp >= ?
+        ORDER BY timestamp ASC, id ASC
+        """,
+        (user_id, since_timestamp),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+
+    results: List[Dict[str, Any]] = []
+    for row in rows:
+        record = dict(row)
+        metadata = _load_json_metadata(record.get("metadata"))
+        record["metadata"] = metadata
+        if "drift_status" in metadata:
+            record["drift_status"] = metadata.get("drift_status")
+        if "drift_score" in metadata:
+            record["drift_score"] = metadata.get("drift_score")
+        if "adaptive_alpha" in metadata:
+            record["adaptive_alpha"] = metadata.get("adaptive_alpha")
+        if "top_shift_topics" in metadata:
+            record["top_shift_topics"] = metadata.get("top_shift_topics")
+        if "explanation" in metadata:
+            record["explanation"] = metadata.get("explanation")
+        results.append(record)
+
+    return results
 
 
 def get_push_papers(push_id: str) -> Optional[Dict]:

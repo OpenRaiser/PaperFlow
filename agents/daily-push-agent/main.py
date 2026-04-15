@@ -50,6 +50,9 @@ embedding_service_module = importlib.import_module("skills.embedding.scripts.emb
 get_embedding_service = embedding_service_module.get_embedding_service
 embed_batch = embedding_service_module.embed_batch
 build_paper_text = embedding_service_module.build_paper_text
+direction_lexicon = __import__("config.direction_lexicon", fromlist=["dummy"])
+canonicalize_direction_terms = direction_lexicon.canonicalize_direction_terms
+expand_direction_terms_from_registry = direction_lexicon.expand_direction_terms
 
 # 飞书报告器（可选）
 try:
@@ -143,7 +146,7 @@ def load_scoring_weights() -> Dict:
         "w2_topic_weight": 0.25,
         "w3_author_institution": 0.20,
         "w4_quality_signal": 0.20,
-        "bonus_must_read": 1.0,
+        "bonus_must_read": 0.15,
         "threshold_high_relevant": 0.75,
         "threshold_maybe_interested": 0.50,
     }
@@ -174,95 +177,6 @@ def resolve_chat_id_for_user(user_id: str, profile: Dict = None) -> str:
                 return role_info["feishu_chat_id"]
 
     return ""
-
-
-def categorize_papers_by_rank(scored_papers: List[PaperWithScore], profile: Dict, weights: Dict) -> List[PaperWithScore]:
-    """
-    按排名分类论文（结合分数阈值）
-
-    策略：
-    - 必读：命中 must_read 清单的
-    - 高度相关：分数 >= threshold_high_relevant 或 前 10%
-    - 可能感兴趣：分数 >= threshold_maybe_interested 或 前 11-40%
-    - 边缘相关：分数 >= threshold_edge_relevant
-    - 过滤：分数 < threshold_edge_relevant 的论文不推送
-    """
-    total = len(scored_papers)
-    threshold_high = weights.get("threshold_high_relevant", 0.40)
-    threshold_maybe = weights.get("threshold_maybe_interested", 0.25)
-    threshold_edge = weights.get("threshold_edge_relevant", 0.15)
-    min_relevance_signal = weights.get("min_relevance_signal", 0.08)
-    high_rank_fraction = weights.get("rank_high_fraction", 0.1)
-    maybe_rank_fraction = weights.get("rank_maybe_fraction", 0.4)
-
-    rank_eligible = [
-        p for p in scored_papers
-        if p.relevance_signal >= min_relevance_signal
-    ]
-    high_rank_limit = max(1, int(len(rank_eligible) * high_rank_fraction)) if rank_eligible else 0
-    maybe_rank_limit = max(high_rank_limit, int(len(rank_eligible) * maybe_rank_fraction)) if rank_eligible else 0
-    rank_eligible_positions = {id(p): idx for idx, p in enumerate(rank_eligible)}
-
-    filtered = []
-    for p in scored_papers:
-        rank_position = rank_eligible_positions.get(id(p))
-
-        # 必读清单命中 - 无论分数如何都推送
-        if is_must_read(p.paper, profile):
-            p.category = "must_read"
-            filtered.append(p)
-        # 没有足够个人相关性时，质量再高也不直接推送
-        elif p.relevance_signal < min_relevance_signal:
-            print(
-                f"  Filtered out (low relevance={p.relevance_signal:.2f}, score={p.score:.2f}): "
-                f"{p.paper.get('title', '')[:40]}..."
-            )
-        # 高度相关：达到高分阈值，或在高相关候选前列且至少达到 maybe 阈值
-        elif p.score >= threshold_high or (
-            rank_position is not None
-            and rank_position < high_rank_limit
-            and p.score >= threshold_maybe
-        ):
-            p.category = "high_relevant"
-            filtered.append(p)
-        # 可能感兴趣：达到 maybe 阈值，或在候选前列且至少达到 edge 阈值
-        elif p.score >= threshold_maybe or (
-            rank_position is not None
-            and rank_position < maybe_rank_limit
-            and p.score >= threshold_edge
-        ):
-            p.category = "maybe_interested"
-            filtered.append(p)
-        # 边缘相关：只保留达到最低分阈值且有个人相关性的论文
-        elif p.score >= threshold_edge:
-            p.category = "edge_relevant"
-            filtered.append(p)
-        # 分数太低 - 过滤掉，不推送
-        # 高度相关：分数 >= 0.40 或 前 10%
-        else:
-            print(f"  Filtered out (score={p.score:.2f}): {p.paper.get('title', '')[:40]}...")
-
-    return filtered
-
-
-def categorize_paper(score: float, paper: Dict, profile: Dict, weights: Dict) -> str:
-    """
-    分类论文（保留用于向后兼容）
-    """
-    # 必读清单命中
-    if is_must_read(paper, profile):
-        return "must_read"
-
-    # 根据分数分类
-    threshold_high = weights.get("threshold_high_relevant", 0.75)
-    threshold_maybe = weights.get("threshold_maybe_interested", 0.50)
-
-    if score >= threshold_high:
-        return "high_relevant"
-    elif score >= threshold_maybe:
-        return "maybe_interested"
-    else:
-        return "edge_relevant"
 
 
 def dedupe_preserve_order(items: List[str]) -> List[str]:
@@ -346,7 +260,7 @@ def compute_relevance_signal(paper: Dict, profile: Dict) -> float:
     topic_match = 0.0
     matched_weights = [
         float(profile.get("topic_weights", {}).get(topic, 0.0))
-        for topic in paper.get("keywords", [])
+        for topic in paper.get("topics", [])
         if topic in profile.get("topic_weights", {})
     ]
     if matched_weights:
@@ -467,6 +381,11 @@ def format_must_read_reason(paper: Dict, profile: Dict) -> str:
     return "；".join(parts)
 
 
+def expand_direction_terms(canonical_directions: List[str]) -> Dict[str, Dict]:
+    """Return canonical directions plus their aliases / paper terms for reuse."""
+    return expand_direction_terms_from_registry(canonical_directions)
+
+
 def prepare_paper_features(papers: List[Dict]) -> List[Dict]:
     """Attach embeddings and normalized ranking features to fetched papers."""
     if not papers:
@@ -483,15 +402,20 @@ def prepare_paper_features(papers: List[Dict]) -> List[Dict]:
         paper["institution"] = str(paper.get("institution") or "")
         paper["quality_score"] = estimate_quality_score(paper)
 
-        semantic_topics = extract_topics_from_title(paper.get("title", ""))
+        semantic_topics = canonicalize_direction_terms(
+            extract_topics_from_title(paper.get("title", "")),
+            keep_unknown=True,
+        )
         source_categories = list(paper.get("categories", []))
         if paper.get("source") == "openreview":
             source_categories.append(paper.get("venue", "conference"))
         elif paper.get("source") == "journal":
             source_categories.append(paper.get("journal", "journal"))
 
+        expanded_terms = expand_direction_terms(semantic_topics)
         paper["keywords"] = dedupe_preserve_order(source_categories + semantic_topics)
         paper["topics"] = semantic_topics
+        paper["direction_terms"] = expanded_terms
 
     return papers
 
@@ -514,6 +438,10 @@ def extract_topics_from_title(title: str) -> List[str]:
     # cross-modal: 跨模态
     if "cross-modal" in title_lower or "cross modal" in title_lower:
         topics.append("cross-modal")
+    if any(token in title_lower for token in ("gui agent", "computer use", "screen agent", "interface agent")):
+        topics.append("gui-agent")
+    if "protein" in title_lower and any(token in title_lower for token in ("language model", "llm", "transformer")):
+        topics.append("protein-language-model")
 
     # ===== 通用主题（扩展匹配）=====
     # reasoning: 推理
@@ -569,6 +497,25 @@ def extract_topics_from_title(title: str) -> List[str]:
     # detection: 检测
     if "detection" in title_lower or "detect" in title_lower or "object detection" in title_lower:
         topics.append("detection")
+    if (
+        any(token in title_lower for token in ("detection", "detect", "detector"))
+        and any(
+            token in title_lower
+            for token in (
+                "ai",
+                "aigc",
+                "llm",
+                "deepfake",
+                "synthetic media",
+                "synthetic image",
+                "synthetic video",
+                "ai-generated",
+                "generated content",
+                "machine-generated",
+            )
+        )
+    ):
+        topics.append("ai-detection")
     # generation: 生成
     if "generation" in title_lower or "generate" in title_lower or "diffusion" in title_lower:
         topics.append("generation")
@@ -588,7 +535,7 @@ def extract_topics_from_title(title: str) -> List[str]:
     if "privacy" in title_lower or "private" in title_lower:
         topics.append("privacy")
 
-    return list(set(topics))
+    return canonicalize_direction_terms(topics, keep_unknown=True)
 
 
 def fetch_and_process_papers(
@@ -767,27 +714,100 @@ def sort_and_categorize(
     return result
 
 
+def categorize_papers_by_rank(scored_papers: List[PaperWithScore], profile: Dict, weights: Dict) -> List[PaperWithScore]:
+    """Soft-filter and categorize papers while keeping must_read as a soft rule."""
+    threshold_high = weights.get("threshold_high_relevant", 0.40)
+    threshold_maybe = weights.get("threshold_maybe_interested", 0.25)
+    threshold_edge = weights.get("threshold_edge_relevant", 0.15)
+    min_relevance_signal = weights.get("min_relevance_signal", 0.08)
+    high_rank_fraction = weights.get("rank_high_fraction", 0.1)
+    maybe_rank_fraction = weights.get("rank_maybe_fraction", 0.4)
+
+    rank_eligible = [paper for paper in scored_papers if paper.relevance_signal >= min_relevance_signal]
+    high_rank_limit = max(1, int(len(rank_eligible) * high_rank_fraction)) if rank_eligible else 0
+    maybe_rank_limit = max(high_rank_limit, int(len(rank_eligible) * maybe_rank_fraction)) if rank_eligible else 0
+    rank_eligible_positions = {id(paper): idx for idx, paper in enumerate(rank_eligible)}
+
+    filtered: List[PaperWithScore] = []
+    for paper_with_score in scored_papers:
+        rank_position = rank_eligible_positions.get(id(paper_with_score))
+        must_read_hit = is_must_read(paper_with_score.paper, profile)
+
+        if paper_with_score.relevance_signal < min_relevance_signal and not must_read_hit:
+            print(
+                f"  Filtered out (low relevance={paper_with_score.relevance_signal:.2f}, score={paper_with_score.score:.2f}): "
+                f"{str(paper_with_score.paper.get('title', '') or '').strip()}"
+            )
+            continue
+
+        if must_read_hit and paper_with_score.score < threshold_edge:
+            print(
+                f"  Filtered out (must_read below edge threshold, score={paper_with_score.score:.2f}): "
+                f"{str(paper_with_score.paper.get('title', '') or '').strip()}"
+            )
+            continue
+
+        if must_read_hit:
+            paper_with_score.category = "must_read"
+            filtered.append(paper_with_score)
+            continue
+
+        if paper_with_score.score >= threshold_high or (
+            rank_position is not None
+            and rank_position < high_rank_limit
+            and paper_with_score.score >= threshold_maybe
+        ):
+            paper_with_score.category = "high_relevant"
+            filtered.append(paper_with_score)
+            continue
+
+        if paper_with_score.score >= threshold_maybe or (
+            rank_position is not None
+            and rank_position < maybe_rank_limit
+            and paper_with_score.score >= threshold_edge
+        ):
+            paper_with_score.category = "maybe_interested"
+            filtered.append(paper_with_score)
+            continue
+
+        if paper_with_score.score >= threshold_edge:
+            paper_with_score.category = "edge_relevant"
+            filtered.append(paper_with_score)
+            continue
+
+        print(
+            f"  Filtered out (score={paper_with_score.score:.2f}): "
+            f"{str(paper_with_score.paper.get('title', '') or '').strip()}"
+        )
+
+    return filtered
+
+
+def categorize_paper(score: float, paper: Dict, profile: Dict, weights: Dict) -> str:
+    """Backward-compatible coarse categorization."""
+    threshold_high = weights.get("threshold_high_relevant", 0.75)
+    threshold_maybe = weights.get("threshold_maybe_interested", 0.50)
+    threshold_edge = weights.get("threshold_edge_relevant", 0.15)
+
+    if is_must_read(paper, profile) and score >= threshold_edge:
+        return "must_read"
+    if score >= threshold_high:
+        return "high_relevant"
+    if score >= threshold_maybe:
+        return "maybe_interested"
+    return "edge_relevant"
+
+
 def apply_push_count_limit(scored_papers: List[PaperWithScore], weights: Dict) -> List[PaperWithScore]:
-    """Keep daily push volume manageable for chat delivery and user reading load."""
+    """Keep daily push volume manageable without reserving slots for must_read hits."""
     if not scored_papers:
         return scored_papers
 
     target_count = max(1, int(weights.get("push_target_count", 50)))
     max_count = max(target_count, int(weights.get("push_max_count", target_count)))
-
-    if len(scored_papers) <= target_count:
-        return scored_papers
-
-    must_read = [paper for paper in scored_papers if paper.category == "must_read"]
-    non_must_read = [paper for paper in scored_papers if paper.category != "must_read"]
-
-    limited: List[PaperWithScore] = must_read[:max_count]
-    remaining_slots = max(0, target_count - len(limited))
-    if remaining_slots > 0:
-        limited.extend(non_must_read[:remaining_slots])
-
-    if len(limited) > max_count:
-        limited = limited[:max_count]
+    limited = list(scored_papers[:max_count])
+    if len(limited) > target_count:
+        limited = limited[:target_count]
 
     print(
         f"Applying push count limit: {len(scored_papers)} -> {len(limited)} "
@@ -796,126 +816,15 @@ def apply_push_count_limit(scored_papers: List[PaperWithScore], weights: Dict) -
     return limited
 
 
-def format_push_card(
-    scored_papers: List[PaperWithScore],
-    profile: Dict = None,
-    date: str = None,
-    total_fetched: int = None
-) -> str:
-    """
-    格式化推送卡片
-
-    格式示例：
-    📰 今日论文 | 04-21 | 抓取 312 篇 → 筛后 47 篇
-
-    ━━━ 🔒 必读清单（5 篇）━━━
-    01. [cs.AI] AlQuraishi — Geometric Pretraining for Protein Complexes
-    ...
-    ━━━ 🔴 高度相关（9 篇）━━━
-    06. [cs.LG] MIT — Emergence in Biological Foundation Models
-    ...
-    ━━━ 🟡 可能感兴趣（14 篇）━━━
-    ...
-    ━━━ 🔵 边缘相关（19 篇）━━━
-    ...
-    """
-    if date is None:
-        date = datetime.now().strftime("%m-%d")
-
-    # 按分类分组
-    must_read = [p for p in scored_papers if p.category == "must_read"]
-    high_relevant = [p for p in scored_papers if p.category == "high_relevant"]
-    maybe_interested = [p for p in scored_papers if p.category == "maybe_interested"]
-    edge_relevant = [p for p in scored_papers if p.category == "edge_relevant"]
-
-    total = total_fetched or len(scored_papers)
-    filtered = len(must_read) + len(high_relevant) + len(maybe_interested) + len(edge_relevant)
-
-    lines = []
-
-    # 头部 - 显示抓取总数和筛选后数量
-    lines.append(f"📰 今日论文 | {date} | 抓取 {total} 篇 → 筛后 {filtered} 篇")
-    lines.append("")
-
-    # 全局计数器
-    global_count = 0
-
-    # 必读清单 - 显示全部
-    if must_read:
-        lines.append(f"━━━ 🔒 必读清单命中（{len(must_read)} 篇）━━━")
-        for p in must_read:
-            global_count += 1
-            title = p.paper.get("title", "Unknown")[:60]
-            authors = p.paper.get("authors", [])
-            categories = p.paper.get("categories", [])
-            category_str = categories[0] if categories else "unknown"
-            if isinstance(authors, list) and len(authors) > 0:
-                first_author = authors[0].split(",")[0].strip()
-            else:
-                first_author = "Unknown"
-            lines.append(f"{global_count:02d}. [{category_str}] {first_author} — {title}")
-        lines.append("")
-
-    # 高度相关 - 显示全部
-    if high_relevant:
-        lines.append(f"━━━ 🔴 高度相关（{len(high_relevant)} 篇）━━━")
-        for p in high_relevant:
-            global_count += 1
-            title = p.paper.get("title", "Unknown")[:60]
-            authors = p.paper.get("authors", [])
-            categories = p.paper.get("categories", [])
-            category_str = categories[0] if categories else "unknown"
-            if isinstance(authors, list) and len(authors) > 0:
-                first_author = authors[0].split(",")[0].strip()
-            else:
-                first_author = ""
-            lines.append(f"{global_count:02d}. [{category_str}] {first_author} — {title}")
-        lines.append("")
-
-    # 可能感兴趣 - 显示全部
-    if maybe_interested:
-        lines.append(f"━━━ 🟡 可能感兴趣（{len(maybe_interested)} 篇）━━━")
-        for p in maybe_interested:
-            global_count += 1
-            title = p.paper.get("title", "Unknown")[:60]
-            authors = p.paper.get("authors", [])
-            categories = p.paper.get("categories", [])
-            category_str = categories[0] if categories else "unknown"
-            if isinstance(authors, list) and len(authors) > 0:
-                first_author = authors[0].split(",")[0].strip()
-            else:
-                first_author = ""
-            lines.append(f"{global_count:02d}. [{category_str}] {first_author} — {title}")
-        lines.append("")
-
-    # 边缘相关 - 显示全部
-    if edge_relevant:
-        lines.append(f"━━━ 🔵 边缘相关（{len(edge_relevant)} 篇）━━━")
-        for p in edge_relevant:
-            global_count += 1
-            title = p.paper.get("title", "Unknown")[:60]
-            authors = p.paper.get("authors", [])
-            categories = p.paper.get("categories", [])
-            category_str = categories[0] if categories else "unknown"
-            if isinstance(authors, list) and len(authors) > 0:
-                first_author = authors[0].split(",")[0].strip()
-            else:
-                first_author = ""
-            lines.append(f"{global_count:02d}. [{category_str}] {first_author} — {title}")
-        lines.append("")
-
-    # 分割线
-    lines.append("━━━━━━━━━━━━")
-
-    # 回复说明
-    lines.append("选择方式（任选）：")
-    lines.append("  直接回复编号：1 2 4 6 7 9 11")
-    lines.append("  范围选择：1-5 6 9 11")
-    lines.append("  快捷命令：all lock（所有必读）")
-    lines.append("           all red（所有高度相关）")
-    lines.append("           none（今天都不看）")
-
-    return "\n".join(lines)
+def format_drift_hint(profile: Dict) -> str:
+    """Render a short ranking explanation based on drift state."""
+    drift_state = (profile or {}).get("drift_state", {}) or {}
+    status = drift_state.get("status", "stable")
+    if status == "shifting":
+        return "兴趣迁移状态：迁移中，近期偏好权重已提升。"
+    if status == "recovered":
+        return "兴趣迁移状态：已恢复，系统正在重新平衡短期与长期兴趣。"
+    return "兴趣迁移状态：稳定，长期画像权重占优。"
 
 
 def format_push_card(
@@ -924,7 +833,7 @@ def format_push_card(
     date: str = None,
     total_fetched: int = None
 ) -> str:
-    """Format the daily push card with explicit must-read status."""
+    """Format the daily push card with explicit must-read status and drift hint."""
     if date is None:
         date = datetime.now().strftime("%m-%d")
 
@@ -937,14 +846,15 @@ def format_push_card(
     filtered = len(must_read) + len(high_relevant) + len(maybe_interested) + len(edge_relevant)
 
     lines = [f"📰 今日论文 | {date} | 抓取 {total} 篇 → 筛后 {filtered} 篇", ""]
-    global_count = 0
-
     lines.append(f"━━━ 🔒 必读清单命中（{len(must_read)} 篇）━━━")
     lines.append(format_must_read_config(profile or {}))
+    lines.append(format_drift_hint(profile or {}))
+
+    global_count = 0
     if must_read:
         for paper_with_score in must_read:
             global_count += 1
-            title = paper_with_score.paper.get("title", "Unknown")[:60]
+            title = str(paper_with_score.paper.get("title", "Unknown") or "Unknown").strip()
             authors = paper_with_score.paper.get("authors", [])
             categories = paper_with_score.paper.get("categories", [])
             category_str = categories[0] if categories else "unknown"
@@ -966,28 +876,25 @@ def format_push_card(
         ("🟡", "可能感兴趣", maybe_interested),
         ("🔵", "边缘相关", edge_relevant),
     ]
-    for marker, title, items in sections:
+    for marker, section_title, items in sections:
         if not items:
             continue
-        lines.append(f"━━━ {marker} {title}（{len(items)} 篇）━━━")
+        lines.append(f"━━━ {marker} {section_title}（{len(items)} 篇）━━━")
         for paper_with_score in items:
             global_count += 1
-            title_text = paper_with_score.paper.get("title", "Unknown")[:60]
+            title = str(paper_with_score.paper.get("title", "Unknown") or "Unknown").strip()
             authors = paper_with_score.paper.get("authors", [])
             categories = paper_with_score.paper.get("categories", [])
             category_str = categories[0] if categories else "unknown"
             first_author = authors[0].split(",")[0].strip() if isinstance(authors, list) and authors else ""
-            lines.append(f"{global_count:02d}. [{category_str}] {first_author} — {title_text}")
+            lines.append(f"{global_count:02d}. [{category_str}] {first_author} — {title}")
         lines.append("")
 
     lines.append("━━━━━━━━━━━━")
     lines.append("选择方式（任选）：")
-    lines.append("  直接回复编号：1 2 4 6 7 9 11")
-    lines.append("  范围选择：1-5 6 9 11")
-    lines.append("  快捷命令：all lock（所有必读）")
-    lines.append("           all red（所有高度相关）")
-    lines.append("           none（今天都不看）")
-
+    lines.append("  直接回复编号：1 2 4 6")
+    lines.append("  范围选择：1-5 8 10")
+    lines.append("  快捷命令：all lock / all red / none")
     return "\n".join(lines)
 
 
@@ -1127,6 +1034,8 @@ def daily_push(
                         "venue": paper.get("venue") or paper.get("journal"),
                         "publish_date": paper.get("publish_date"),
                         "categories": paper.get("categories", []),
+                        "keywords": paper.get("keywords", []),
+                        "topics": paper.get("topics", []),
                     }
                 )
             except Exception as e:

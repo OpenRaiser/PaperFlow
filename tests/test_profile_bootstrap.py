@@ -17,6 +17,7 @@ coldstart_agent = importlib.import_module("agents.coldstart-agent.main")
 master_coordinator = importlib.import_module("agents.master_coordinator.main")
 reading_agent = importlib.import_module("agents.reading-agent.main")
 db_ops = importlib.import_module("skills.storage-helper.scripts.db_ops")
+direction_lexicon = importlib.import_module("config.direction_lexicon")
 
 
 def _create_pdf(tmp_path: Path, name: str, text: str) -> str:
@@ -274,8 +275,64 @@ def test_handle_profile_update_adds_interest_signal_from_free_text(test_db_path,
     updated_profile = db_ops.get_profile("user_rolea")
 
     assert result["success"] is True
-    assert updated_profile["core_directions"]["bio-molecular"] >= 0.65
-    assert updated_profile["core_directions"]["language"] >= 0.65
+    assert "蛋白语言模型" in result["updated_topics"]
+    assert updated_profile["core_directions"]["protein-language-model"] >= 0.55
+    assert updated_profile["topic_weights"]["protein-language-model"] >= 0.55
+
+
+def test_handle_profile_update_deduplicates_pending_direction_prompt(test_db_path, monkeypatch):
+    db_ops.DB_PATH = test_db_path
+    master_coordinator.db_ops.DB_PATH = test_db_path
+
+    profile = master_coordinator.build_empty_profile("user_rolea")
+    profile["core_directions"] = {"bio-molecular": 0.68, "language": 0.60}
+    profile["topic_weights"] = {"bio-molecular": 0.68, "language": 0.60}
+    db_ops.create_profile("user_rolea", profile)
+
+    captured = {}
+    pending_prompt = '发现候选新方向：智能制造，回复“确认方向：智能制造”后纳入统一方向库。'
+
+    monkeypatch.setitem(
+        master_coordinator.MasterCoordinator.handle_profile_update.__globals__,
+        "parse_profile_update_request",
+        lambda *args, **kwargs: {
+            "action": "adjust_interest",
+            "direction": "increase",
+            "topic": "智能制造",
+            "topics": ["智能制造"],
+        },
+    )
+    monkeypatch.setitem(
+        master_coordinator.MasterCoordinator.handle_profile_update.__globals__,
+        "normalize_profile_update_topics",
+        lambda *args, **kwargs: {
+            "canonical_directions": [],
+            "temporary_matches": [],
+            "pending_candidates": [
+                {
+                    "candidate_key": "smart-manufacturing",
+                    "name": "smart-manufacturing",
+                    "name_cn": "智能制造",
+                }
+            ],
+            "explanations": [pending_prompt],
+        },
+    )
+    def fake_send_message(text, *args, **kwargs):
+        captured["text"] = text
+        return {"success": True}
+
+    monkeypatch.setitem(
+        master_coordinator.MasterCoordinator.handle_profile_update.__globals__,
+        "send_message",
+        fake_send_message,
+    )
+
+    coordinator = master_coordinator.MasterCoordinator(user_id="user_rolea")
+    result = coordinator.handle_profile_update("添加方向：智能制造")
+
+    assert result["success"] is True
+    assert captured["text"].count(pending_prompt) == 1
 
 
 def test_detect_intent_prefers_llm_for_profile_update(monkeypatch):
@@ -568,6 +625,45 @@ def test_format_direction_label_prettifies_dynamic_labels():
     assert master_coordinator.format_direction_label("ai-detection") == "AI Detection"
 
 
+def test_derive_topic_key_canonicalizes_ai_detection_aliases():
+    assert master_coordinator.derive_topic_key("Ai 检测") == "ai-detection"
+    assert master_coordinator.derive_topic_key("AI检测") == "ai-detection"
+    assert master_coordinator.derive_topic_key("AIGC 检测") == "ai-detection"
+
+
+def test_find_profile_topic_key_matches_ai_detection_alias():
+    profile = {
+        "core_directions": {"ai-detection": 0.65},
+        "topic_weights": {"ai-detection": 0.65},
+    }
+
+    assert master_coordinator.find_profile_topic_key(profile, "Ai 检测") == "ai-detection"
+    assert master_coordinator.find_profile_topic_key(profile, "AI检测") == "ai-detection"
+
+
+def test_handle_profile_update_canonicalizes_ai_detection_alias(test_db_path, monkeypatch):
+    db_ops.DB_PATH = test_db_path
+    master_coordinator.db_ops.DB_PATH = test_db_path
+
+    profile = master_coordinator.build_empty_profile("user_rolea")
+    db_ops.create_profile("user_rolea", profile)
+
+    monkeypatch.setattr(master_coordinator, "send_message", lambda *args, **kwargs: {"success": True})
+    coldstart_agent = importlib.import_module("agents.coldstart-agent.main")
+    monkeypatch.setattr(coldstart_agent, "parse_natural_language", lambda text, use_llm=True: {"core_directions": {}})
+
+    coordinator = master_coordinator.MasterCoordinator(user_id="user_rolea")
+    result = coordinator.handle_profile_update("Ai 检测的权重提高到1")
+    updated_profile = db_ops.get_profile("user_rolea")
+
+    assert result["success"] is True
+    assert "AI Detection" in result["updated_topics"]
+    assert updated_profile["core_directions"]["ai-detection"] == 1.0
+    assert updated_profile["topic_weights"]["ai-detection"] == 1.0
+    assert "ai 检测" not in updated_profile["core_directions"]
+    assert "ai 检测" not in updated_profile["topic_weights"]
+
+
 def test_detect_intent_routes_must_read_removal_before_profile_update(monkeypatch):
     coordinator = master_coordinator.MasterCoordinator(user_id="user_rolea")
 
@@ -609,6 +705,49 @@ def test_detect_intent_routes_academic_profile_to_show_profile():
     intent = coordinator.detect_intent("学术画像")
 
     assert intent["intent"] == "show_profile"
+
+
+def test_detect_intent_routes_confirm_direction_command():
+    coordinator = master_coordinator.MasterCoordinator(user_id="user_rolea")
+
+    intent = coordinator.detect_intent("确认方向：AIGC 检测")
+
+    assert intent["intent"] == "confirm_direction"
+    assert intent["slots"]["topic"] == "AIGC 检测"
+
+
+def test_handle_confirm_direction_promotes_pending_candidate(test_db_path, monkeypatch, tmp_path):
+    db_ops.DB_PATH = test_db_path
+    master_coordinator.db_ops.DB_PATH = test_db_path
+
+    monkeypatch.setattr(direction_lexicon, "LEXICON_PATH", tmp_path / "direction_lexicon.json")
+    monkeypatch.setattr(direction_lexicon, "PENDING_PATH", tmp_path / "direction_pending.json")
+    monkeypatch.setattr(master_coordinator, "send_message", lambda *args, **kwargs: {"success": True})
+
+    direction_lexicon.upsert_pending_direction_candidate(
+        "agentic ui automation",
+        proposed_name="agentic-ui-automation",
+        proposed_name_cn="界面智能体自动化",
+        confidence=0.42,
+        user_id="user_rolea",
+        reason="novel_direction_candidate",
+    )
+
+    profile = master_coordinator.build_empty_profile("user_rolea")
+    db_ops.create_profile("user_rolea", profile)
+
+    coordinator = master_coordinator.MasterCoordinator(user_id="user_rolea")
+    result = coordinator.handle_confirm_direction("界面智能体自动化")
+    updated_profile = db_ops.get_profile("user_rolea")
+    confirmed_entry = direction_lexicon.get_direction_entry("agentic-ui-automation")
+
+    assert result["success"] is True
+    assert result["confirmed_direction"] == "agentic-ui-automation"
+    assert "界面智能体自动化" in result["updated_topics"]
+    assert updated_profile["core_directions"]["agentic-ui-automation"] == 0.8
+    assert updated_profile["topic_weights"]["agentic-ui-automation"] == 0.8
+    assert confirmed_entry is not None
+    assert "agentic ui automation" in confirmed_entry["aliases"]
 
 
 def test_detect_intent_does_not_treat_general_research_text_as_cold_start_when_profile_exists(monkeypatch):

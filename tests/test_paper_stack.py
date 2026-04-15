@@ -799,6 +799,15 @@ def test_extract_topics_from_title_recognizes_bio_science_signals():
     assert "science-discovery" in topics
 
 
+def test_extract_topics_from_title_recognizes_ai_detection_signals():
+    topics = daily_push_agent.extract_topics_from_title(
+        "AI-Generated Content Detection with a Deepfake Detector for Synthetic Media"
+    )
+
+    assert "ai-detection" in topics
+    assert "detection" in topics
+
+
 def test_categorize_papers_filters_quality_only_items():
     profile = {
         "interest_vector": [1.0, 0.0, 0.0, 0.0],
@@ -937,6 +946,34 @@ def test_format_push_card_shows_must_read_hit_reason():
 
     assert "🔒 必读清单命中（1 篇）" in card
     assert "命中：作者：cheng tan；机构：tsinghua；关键词：protein-folding" in card
+
+
+def test_format_push_card_preserves_full_titles():
+    long_title = (
+        "A Very Long Paper Title About Scientific Recommendation, Interest Drift, "
+        "and Human-in-the-Loop Preference Learning Across Dynamic Research Directions"
+    )
+    scored_papers = [
+        daily_push_agent.PaperWithScore(
+            paper={
+                "title": long_title,
+                "authors": ["Alice Smith"],
+                "categories": ["cs.AI"],
+            },
+            score=0.81,
+            category="high_relevant",
+            relevance_signal=0.92,
+        )
+    ]
+
+    card = daily_push_agent.format_push_card(
+        scored_papers,
+        profile={"must_read": {"authors": [], "institutions": [], "keywords": []}},
+        date="04-15",
+        total_fetched=1,
+    )
+
+    assert long_title in card
 
 
 def test_fetch_and_process_papers_passes_days_to_journal_fetcher(monkeypatch):
@@ -1102,6 +1139,32 @@ def test_apply_source_diversity_quota_keeps_single_source_results():
     balanced = daily_push_agent.apply_source_diversity_quota(papers, weights)
 
     assert [paper.paper["title"] for paper in balanced] == [paper.paper["title"] for paper in papers]
+
+
+def test_apply_push_count_limit_does_not_reserve_slots_for_must_read_hits():
+    weights = {
+        "push_target_count": 1,
+        "push_max_count": 2,
+    }
+    papers = [
+        daily_push_agent.PaperWithScore(
+            paper={"title": "Top Relevant", "source": "arxiv"},
+            score=0.92,
+            category="high_relevant",
+            relevance_signal=0.92,
+        ),
+        daily_push_agent.PaperWithScore(
+            paper={"title": "Soft Must Read", "source": "arxiv"},
+            score=0.31,
+            category="must_read",
+            relevance_signal=0.20,
+        ),
+    ]
+
+    limited = daily_push_agent.apply_push_count_limit(papers, weights)
+
+    assert len(limited) == 1
+    assert limited[0].paper["title"] == "Top Relevant"
 
 
 def test_save_paper_persists_embedding_payload(test_db_path):

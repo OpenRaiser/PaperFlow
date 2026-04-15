@@ -274,3 +274,45 @@ def test_process_feedback_skips_reading_report_generation_when_feishu_send_disab
 
     assert result["status"] == "success"
     assert result["reading_reports_created"] == 0
+
+
+def test_process_feedback_logs_drift_snapshot_for_legacy_profile(test_db_path, sample_profile):
+    _use_test_db(test_db_path)
+
+    legacy_profile = copy.deepcopy(sample_profile)
+    legacy_profile["user_id"] = "user_rolea"
+    legacy_profile.pop("drift_state", None)
+    db_ops.create_profile("user_rolea", legacy_profile)
+
+    result = feedback_agent.process_feedback(
+        user_id="user_rolea",
+        push_id="push_drift",
+        reply="1",
+        papers=[
+            {
+                "id": 1,
+                "title": "RoleA Paper",
+                "authors": ["Alice"],
+                "keywords": ["gui-agent"],
+                "embedding": [1.0, 0.0, 0.0],
+                "category": "high_relevant",
+            },
+            {
+                "id": 2,
+                "title": "Skipped Paper",
+                "authors": ["Bob"],
+                "keywords": ["bio-molecular"],
+                "embedding": [0.0, 1.0, 0.0],
+                "category": "maybe_interested",
+            },
+        ],
+        send_to_feishu=False,
+    )
+    updated_profile = db_ops.get_profile("user_rolea")
+    logs = db_ops.get_behavior_logs("user_rolea", "2000-01-01", "2100-01-01")
+    drift_logs = [log for log in logs if log["action"] == "profile_updated" and log["action_type"] == "drift_update"]
+
+    assert result["status"] == "success"
+    assert "drift_state" in updated_profile
+    assert updated_profile["drift_state"]["status"] in {"stable", "shifting", "recovered"}
+    assert len(drift_logs) == 1

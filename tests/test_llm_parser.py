@@ -12,6 +12,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 llm_parser = importlib.import_module("agents.master-coordinator.scripts.llm_parser")
 profile_updater = importlib.import_module("skills.profile-updater.scripts.update_profile")
+direction_lexicon = importlib.import_module("config.direction_lexicon")
 
 
 def test_get_openai_client_skips_placeholder_key(monkeypatch):
@@ -602,18 +603,19 @@ def test_parse_research_directions_returns_fast_candidates_without_llm(monkeypat
     monkeypatch.setattr(llm_parser, "_generate_json_with_openai", fail_openai)
 
     result = llm_parser.parse_research_directions(
-        "I am interested in protein language model and embodied ai",
+        "I am interested in protein language model and GUI agent",
         auto_learn=False,
     )
 
     names = [item["name"] for item in result]
     assert "protein-language-model" in names
-    assert "embodied-ai" in names
+    assert "gui-agent" in names
 
 
-def test_parse_research_directions_falls_back_after_openai_timeout(monkeypatch):
+def test_normalize_research_directions_falls_back_to_pending_after_openai_timeout(monkeypatch, tmp_path):
     monkeypatch.setenv("LLM_PARSER_PROVIDER", "openai")
     monkeypatch.setenv("LLM_PARSER_DIRECTION_TIMEOUT", "9")
+    monkeypatch.setattr(direction_lexicon, "PENDING_PATH", tmp_path / "direction_pending.json")
 
     captured = {}
 
@@ -624,11 +626,12 @@ def test_parse_research_directions_falls_back_after_openai_timeout(monkeypatch):
     monkeypatch.setattr(llm_parser, "_generate_json_with_openai", fake_openai)
     monkeypatch.setattr(llm_parser, "_looks_like_explicit_direction_description", lambda text: False)
 
-    result = llm_parser.parse_research_directions(
+    result = llm_parser.normalize_research_directions(
         "scientific planning for protein design",
-        auto_learn=False,
+        auto_persist_known_aliases=False,
+        user_id="user_test",
     )
 
     assert captured["timeout_override"] == 9.0
-    names = [item["name"] for item in result]
-    assert "scientific-planning-for-protein-design" in names
+    assert result["canonical_directions"] == []
+    assert result["pending_candidates"][0]["candidate_key"] == "scientific-planning-for-protein-design"

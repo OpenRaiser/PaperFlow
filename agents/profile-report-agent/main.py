@@ -43,6 +43,7 @@ get_selection_stats = db_ops.get_selection_stats
 get_selection_stats_by_category = db_ops.get_selection_stats_by_category
 get_direction_changes = db_ops.get_direction_changes
 get_recent_pushes = db_ops.get_recent_pushes
+get_recent_drift_updates = getattr(db_ops, "get_recent_drift_updates", lambda *args, **kwargs: [])
 get_paper_by_arxiv_id = db_ops.get_paper_by_arxiv_id
 
 
@@ -68,79 +69,6 @@ def translate_direction(direction: str) -> str:
     return translations.get(direction, direction)
 
 
-def generate_weekly_report(user_id: str, days: int = 7) -> Dict[str, Any]:
-    """
-    生成周报
-
-    Args:
-        user_id: 用户 ID
-        days: 统计天数（默认 7 天）
-
-    Returns:
-        周报字典
-    """
-    # 获取用户画像
-    profile = get_profile(user_id)
-    if not profile:
-        return {"error": "Profile not found"}
-
-    # 获取方向权重变化
-    direction_changes = get_direction_changes(user_id, days)
-
-    # 获取统计数据
-    end_date = datetime.now().date()
-    start_date = end_date - timedelta(days=days)
-
-    stats = get_selection_stats(user_id, days)
-    stats_by_category = get_selection_stats_by_category(user_id, days)
-
-    # 获取行为日志
-    logs = get_behavior_logs(
-        user_id,
-        start_date.isoformat(),
-        end_date.isoformat()
-    )
-
-    # 获取最近推送
-    recent_pushes = get_recent_pushes(user_id, limit=100)
-
-    # 分析阅读历史
-    reading_history = profile.get("reading_history", [])
-    recent_reads = [
-        r for r in reading_history
-        if datetime.fromisoformat(r.get("selected_at", "2000-01-01")) >= datetime.combine(start_date, datetime.min.time())
-    ]
-
-    # 统计作者热度变化
-    author_heat = profile.get("author_heat", {})
-    top_authors = sorted(author_heat.items(), key=lambda x: -x[1])[:5]
-
-    # 统计机构热度变化
-    institution_heat = profile.get("institution_heat", {})
-    top_institutions = sorted(institution_heat.items(), key=lambda x: -x[1])[:5]
-
-    # 核心方向
-    core_directions = profile.get("core_directions", {})
-    top_directions = sorted(core_directions.items(), key=lambda x: -x[1])[:7]
-
-    # 检测遗漏的论文（跳过但后来被高引的）
-    missed_papers = _detect_missed_papers(logs, recent_pushes)
-
-    return {
-        "user_id": user_id,
-        "period": f"{start_date.isoformat()} ~ {end_date.isoformat()}",
-        "direction_changes": direction_changes,
-        "stats": stats,
-        "stats_by_category": stats_by_category,
-        "recent_reads_count": len(recent_reads),
-        "top_authors": top_authors,
-        "top_institutions": top_institutions,
-        "top_directions": top_directions,
-        "missed_papers": missed_papers,
-        "profile_version": profile.get("version", "unknown"),
-    }
-
-
 def _detect_missed_papers(logs: List[Dict], recent_pushes: List[Dict]) -> List[Dict]:
     """
     检测遗漏的论文（用户跳过但可能重要的）
@@ -155,130 +83,6 @@ def _detect_missed_papers(logs: List[Dict], recent_pushes: List[Dict]) -> List[D
     # 简化版：返回空列表（完整版需要调用外部 API 获取引用情况）
     # TODO: 集成 arxiv-fetcher 获取引用次数
     return []
-
-
-def format_report_card(report: Dict) -> str:
-    """
-    格式化周报卡片（按照 spec 格式）
-
-    Args:
-        report: 周报字典
-
-    Returns:
-        格式化文本
-    """
-    lines = []
-    lines.append("=" * 60)
-    lines.append(f"📊 你的学术画像周度报告 | {report.get('period', 'N/A')}")
-    lines.append("=" * 60)
-    lines.append("")
-
-    # 方向权重变化
-    direction_changes = report.get("direction_changes", [])
-    if direction_changes:
-        lines.append("━━━ 方向权重变化 ━━━")
-        for change in direction_changes[:7]:  # 最多显示 7 个方向
-            direction = change["direction"]
-            direction_cn = translate_direction(direction)
-            current = change["current_weight"]
-            previous = change["previous_weight"]
-            delta = change["delta"]
-            trend = change["trend"]
-
-            # 进度条（20 格满格）
-            bar_len = int(current * 20)
-            bar = "█" * bar_len + "░" * (20 - bar_len)
-
-            if trend == "up":
-                trend_str = f"→{previous:.2f} ↑"
-            elif trend == "down":
-                trend_str = f"→{previous:.2f} ↓"
-            else:
-                trend_str = "不变"
-
-            # 新增方向
-            if previous == 0 and current > 0:
-                lines.append(f"【新增】{direction_cn}  [{bar}]  {current:.2f} ← 新出现的兴趣")
-            else:
-                lines.append(f"{direction_cn}  [{bar}]  {current:.2f} ({trend_str})")
-
-                # 下降方向标注
-                if trend == "down" and delta < -0.05:
-                    lines[-1] += " ← 权重下降"
-        lines.append("")
-
-    # 本周阅读统计
-    stats = report.get("stats", {})
-    lines.append("━━━ 本周阅读统计 ━━━")
-    lines.append(f"推送论文总数：{stats.get('total', 0)}")
-    lines.append(f"你选择精读：{stats.get('selected', 0)}（选择率 {stats.get('selection_rate', 0):.1%}）")
-    lines.append("")
-
-    # 推荐准确率（按🔴🟡🔵分类）
-    stats_by_category = report.get("stats_by_category", {})
-    if stats_by_category:
-        lines.append("━━━ 推荐准确率 ━━━")
-        # 映射 category key 到 emoji
-        category_map = {
-            "high_relevant": "🔴",
-            "maybe_interested": "🟡",
-            "edge_relevant": "🔵",
-            "must_read_manager": "🔒",
-        }
-        category_names = {
-            "high_relevant": "高度相关",
-            "maybe_interested": "可能感兴趣",
-            "edge_relevant": "边缘相关",
-            "must_read_manager": "必读清单",
-        }
-        for cat_key, emoji in category_map.items():
-            if cat_key in stats_by_category:
-                cat_stats = stats_by_category[cat_key]
-                rate = cat_stats.get("selection_rate", 0)
-                cat_name = category_names.get(cat_key, cat_key)
-                lines.append(f"{emoji}{cat_name}中你选择了：{rate:.0%}")
-        lines.append("")
-
-    # 高频作者
-    top_authors = report.get("top_authors", [])
-    if top_authors:
-        lines.append("━━━ 👥 高频作者 ━━━")
-        for author, heat in top_authors:
-            lines.append(f"  • {author} (热度：{heat:.2f})")
-        lines.append("")
-
-    # 高频机构
-    top_institutions = report.get("top_institutions", [])
-    if top_institutions:
-        lines.append("━━━ 🏛️ 高频机构 ━━━")
-        for inst, heat in top_institutions:
-            lines.append(f"  • {inst} (热度：{heat:.2f})")
-        lines.append("")
-
-    # 遗漏检测
-    missed_papers = report.get("missed_papers", [])
-    if missed_papers:
-        lines.append("━━━ 你可能遗漏的 ━━━")
-        for paper in missed_papers[:3]:  # 最多显示 3 篇
-            lines.append(f"[{paper.get('title', 'Unknown')}]")
-        lines.append("→ 要补读吗？")
-        lines.append("")
-
-    # 画像调整建议
-    lines.append("━━━ 画像调整建议 ━━━")
-    suggestions = _generate_suggestions(report)
-    if suggestions:
-        for sug in suggestions[:5]:  # 最多 5 条建议
-            lines.append(f"• {sug}")
-    else:
-        lines.append("画像状态良好，继续保持！")
-    lines.append("")
-
-    lines.append("=" * 60)
-    lines.append("新的一周，继续探索！")
-    lines.append("=" * 60)
-
-    return "\n".join(lines)
 
 
 def _generate_suggestions(report: Dict) -> List[str]:
@@ -307,6 +111,192 @@ def _generate_suggestions(report: Dict) -> List[str]:
             suggestions.append(f"建议将\"{direction_cn}\"正式加入关注方向")
 
     return suggestions
+
+
+def _build_drift_summary(profile: Dict[str, Any], drift_updates: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Aggregate current and recent drift signals for the weekly report."""
+    drift_state = (profile or {}).get("drift_state", {}) or {}
+    status = drift_state.get("status", "stable")
+    max_score = float(drift_state.get("score", 0.0) or 0.0)
+    explanation = drift_state.get("explanation", "")
+    top_shift_topics = list(drift_state.get("top_shift_topics", []) or [])
+    detected_at = drift_state.get("detected_at")
+
+    for update in drift_updates:
+        metadata = update.get("metadata", {}) or {}
+        max_score = max(max_score, float(metadata.get("drift_score", update.get("drift_score", 0.0)) or 0.0))
+        if not explanation and metadata.get("explanation"):
+            explanation = metadata.get("explanation")
+        if not top_shift_topics and metadata.get("top_shift_topics"):
+            top_shift_topics = list(metadata.get("top_shift_topics") or [])
+        if not detected_at and metadata.get("drift_status") == "shifting":
+            detected_at = update.get("timestamp")
+
+    return {
+        "status": status,
+        "status_label": {
+            "stable": "稳定",
+            "shifting": "迁移中",
+            "recovered": "已恢复",
+        }.get(status, "稳定"),
+        "max_score": round(max_score, 4),
+        "detected_at": detected_at,
+        "top_shift_topics": top_shift_topics[:3],
+        "explanation": explanation or "近期兴趣稳定，系统继续以长期画像为主。",
+    }
+
+
+def generate_weekly_report(user_id: str, days: int = 7) -> Dict[str, Any]:
+    """Generate the weekly report, including drift-awareness summary."""
+    profile = get_profile(user_id)
+    if not profile:
+        return {"error": "Profile not found"}
+
+    end_date = datetime.now().date()
+    start_date = end_date - timedelta(days=days)
+
+    direction_changes = get_direction_changes(user_id, days)
+    stats = get_selection_stats(user_id, days)
+    stats_by_category = get_selection_stats_by_category(user_id, days)
+    logs = get_behavior_logs(user_id, start_date.isoformat(), end_date.isoformat())
+    recent_pushes = get_recent_pushes(user_id, limit=100)
+    drift_updates = get_recent_drift_updates(user_id, days)
+
+    reading_history = profile.get("reading_history", [])
+    recent_reads = [
+        item for item in reading_history
+        if datetime.fromisoformat(item.get("selected_at", "2000-01-01")) >= datetime.combine(start_date, datetime.min.time())
+    ]
+
+    author_heat = profile.get("author_heat", {})
+    top_authors = sorted(author_heat.items(), key=lambda item: -item[1])[:5]
+
+    institution_heat = profile.get("institution_heat", {})
+    top_institutions = sorted(institution_heat.items(), key=lambda item: -item[1])[:5]
+
+    core_directions = profile.get("core_directions", {})
+    top_directions = sorted(core_directions.items(), key=lambda item: -item[1])[:7]
+
+    return {
+        "user_id": user_id,
+        "period": f"{start_date.isoformat()} ~ {end_date.isoformat()}",
+        "direction_changes": direction_changes,
+        "stats": stats,
+        "stats_by_category": stats_by_category,
+        "recent_reads_count": len(recent_reads),
+        "top_authors": top_authors,
+        "top_institutions": top_institutions,
+        "top_directions": top_directions,
+        "missed_papers": _detect_missed_papers(logs, recent_pushes),
+        "profile_version": profile.get("version", "unknown"),
+        "drift_summary": _build_drift_summary(profile, drift_updates),
+    }
+
+
+def format_report_card(report: Dict) -> str:
+    """Format the weekly report card with a drift-awareness section."""
+    lines = []
+    lines.append("=" * 60)
+    lines.append(f"📋 你的学术画像周度报告 | {report.get('period', 'N/A')}")
+    lines.append("=" * 60)
+    lines.append("")
+
+    drift_summary = report.get("drift_summary", {})
+    if drift_summary:
+        lines.append("━━━ 兴趣迁移状态 ━━━")
+        lines.append(f"当前状态：{drift_summary.get('status_label', '稳定')}")
+        lines.append(f"本周最高漂移分数：{drift_summary.get('max_score', 0.0):.2f}")
+        if drift_summary.get("detected_at"):
+            lines.append(f"最近一次检测时间：{drift_summary.get('detected_at')}")
+        if drift_summary.get("top_shift_topics"):
+            lines.append(f"最近漂移主题：{', '.join(drift_summary.get('top_shift_topics', [])[:3])}")
+        lines.append(f"更新器解释：{drift_summary.get('explanation', '')}")
+        lines.append("")
+
+    direction_changes = report.get("direction_changes", [])
+    if direction_changes:
+        lines.append("━━━ 方向权重变化 ━━━")
+        for change in direction_changes[:7]:
+            direction_cn = translate_direction(change["direction"])
+            current = change["current_weight"]
+            previous = change["previous_weight"]
+            delta = change["delta"]
+            trend = change["trend"]
+            bar_len = int(current * 20)
+            bar = "█" * bar_len + "░" * (20 - bar_len)
+            if trend == "up":
+                trend_str = f"{previous:.2f} → {current:.2f}"
+            elif trend == "down":
+                trend_str = f"{previous:.2f} → {current:.2f}"
+            else:
+                trend_str = "不变"
+            if previous == 0 and current > 0:
+                lines.append(f"【新增】{direction_cn} [{bar}] {current:.2f} → 新出现的兴趣")
+            else:
+                text = f"{direction_cn} [{bar}] {current:.2f} ({trend_str})"
+                if trend == "down" and delta < -0.05:
+                    text += " → 权重下降"
+                lines.append(text)
+        lines.append("")
+
+    stats = report.get("stats", {})
+    lines.append("━━━ 本周阅读统计 ━━━")
+    lines.append(f"推送论文总数：{stats.get('total', 0)}")
+    lines.append(f"你选择精读：{stats.get('selected', 0)}（选择率 {stats.get('selection_rate', 0):.1%}）")
+    lines.append("")
+
+    stats_by_category = report.get("stats_by_category", {})
+    if stats_by_category:
+        lines.append("━━━ 推荐准确率 ━━━")
+        category_map = {
+            "high_relevant": ("🔴", "高度相关"),
+            "maybe_interested": ("🟡", "可能感兴趣"),
+            "edge_relevant": ("🔵", "边缘相关"),
+            "must_read": ("🔒", "必读清单"),
+            "must_read_manager": ("🔒", "必读清单"),
+        }
+        for cat_key, (emoji, label) in category_map.items():
+            if cat_key not in stats_by_category:
+                continue
+            rate = stats_by_category[cat_key].get("selection_rate", 0)
+            lines.append(f"{emoji}{label}中你选择了：{rate:.0%}")
+        lines.append("")
+
+    top_authors = report.get("top_authors", [])
+    if top_authors:
+        lines.append("━━━ 👥 高频作者 ━━━")
+        for author, heat in top_authors:
+            lines.append(f"  · {author} (热度：{heat:.2f})")
+        lines.append("")
+
+    top_institutions = report.get("top_institutions", [])
+    if top_institutions:
+        lines.append("━━━ 🏛️ 高频机构 ━━━")
+        for institution, heat in top_institutions:
+            lines.append(f"  · {institution} (热度：{heat:.2f})")
+        lines.append("")
+
+    missed_papers = report.get("missed_papers", [])
+    if missed_papers:
+        lines.append("━━━ 你可能遗漏的 ━━━")
+        for paper in missed_papers[:3]:
+            lines.append(f"[{paper.get('title', 'Unknown')}]")
+        lines.append("→ 要补读吗？")
+        lines.append("")
+
+    lines.append("━━━ 画像调整建议 ━━━")
+    suggestions = _generate_suggestions(report)
+    if suggestions:
+        for suggestion in suggestions[:5]:
+            lines.append(f"· {suggestion}")
+    else:
+        lines.append("画像状态良好，继续保持。")
+    lines.append("")
+
+    lines.append("=" * 60)
+    lines.append("新的一周，继续探索！")
+    lines.append("=" * 60)
+    return "\n".join(lines)
 
 
 def load_roles_meta() -> Dict[str, Any]:

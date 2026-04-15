@@ -518,7 +518,7 @@ def _build_direction_alias_map(lexicon: Dict[str, Any]) -> Dict[str, Dict[str, A
 
     for direction_key, data in (lexicon or {}).items():
         payload = {
-            "name": _normalize_direction_key(direction_key) or str(direction_key),
+            "name": _normalize_direction_key(data.get("canonical_name") or direction_key) or str(direction_key),
             "name_cn": str(data.get("name_cn") or data.get("name") or direction_key),
             "is_known": True,
             "_auto_learn": False,
@@ -526,6 +526,11 @@ def _build_direction_alias_map(lexicon: Dict[str, Any]) -> Dict[str, Dict[str, A
         register(direction_key, payload)
         register(data.get("name"), payload)
         register(data.get("name_cn"), payload)
+        register(data.get("canonical_name"), payload)
+        for alias in data.get("aliases", []) or []:
+            register(alias, payload)
+        for keyword in data.get("paper_terms", []) or []:
+            register(keyword, payload)
         for keyword in data.get("keywords", []) or []:
             register(keyword, payload)
 
@@ -665,6 +670,232 @@ def _normalize_direction_results(
         normalized_directions.append(normalized_direction)
 
     return normalized_directions[:3]
+
+
+def normalize_research_directions(
+    text: str,
+    *,
+    auto_persist_known_aliases: bool = True,
+    user_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Normalize free-form user direction text into canonical directions.
+
+    Returns:
+        {
+            "canonical_directions": [...],
+            "temporary_matches": [...],
+            "pending_candidates": [...],
+            "explanations": [...],
+        }
+    """
+    from config.direction_lexicon import (
+        add_direction_alias,
+        get_direction_entry,
+        load_lexicon,
+        resolve_canonical_direction,
+        upsert_pending_direction_candidate,
+    )
+
+    lexicon = load_lexicon()
+    alias_map = _build_direction_alias_map(lexicon)
+    heuristic_candidates = _normalize_direction_results(
+        _extract_direction_candidates_fast(text, alias_map),
+        alias_map,
+    )
+
+    if heuristic_candidates and (
+        _looks_like_explicit_direction_description(text) or len(heuristic_candidates) >= 2
+    ):
+        final_directions = heuristic_candidates
+    else:
+        known_directions = [
+            _DIRECTION_DISPLAY_MAP.get(direction_key, direction_key.replace("-", " ").title())
+            for direction_key in KNOWN_DIRECTIONS
+        ] + [
+            str(data.get("name_cn") or data.get("name") or "").strip()
+            for data in lexicon.values()
+            if str(data.get("name_cn") or data.get("name") or "").strip()
+        ]
+
+        candidate_hint = ""
+        if heuristic_candidates:
+            candidate_hint = "Fast candidate phrases: " + ", ".join(
+                direction.get("source_text") or direction.get("name_cn") or direction.get("name")
+                for direction in heuristic_candidates
+            )
+
+        system_prompt = (
+            "You extract up to 3 research directions from a user's self-description.\n"
+            "Keep multi-word phrases intact and prefer specific topics over broad umbrellas.\n"
+            "Do not split phrases like 'protein language model' or 'world model for epidemiology'.\n"
+            f"Known directions include: {', '.join(known_directions[:40])}.\n"
+            f"{candidate_hint}\n"
+            "Return JSON only in this format:\n"
+            "{\n"
+            '  "directions": [\n'
+            "    {\n"
+            '      "name": "english-kebab-case-or-best-normalized-name",\n'
+            '      "name_cn": "Chinese display name",\n'
+            '      "confidence": 0.0,\n'
+            '      "source_text": "matched phrase from the user text",\n'
+            '      "is_known": true\n'
+            "    }\n"
+            "  ]\n"
+            "}\n"
+            "If the user names a new direction, still extract it.\n"
+            "Return at most 3 directions."
+        )
+
+        result = _generate_json_with_configured_llm(
+            system_prompt=system_prompt,
+            user_text=text,
+            max_tokens=160,
+            timeout_override=_get_direction_parser_timeout(),
+        )
+        llm_directions = (
+            _normalize_direction_results(result.get("directions", []), alias_map)
+            if isinstance(result, dict)
+            else []
+        )
+
+        final_directions = []
+        seen_names: set[str] = set()
+        for bucket in (llm_directions, heuristic_candidates):
+            for direction in bucket:
+                name = str(direction.get("name") or "").strip()
+                if not name or name in seen_names:
+                    continue
+                seen_names.add(name)
+                final_directions.append(direction)
+                if len(final_directions) >= 3:
+                    break
+            if len(final_directions) >= 3:
+                break
+
+    normalized_input = re.sub(r"\s+", " ", str(text or "").strip())
+    token_count = len(re.findall(r"[\w\u4e00-\u9fff]+", normalized_input, flags=re.UNICODE))
+    if not final_directions and normalized_input and token_count <= 10 and len(normalized_input) <= 80:
+        pending = upsert_pending_direction_candidate(
+            normalized_input,
+            proposed_name=normalized_input,
+            proposed_name_cn=normalized_input,
+            confidence=0.0,
+            user_id=user_id,
+            reason="parser_fallback_pending",
+        )
+        return {
+            "canonical_directions": [],
+            "temporary_matches": [],
+            "pending_candidates": [pending],
+            "explanations": [
+                f"发现候选新方向：{pending['name_cn']}，回复“确认方向：{pending['name_cn']}”后纳入统一方向库。"
+            ],
+        }
+
+    canonical_directions: List[Dict[str, Any]] = []
+    temporary_matches: List[Dict[str, Any]] = []
+    pending_candidates: List[Dict[str, Any]] = []
+    explanations: List[str] = []
+    seen_canonical: set[str] = set()
+    seen_pending: set[str] = set()
+
+    for direction in final_directions:
+        raw_name = str(direction.get("name") or "").strip()
+        source_text = str(direction.get("source_text") or direction.get("name_cn") or raw_name).strip()
+        try:
+            confidence = max(0.0, min(1.0, float(direction.get("confidence", 0.0))))
+        except (TypeError, ValueError):
+            confidence = 0.0
+
+        source_resolution = resolve_canonical_direction(
+            source_text,
+            lexicon=lexicon,
+            include_paper_terms=True,
+        )
+        target_resolution = resolve_canonical_direction(
+            raw_name,
+            lexicon=lexicon,
+            include_paper_terms=True,
+        ) or source_resolution
+
+        if target_resolution:
+            canonical_name = target_resolution["canonical_name"]
+            known_by_source = bool(
+                source_resolution and source_resolution["canonical_name"] == canonical_name
+            )
+
+            if known_by_source or confidence >= 0.60:
+                entry = get_direction_entry(canonical_name, lexicon=lexicon) or target_resolution["entry"]
+                if canonical_name not in seen_canonical:
+                    seen_canonical.add(canonical_name)
+                    canonical_directions.append(
+                        {
+                            "name": canonical_name,
+                            "name_cn": str(entry.get("name_cn") or entry.get("name") or canonical_name),
+                            "confidence": round(confidence, 4),
+                            "source_text": source_text,
+                            "is_known": True,
+                        }
+                    )
+
+            if not known_by_source and source_text:
+                display_name = str(
+                    (get_direction_entry(canonical_name, lexicon=lexicon) or {}).get("name_cn")
+                    or canonical_name
+                )
+                if confidence >= 0.85:
+                    if auto_persist_known_aliases and add_direction_alias(canonical_name, source_text):
+                        lexicon = load_lexicon()
+                    explanations.append(f"已将“{source_text}”归一为“{display_name}”。")
+                elif confidence >= 0.60:
+                    temporary_matches.append(
+                        {
+                            "source_text": source_text,
+                            "canonical_name": canonical_name,
+                            "canonical_display_name": display_name,
+                            "confidence": round(confidence, 4),
+                        }
+                    )
+                    explanations.append(f"本轮已将“{source_text}”临时归一为“{display_name}”。")
+                else:
+                    pending = upsert_pending_direction_candidate(
+                        source_text,
+                        proposed_name=raw_name or source_text,
+                        proposed_name_cn=direction.get("name_cn") or source_text,
+                        confidence=confidence,
+                        user_id=user_id,
+                        reason="low_confidence_alias_mapping",
+                    )
+                    if pending["candidate_key"] not in seen_pending:
+                        seen_pending.add(pending["candidate_key"])
+                        pending_candidates.append(pending)
+                        explanations.append(
+                            f"发现候选新方向：{pending['name_cn']}，回复“确认方向：{pending['name_cn']}”后纳入统一方向库。"
+                        )
+            continue
+
+        pending = upsert_pending_direction_candidate(
+            source_text or raw_name,
+            proposed_name=raw_name or source_text,
+            proposed_name_cn=direction.get("name_cn") or source_text or raw_name,
+            confidence=confidence,
+            user_id=user_id,
+            reason="novel_direction_candidate",
+        )
+        if pending["candidate_key"] not in seen_pending:
+            seen_pending.add(pending["candidate_key"])
+            pending_candidates.append(pending)
+            explanations.append(
+                f"发现候选新方向：{pending['name_cn']}，回复“确认方向：{pending['name_cn']}”后纳入统一方向库。"
+            )
+
+    return {
+        "canonical_directions": canonical_directions[:3],
+        "temporary_matches": temporary_matches[:3],
+        "pending_candidates": pending_candidates[:3],
+        "explanations": explanations[:6],
+    }
 
 
 def _get_local_llm_backend(force_device: Optional[str] = None) -> Optional[Dict[str, Any]]:
@@ -1182,6 +1413,28 @@ def parse_research_directions(text: str, auto_learn: bool = True) -> List[Dict[s
     return [
         {key: value for key, value in direction.items() if not key.startswith("_")}
         for direction in final_directions
+    ]
+
+
+def parse_research_directions(text: str, auto_learn: bool = True) -> List[Dict[str, Any]]:
+    """
+    Return canonical directions only.
+
+    Unknown directions are kept in the pending store until the user confirms them.
+    """
+    normalized = normalize_research_directions(
+        text,
+        auto_persist_known_aliases=auto_learn,
+    )
+    return [
+        {
+            "name": direction.get("name"),
+            "name_cn": direction.get("name_cn"),
+            "confidence": direction.get("confidence", 0.0),
+            "source_text": direction.get("source_text", ""),
+            "is_known": direction.get("is_known", True),
+        }
+        for direction in normalized.get("canonical_directions", [])
     ]
 
 

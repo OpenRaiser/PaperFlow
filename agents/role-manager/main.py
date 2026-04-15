@@ -38,6 +38,8 @@ db_ops = importlib.import_module("skills.storage-helper.scripts.db_ops")
 get_profile = db_ops.get_profile
 create_profile = db_ops.create_profile
 update_profile = db_ops.update_profile
+profile_updater = importlib.import_module("skills.profile-updater.scripts.update_profile")
+build_default_drift_state = profile_updater.build_default_drift_state
 
 # 飞书报告器
 feishu_reporter = importlib.import_module("skills.feishu-reporter.scripts.feishu_reporter")
@@ -121,6 +123,7 @@ def create_role(role_name: str, description: str = "", natural_language: str = "
         "taste_profile": {},
         "reading_history": [],
         "behavior_logs": [],
+        "drift_state": build_default_drift_state(),
         "feishu_chat_id": feishu_chat_id,  # 画像中也存储飞书群 ID
     }
 
