@@ -23,6 +23,7 @@ canonicalize_direction_terms = direction_lexicon.canonicalize_direction_terms
 canonicalize_weight_mapping = direction_lexicon.canonicalize_weight_mapping
 expand_direction_terms = direction_lexicon.expand_direction_terms
 get_direction_entry = direction_lexicon.get_direction_entry
+get_lexicon_keywords = direction_lexicon.get_lexicon_keywords
 resolve_canonical_direction = direction_lexicon.resolve_canonical_direction
 
 
@@ -70,6 +71,17 @@ def _drift_config() -> Dict[str, float]:
         "skipped_topic_delta": _get_env_float("SCITASTE_TOPIC_NEGATIVE_DELTA", 0.01),
         "author_positive_delta": _get_env_float("SCITASTE_AUTHOR_HEAT_POSITIVE_DELTA", 0.05),
         "institution_positive_delta": _get_env_float("SCITASTE_INSTITUTION_HEAT_POSITIVE_DELTA", 0.05),
+        "reading_signal_window_days": _get_env_int("SCITASTE_READING_SIGNAL_WINDOW_DAYS", 21),
+        "reading_signal_activation_count": _get_env_int("SCITASTE_READING_SIGNAL_ACTIVATION_COUNT", 2),
+        "reading_signal_topic_seed_weak": _get_env_float("SCITASTE_READING_SIGNAL_TOPIC_SEED_WEAK", 0.18),
+        "reading_signal_topic_seed_strong": _get_env_float("SCITASTE_READING_SIGNAL_TOPIC_SEED_STRONG", 0.38),
+        "reading_signal_topic_delta_weak": _get_env_float("SCITASTE_READING_SIGNAL_TOPIC_DELTA_WEAK", 0.03),
+        "reading_signal_topic_delta_strong": _get_env_float("SCITASTE_READING_SIGNAL_TOPIC_DELTA_STRONG", 0.08),
+        "reading_signal_core_seed_strong": _get_env_float("SCITASTE_READING_SIGNAL_CORE_SEED_STRONG", 0.45),
+        "reading_signal_core_delta_strong": _get_env_float("SCITASTE_READING_SIGNAL_CORE_DELTA_STRONG", 0.08),
+        "reading_signal_short_term_base": _get_env_float("SCITASTE_READING_SIGNAL_SHORT_TERM_BASE", 0.35),
+        "reading_signal_short_term_step": _get_env_float("SCITASTE_READING_SIGNAL_SHORT_TERM_STEP", 0.18),
+        "reading_signal_short_term_strong_bonus": _get_env_float("SCITASTE_READING_SIGNAL_SHORT_TERM_STRONG_BONUS", 0.22),
     }
 
 
@@ -111,6 +123,24 @@ def build_default_drift_state(now_iso: Optional[str] = None) -> Dict[str, Any]:
         "adaptive_alpha": _drift_config()["alpha_base"],
         "top_shift_topics": [],
         "explanation": "近期兴趣稳定，系统继续以长期画像为主。",
+    }
+
+
+def build_default_reading_signal_state() -> Dict[str, Any]:
+    return {
+        "recent_topics": {},
+        "short_term_topics": {},
+        "last_signal_at": None,
+        "last_explicit_signal_at": None,
+        "last_signal": {
+            "timestamp": None,
+            "topics": [],
+            "activated_topics": [],
+            "strength": "",
+            "source_type": "",
+            "source_key": "",
+            "explicit_note": "",
+        },
     }
 
 
@@ -162,6 +192,53 @@ def ensure_profile_schema(profile: Optional[Dict[str, Any]], now: Optional[datet
         normalized["drift_state"].get("top_shift_topics", []),
         keep_unknown=True,
     )
+
+    reading_signal_state = normalized.get("reading_signal_state")
+    default_reading_signal_state = build_default_reading_signal_state()
+    normalized["reading_signal_state"] = (
+        copy.deepcopy(reading_signal_state)
+        if isinstance(reading_signal_state, dict)
+        else copy.deepcopy(default_reading_signal_state)
+    )
+    for key, default_value in default_reading_signal_state.items():
+        normalized["reading_signal_state"].setdefault(key, copy.deepcopy(default_value))
+
+    raw_recent_topics = normalized["reading_signal_state"].get("recent_topics")
+    normalized_recent_topics: Dict[str, Dict[str, Any]] = {}
+    if isinstance(raw_recent_topics, dict):
+        for topic, payload in raw_recent_topics.items():
+            canonical_topics = canonicalize_direction_terms([topic], keep_unknown=False)
+            if not canonical_topics or not isinstance(payload, dict):
+                continue
+            canonical_topic = canonical_topics[0]
+            normalized_recent_topics[canonical_topic] = {
+                "count": max(0, int(payload.get("count", 0) or 0)),
+                "strong_count": max(0, int(payload.get("strong_count", 0) or 0)),
+                "last_seen_at": str(payload.get("last_seen_at") or ""),
+            }
+    normalized["reading_signal_state"]["recent_topics"] = normalized_recent_topics
+    normalized["reading_signal_state"]["short_term_topics"] = canonicalize_weight_mapping(
+        normalized["reading_signal_state"].get("short_term_topics", {})
+    )
+
+    last_signal = normalized["reading_signal_state"].get("last_signal")
+    normalized["reading_signal_state"]["last_signal"] = (
+        copy.deepcopy(last_signal)
+        if isinstance(last_signal, dict)
+        else copy.deepcopy(default_reading_signal_state["last_signal"])
+    )
+    normalized["reading_signal_state"]["last_signal"]["topics"] = canonicalize_direction_terms(
+        normalized["reading_signal_state"]["last_signal"].get("topics", []),
+        keep_unknown=False,
+    )
+    normalized["reading_signal_state"]["last_signal"]["activated_topics"] = canonicalize_direction_terms(
+        normalized["reading_signal_state"]["last_signal"].get("activated_topics", []),
+        keep_unknown=False,
+    )
+    for key in ("strength", "source_type", "source_key", "explicit_note", "timestamp"):
+        normalized["reading_signal_state"]["last_signal"][key] = str(
+            normalized["reading_signal_state"]["last_signal"].get(key) or ""
+        )
 
     return normalized
 
@@ -276,6 +353,52 @@ def _normalize_keywords(paper: Dict[str, Any]) -> List[str]:
     for key in ("keywords", "topics", "categories"):
         merged_values.extend(_normalize_string_list(paper.get(key)))
     return canonicalize_direction_terms(merged_values, keep_unknown=True)
+
+
+def infer_reading_signal_topics(
+    paper: Optional[Dict[str, Any]] = None,
+    parsed_pdf: Optional[Dict[str, Any]] = None,
+    *,
+    max_topics: int = 6,
+) -> List[str]:
+    """Infer stable canonical topics from a direct-upload reading signal."""
+    candidates: List[str] = []
+    paper = paper or {}
+    parsed_pdf = parsed_pdf or {}
+
+    for key in ("topics", "keywords", "categories"):
+        candidates.extend(_normalize_string_list(paper.get(key)))
+    candidates.extend(_normalize_string_list(parsed_pdf.get("inferred_topics")))
+
+    for direction in parsed_pdf.get("inferred_directions", []) or []:
+        if not isinstance(direction, dict):
+            continue
+        candidates.append(direction.get("canonical_name") or direction.get("name"))
+
+    canonical_topics = canonicalize_direction_terms(candidates, keep_unknown=False)
+    if canonical_topics:
+        return canonical_topics[:max_topics]
+
+    # Fallback: scan title/abstract/full-text snippets against the shared lexicon.
+    text_parts = [
+        str(paper.get("title") or ""),
+        str(paper.get("abstract") or ""),
+        str(parsed_pdf.get("abstract") or ""),
+        str(parsed_pdf.get("full_text") or "")[:4000],
+    ]
+    probe_text = " ".join(part for part in text_parts if part).lower()
+    if not probe_text:
+        return []
+
+    inferred: List[str] = []
+    for canonical_name, keywords in get_lexicon_keywords().items():
+        for keyword in keywords:
+            keyword_text = str(keyword or "").strip().lower()
+            if keyword_text and keyword_text in probe_text:
+                inferred.append(canonical_name)
+                break
+
+    return canonicalize_direction_terms(inferred, keep_unknown=False)[:max_topics]
 
 
 def _paper_timestamp(paper: Dict[str, Any], now: datetime) -> datetime:
@@ -549,6 +672,160 @@ def _increment_version(version: str) -> str:
         return "0.1"
 
 
+def _bump_topic_weight(
+    current_weights: Dict[str, float],
+    topic: str,
+    *,
+    delta: float,
+    seed_weight: float,
+) -> Dict[str, float]:
+    updated = {str(key): float(value) for key, value in (current_weights or {}).items()}
+    existing = float(updated.get(topic, 0.0) or 0.0)
+    if existing > 0:
+        updated[topic] = min(1.0, existing + float(delta))
+    else:
+        updated[topic] = min(1.0, float(seed_weight))
+    return _round_mapping(updated)
+
+
+def update_profile_with_reading_signal(
+    profile: Dict,
+    *,
+    paper: Optional[Dict[str, Any]] = None,
+    parsed_pdf: Optional[Dict[str, Any]] = None,
+    signal_topics: Optional[List[str]] = None,
+    signal_strength: str = "weak",
+    explicit_text: str = "",
+    current_time: Optional[datetime] = None,
+    source_type: str = "",
+    source_key: str = "",
+) -> Dict[str, Any]:
+    """
+    Apply a conservative reading-side interest signal without touching drift status.
+
+    Rules:
+    - single upload -> weak positive signal only
+    - repeated same-topic uploads/readings -> activate upload short-term interests
+    - explicit phrasing after upload -> strong signal for the same topics
+    """
+    now = current_time or datetime.now()
+    now_iso = now.isoformat()
+    config = _drift_config()
+    updated = ensure_profile_schema(profile, now=now)
+
+    strength = "strong" if str(signal_strength or "").strip().lower() == "strong" or explicit_text.strip() else "weak"
+    topics = canonicalize_direction_terms(
+        signal_topics or infer_reading_signal_topics(paper=paper, parsed_pdf=parsed_pdf),
+        keep_unknown=False,
+    )
+    if not topics:
+        return updated
+
+    state = copy.deepcopy(updated.get("reading_signal_state") or build_default_reading_signal_state())
+    recent_topics: Dict[str, Dict[str, Any]] = {}
+    cutoff = now - timedelta(days=int(config["reading_signal_window_days"]))
+
+    for topic, payload in (state.get("recent_topics") or {}).items():
+        if not isinstance(payload, dict):
+            continue
+        last_seen = _safe_iso_datetime(payload.get("last_seen_at"), fallback=cutoff - timedelta(days=1))
+        if last_seen < cutoff:
+            continue
+        canonical_topics = canonicalize_direction_terms([topic], keep_unknown=False)
+        if not canonical_topics:
+            continue
+        canonical_topic = canonical_topics[0]
+        recent_topics[canonical_topic] = {
+            "count": max(0, int(payload.get("count", 0) or 0)),
+            "strong_count": max(0, int(payload.get("strong_count", 0) or 0)),
+            "last_seen_at": str(payload.get("last_seen_at") or ""),
+        }
+
+    activated_topics: Dict[str, float] = {}
+    for topic in topics:
+        payload = recent_topics.get(
+            topic,
+            {"count": 0, "strong_count": 0, "last_seen_at": now_iso},
+        )
+        payload["count"] = int(payload.get("count", 0) or 0) + 1
+        if strength == "strong":
+            payload["strong_count"] = int(payload.get("strong_count", 0) or 0) + 1
+        payload["last_seen_at"] = now_iso
+        recent_topics[topic] = payload
+
+        updated["topic_weights"] = _bump_topic_weight(
+            updated.get("topic_weights", {}),
+            topic,
+            delta=float(
+                config["reading_signal_topic_delta_strong"]
+                if strength == "strong"
+                else config["reading_signal_topic_delta_weak"]
+            ),
+            seed_weight=float(
+                config["reading_signal_topic_seed_strong"]
+                if strength == "strong"
+                else config["reading_signal_topic_seed_weak"]
+            ),
+        )
+
+        if strength == "strong":
+            existing_core = float(updated.get("core_directions", {}).get(topic, 0.0) or 0.0)
+            core_seed = float(config["reading_signal_core_seed_strong"])
+            core_delta = float(config["reading_signal_core_delta_strong"])
+            updated["core_directions"][topic] = round(
+                min(1.0, max(core_seed, existing_core + core_delta if existing_core > 0 else core_seed)),
+                4,
+            )
+
+    activation_count = int(config["reading_signal_activation_count"])
+    short_term_topics: Dict[str, float] = {}
+    for topic, payload in recent_topics.items():
+        count = int(payload.get("count", 0) or 0)
+        strong_count = int(payload.get("strong_count", 0) or 0)
+        if count < activation_count and strong_count <= 0:
+            continue
+
+        strength_score = float(config["reading_signal_short_term_base"])
+        strength_score += max(0, count - activation_count) * float(config["reading_signal_short_term_step"])
+        strength_score += strong_count * float(config["reading_signal_short_term_strong_bonus"])
+        short_term_topics[topic] = round(min(1.0, strength_score), 4)
+        if topic in topics:
+            activated_topics[topic] = short_term_topics[topic]
+
+    state["recent_topics"] = recent_topics
+    state["short_term_topics"] = _round_mapping(short_term_topics)
+    state["last_signal_at"] = now_iso
+    if strength == "strong":
+        state["last_explicit_signal_at"] = now_iso
+    state["last_signal"] = {
+        "timestamp": now_iso,
+        "topics": topics,
+        "activated_topics": list(activated_topics.keys()),
+        "strength": strength,
+        "source_type": str(source_type or ""),
+        "source_key": str(source_key or ""),
+        "explicit_note": str(explicit_text or "").strip(),
+    }
+    updated["reading_signal_state"] = state
+
+    reading_history = list(updated.get("reading_history", []))
+    reading_history.append(
+        {
+            "paper_id": (paper or {}).get("id"),
+            "arxiv_id": (paper or {}).get("arxiv_id"),
+            "selected_at": now_iso,
+            "action": "reading_signal_strong" if strength == "strong" else "reading_signal_weak",
+            "topics": topics,
+            "source_type": str(source_type or ""),
+        }
+    )
+    updated["reading_history"] = reading_history[-200:]
+
+    updated["updated_at"] = now_iso
+    updated["version"] = _increment_version(updated.get("version", "0.1"))
+    return updated
+
+
 def calculate_paper_score(
     paper: Dict,
     profile: Dict,
@@ -692,6 +969,7 @@ def update_profile_with_feedback(
     skipped_papers: List[Dict],
     historical_selected_papers: Optional[List[Dict]] = None,
     current_time: Optional[datetime] = None,
+    feedback_strength_multiplier: float = 1.0,
 ) -> Dict:
     """
     Unified drift-aware profile update entry.
@@ -785,6 +1063,8 @@ def update_profile_with_feedback(
         float(config["alpha_base"]) + drift_intensity * (float(config["alpha_max"]) - float(config["alpha_base"])),
         4,
     )
+    strength_multiplier = _clamp(float(feedback_strength_multiplier or 1.0), 0.5, 1.5)
+    adaptive_alpha = round(_clamp(adaptive_alpha * strength_multiplier, 0.02, float(config["alpha_max"])), 4)
 
     explicit_prior_vector = _explicit_prior_vector(updated, target_dim)
     blend_weights = get_drift_blend_weights(drift_status)
@@ -823,8 +1103,8 @@ def update_profile_with_feedback(
         decayed_topic_weights,
         selected_papers,
         skipped_papers,
-        positive_delta=float(config["selected_topic_delta"]),
-        negative_delta=float(config["skipped_topic_delta"]),
+        positive_delta=float(config["selected_topic_delta"]) * strength_multiplier,
+        negative_delta=float(config["skipped_topic_delta"]) * strength_multiplier,
     )
 
     selected_authors: List[str] = []
@@ -849,7 +1129,7 @@ def update_profile_with_feedback(
         positive_hits=selected_authors,
         decay_rate=float(config["author_decay"]),
         days_inactive=inactivity_days,
-        delta=float(config["author_positive_delta"]),
+        delta=float(config["author_positive_delta"]) * strength_multiplier,
         touched_keys=recent_short_authors,
     )
     updated["institution_heat"] = _update_heat_map(
@@ -857,7 +1137,7 @@ def update_profile_with_feedback(
         positive_hits=selected_institutions,
         decay_rate=float(config["institution_decay"]),
         days_inactive=inactivity_days,
-        delta=float(config["institution_positive_delta"]),
+        delta=float(config["institution_positive_delta"]) * strength_multiplier,
         touched_keys=recent_short_institutions,
     )
 

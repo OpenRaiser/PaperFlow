@@ -21,11 +21,12 @@ import hashlib
 import hmac
 import base64
 import importlib
+import re
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Dict, Any, Optional
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import parse_qs, urlparse
 import logging
 import threading
 import time
@@ -89,9 +90,29 @@ ASYNC_INTENT_DUPLICATE_ACKS = {
     "weekly_report": "当前已有一个周报任务在处理中，请稍候查看本群结果。",
 }
 PDF_ASYNC_ACK = "收到 PDF，正在生成精读报告，请稍候..."
+RECENT_UPLOAD_INTEREST_WINDOW_MINUTES = 30
 INFLIGHT_COORDINATOR_TASKS: set[str] = set()
 INFLIGHT_COORDINATOR_TASKS_LOCK = threading.Lock()
 ASYNC_TASK_LOCK_DIR = PROJECT_ROOT_PATH / "data" / "webhook_task_locks"
+
+
+def looks_like_recent_upload_interest_reinforcement(text: str) -> bool:
+    """Detect short follow-up phrases that likely refer to the latest uploaded PDF."""
+    normalized = str(text or "").strip().lower()
+    if not normalized:
+        return False
+
+    anchor_tokens = ("这类", "这种", "这一类", "这篇", "这个方向", "这条线")
+    intent_tokens = (
+        "想多看",
+        "想多读",
+        "想多关注",
+        "想继续看",
+        "想继续读",
+        "更想看",
+        "更感兴趣",
+    )
+    return any(anchor in normalized for anchor in anchor_tokens) and any(token in normalized for token in intent_tokens)
 
 
 def get_async_task_lock_ttl_seconds() -> int:
@@ -357,6 +378,190 @@ class FeishuEventHandler:
             logger.warning(f"Failed to look up existing PDF report: {exc}")
             return None
 
+    def _find_recent_pdf_interest_signal(self, user_id: str) -> Optional[Dict[str, Any]]:
+        """Return the latest direct-upload reading signal for a user."""
+        if not user_id:
+            return None
+
+        try:
+            db_ops = importlib.import_module("skills.storage-helper.scripts.db_ops")
+            finder = getattr(db_ops, "get_recent_reading_signal", None)
+            if not callable(finder):
+                return None
+            return finder(
+                user_id,
+                minutes=RECENT_UPLOAD_INTEREST_WINDOW_MINUTES,
+                source_prefix="",
+            )
+        except Exception as exc:
+            logger.warning(f"Failed to fetch recent PDF interest signal: {exc}")
+            return None
+
+    def _log_doc_open(self, user_id: str, *, doc_url: str, doc_token: str = "", title: str = "") -> None:
+        if not user_id or not doc_url:
+            return
+        try:
+            db_ops = importlib.import_module("skills.storage-helper.scripts.db_ops")
+            logger_fn = getattr(db_ops, "log_behavior", None)
+            if not callable(logger_fn):
+                return
+            logger_fn(
+                user_id=user_id,
+                push_id="reading_report",
+                paper_id=None,
+                action="opened_report",
+                action_type="doc_open",
+                category="reading_report",
+                metadata={
+                    "doc_url": doc_url,
+                    "doc_token": doc_token,
+                    "paper_title": title,
+                },
+            )
+        except Exception as exc:
+            logger.warning(f"Failed to log doc open: {exc}")
+
+    def _log_pending_doc_dwell_proxy(self, user_id: str) -> None:
+        if not user_id:
+            return
+        try:
+            db_ops = importlib.import_module("skills.storage-helper.scripts.db_ops")
+            finder = getattr(db_ops, "get_pending_doc_open_for_dwell", None)
+            logger_fn = getattr(db_ops, "log_behavior", None)
+            if not callable(finder) or not callable(logger_fn):
+                return
+            pending = finder(user_id, within_minutes=240)
+            if not pending:
+                return
+            opened_at = datetime.fromisoformat(str(pending.get("timestamp")).replace("Z", "+00:00"))
+            now = datetime.now(opened_at.tzinfo) if opened_at.tzinfo else datetime.now()
+            dwell_seconds = max(0.0, min(7200.0, (now - opened_at).total_seconds()))
+            if dwell_seconds < 5:
+                return
+            metadata = pending.get("metadata", {}) or {}
+            logger_fn(
+                user_id=user_id,
+                push_id="reading_report",
+                paper_id=pending.get("paper_id"),
+                action="doc_dwell_proxy",
+                action_type="doc_engagement",
+                category="reading_report",
+                metadata={
+                    "doc_url": metadata.get("doc_url", ""),
+                    "doc_token": metadata.get("doc_token", ""),
+                    "paper_title": metadata.get("paper_title", ""),
+                    "dwell_seconds": round(dwell_seconds, 2),
+                },
+            )
+        except Exception as exc:
+            logger.warning(f"Failed to log doc dwell proxy: {exc}")
+
+    def _handle_recent_upload_interest_reinforcement(
+        self,
+        user_id: str,
+        chat_id: str,
+        open_id: str,
+        text: str,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Treat phrases like “这类我最近想多看” as a strong signal for the latest uploaded PDF topics.
+        """
+        if not looks_like_recent_upload_interest_reinforcement(text):
+            return None
+
+        recent_signal = self._find_recent_pdf_interest_signal(user_id)
+        if not recent_signal:
+            return None
+
+        topics = recent_signal.get("topics") or []
+        if not topics:
+            return None
+
+        try:
+            db_ops = importlib.import_module("skills.storage-helper.scripts.db_ops")
+            profile_updater = importlib.import_module("skills.profile-updater.scripts.update_profile")
+            direction_lexicon = importlib.import_module("config.direction_lexicon")
+
+            get_profile = getattr(db_ops, "get_profile")
+            update_profile = getattr(db_ops, "update_profile")
+            log_behavior = getattr(db_ops, "log_behavior")
+            ensure_profile_schema = getattr(profile_updater, "ensure_profile_schema")
+            update_profile_with_reading_signal = getattr(profile_updater, "update_profile_with_reading_signal")
+
+            signal_time = datetime.now()
+            profile = ensure_profile_schema(get_profile(user_id), now=signal_time)
+            updated_profile = update_profile_with_reading_signal(
+                profile,
+                signal_topics=list(topics),
+                signal_strength="strong",
+                explicit_text=text,
+                current_time=signal_time,
+                source_type=recent_signal.get("source_type") or "",
+                source_key=recent_signal.get("source_key") or "",
+            )
+            update_profile(user_id, updated_profile)
+
+            last_signal = (
+                (updated_profile.get("reading_signal_state", {}) or {}).get("last_signal", {}) or {}
+            )
+            activated_topics = last_signal.get("activated_topics", []) or []
+
+            log_behavior(
+                user_id=user_id,
+                push_id="reading_signal",
+                paper_id=recent_signal.get("paper_id"),
+                action="profile_updated",
+                action_type="reading_signal",
+                category="strong",
+                metadata={
+                    "signal_strength": "strong",
+                    "signal_topics": list(last_signal.get("topics", []) or topics),
+                    "activated_topics": list(activated_topics),
+                    "source_type": last_signal.get("source_type") or recent_signal.get("source_type") or "",
+                    "source_key": last_signal.get("source_key") or recent_signal.get("source_key") or "",
+                    "trigger": "recent_upload_followup_text",
+                    "explicit_note": text,
+                },
+            )
+
+            label_formatter = getattr(direction_lexicon, "format_direction_label", None)
+            if callable(label_formatter):
+                topic_labels = [label_formatter(topic, prefer_chinese=True) for topic in (last_signal.get("topics") or topics)[:3]]
+                activated_labels = [label_formatter(topic, prefer_chinese=True) for topic in activated_topics[:3]]
+            else:
+                topic_labels = [str(topic) for topic in (last_signal.get("topics") or topics)[:3]]
+                activated_labels = [str(topic) for topic in activated_topics[:3]]
+
+            summary = f"收到，已把最近这篇直传论文对应的方向按强正信号记入画像：{'、'.join(topic_labels)}。"
+            if activated_labels:
+                summary += f"\n已进入短期兴趣关注：{'、'.join(activated_labels)}。"
+            else:
+                summary += "\n这次会先按强正信号处理，但不会立刻触发整体兴趣漂移。"
+
+            self._send_async_ack(chat_id, open_id, summary)
+            return {
+                "status": "success",
+                "intent": "reading_signal_reinforce",
+                "user_id": user_id,
+                "chat_id": chat_id,
+                "topics": list(last_signal.get("topics", []) or topics),
+                "activated_topics": list(activated_topics),
+            }
+        except Exception as exc:
+            logger.error(f"Failed to reinforce recent upload interest signal: {exc}", exc_info=True)
+            self._send_async_ack(
+                chat_id,
+                open_id,
+                "我识别到你是在增强最近直传论文的兴趣信号，但这次更新失败了，请稍后再试。",
+            )
+            return {
+                "status": "error",
+                "intent": "reading_signal_reinforce",
+                "user_id": user_id,
+                "chat_id": chat_id,
+                "message": str(exc),
+            }
+
     def verify_url(self, token: str, challenge: str) -> str:
         """
         验证飞书 URL
@@ -556,6 +761,16 @@ class FeishuEventHandler:
             logger.info(f"No role found for chat_id: {chat_id}, using open_id as user_id: {open_id}")
 
         logger.info(f"Final user_id for coordinator: {user_id}")
+        self._log_pending_doc_dwell_proxy(user_id)
+
+        recent_upload_reinforcement = self._handle_recent_upload_interest_reinforcement(
+            user_id,
+            chat_id,
+            open_id,
+            text,
+        )
+        if recent_upload_reinforcement is not None:
+            return recent_upload_reinforcement
 
         # 路由到 master-coordinator 处理
         # 注意：飞书 p2p 聊天中 user_id 为 null，使用 open_id 作为用户 ID
@@ -648,10 +863,46 @@ class FeishuEventHandler:
         reaction_event = event.get("event", {})
         message_id = reaction_event.get("message_id", "")
         reaction_type = reaction_event.get("reaction_type", "")
+        chat_id = (
+            reaction_event.get("chat_id")
+            or ((reaction_event.get("message") or {}).get("chat_id"))
+            or ""
+        )
+        sender = reaction_event.get("operator", {}) or reaction_event.get("sender", {}) or {}
+        open_id = (
+            ((sender.get("operator_id") or {}).get("open_id"))
+            or ((sender.get("sender_id") or {}).get("open_id"))
+            or ""
+        )
+        user_id = self._resolve_user_id_for_chat(chat_id, open_id)
 
         logger.info(f"Reaction {reaction_type} on message {message_id}")
+        try:
+            db_ops = importlib.import_module("skills.storage-helper.scripts.db_ops")
+            logger_fn = getattr(db_ops, "log_behavior", None)
+            if callable(logger_fn) and user_id:
+                logger_fn(
+                    user_id=user_id,
+                    push_id="reaction",
+                    paper_id=None,
+                    action="message_reaction",
+                    action_type="reaction",
+                    category=str(reaction_type or ""),
+                    metadata={
+                        "message_id": message_id,
+                        "chat_id": chat_id,
+                    },
+                )
+        except Exception as exc:
+            logger.warning(f"Failed to persist reaction log: {exc}")
 
-        # TODO: 记录表情反馈到行为日志
+        normalized_reaction = str(reaction_type or "").lower()
+        positive_tokens = {"+1", "thumbsup", "thumbs_up", "like", "ok"}
+        negative_tokens = {"-1", "thumbsdown", "thumbs_down", "dislike"}
+        if normalized_reaction in positive_tokens and user_id:
+            self._route_to_coordinator(user_id, "这篇报告写得好", chat_id, open_id)
+        elif normalized_reaction in negative_tokens and user_id:
+            self._route_to_coordinator(user_id, "这篇报告没抓住重点", chat_id, open_id)
 
         return {"status": "success", "reaction": reaction_type}
 
@@ -675,8 +926,38 @@ class FeishuEventHandler:
             value_data = {}
 
         logger.info(f"Menu button clicked: {value_data}")
+        chat_id = button_event.get("chat_id", "")
+        open_id = (
+            ((button_event.get("operator") or {}).get("operator_id") or {}).get("open_id")
+            or ""
+        )
+        user_id = self._resolve_user_id_for_chat(chat_id, open_id)
 
-        # TODO: 路由到对应的 Agent 处理
+        command_text = (
+            value_data.get("command")
+            or value_data.get("text")
+            or value_data.get("message")
+            or ""
+        )
+        if command_text and user_id:
+            result = self._route_to_coordinator(user_id, str(command_text), chat_id, open_id)
+            return {"status": "success", "action": value_data, "response": result}
+
+        try:
+            db_ops = importlib.import_module("skills.storage-helper.scripts.db_ops")
+            logger_fn = getattr(db_ops, "log_behavior", None)
+            if callable(logger_fn) and user_id:
+                logger_fn(
+                    user_id=user_id,
+                    push_id="menu_button",
+                    paper_id=None,
+                    action="menu_button",
+                    action_type="ui_action",
+                    category=str(value_data.get("action") or value_data.get("type") or "button"),
+                    metadata=value_data,
+                )
+        except Exception as exc:
+            logger.warning(f"Failed to persist menu button log: {exc}")
 
         return {"status": "success", "action": value_data}
 
@@ -945,11 +1226,36 @@ class WebhookHandler(BaseHTTPRequestHandler):
             return
 
         # 健康检查
+        if parsed.path == "/r/doc":
+            target = params.get("target", [""])[0].strip()
+            user_id = params.get("user_id", [""])[0].strip()
+            doc_token = params.get("doc_token", [""])[0].strip()
+            title = params.get("title", [""])[0].strip()
+            if not target.startswith(("http://", "https://")):
+                self.send_response(400)
+                self.send_header('Content-Type', 'text/plain; charset=utf-8')
+                self.end_headers()
+                self.wfile.write("Invalid target URL".encode("utf-8"))
+                return
+            self.event_handler._log_doc_open(user_id, doc_url=target, doc_token=doc_token, title=title)
+            self.send_response(302)
+            self.send_header("Location", target)
+            self.end_headers()
+            return
+
         if parsed.path == "/health":
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
-            self.wfile.write(json.dumps({"status": "healthy"}).encode('utf-8'))
+            payload = {"status": "healthy"}
+            try:
+                scheduler_module = importlib.import_module("services.webhook-server.scripts.scheduler")
+                status_snapshot = getattr(scheduler_module, "get_scheduler_status_snapshot", None)
+                if callable(status_snapshot):
+                    payload["scheduler"] = status_snapshot()
+            except Exception:
+                logger.debug("Unable to include scheduler status in health payload", exc_info=True)
+            self.wfile.write(json.dumps(payload, ensure_ascii=False).encode('utf-8'))
             return
 
         self.send_response(404)

@@ -795,6 +795,63 @@ def get_recent_papers(
     return unique_papers
 
 
+def _profile_id_to_display_name(profile_id: str) -> str:
+    cleaned = str(profile_id or "").strip()
+    if not cleaned:
+        return ""
+    if cleaned.startswith("~"):
+        cleaned = cleaned[1:]
+    cleaned = re.sub(r"\d+$", "", cleaned)
+    cleaned = cleaned.replace("_", " ").strip()
+    return cleaned
+
+
+def get_active_reviewer_candidates(conference: str, year: int, limit: int = 10) -> List[str]:
+    """
+    Best-effort fetch reviewer / AC identities from public OpenReview groups.
+
+    This only works when the venue exposes group membership publicly.
+    """
+    normalized_conference = normalize_conference_name(conference)
+    if not normalized_conference:
+        return []
+    conference_info = CONFERENCE_MAP.get(normalized_conference, {})
+    if conference_info.get("source_type") != "openreview":
+        return []
+
+    client = get_client()
+    if not client:
+        return []
+
+    venue_root = f"{conference_info['venue_id']}/{year}/Conference"
+    group_ids = [
+        f"{venue_root}/Reviewers",
+        f"{venue_root}/Area_Chairs",
+        f"{venue_root}/Senior_Area_Chairs",
+    ]
+
+    candidates: List[str] = []
+    seen = set()
+    for group_id in group_ids:
+        try:
+            group = client.get_group(group_id)
+        except Exception:
+            continue
+        members = list(getattr(group, "members", []) or [])
+        for member in members:
+            display_name = _profile_id_to_display_name(member)
+            if not display_name:
+                continue
+            marker = display_name.casefold()
+            if marker in seen:
+                continue
+            seen.add(marker)
+            candidates.append(display_name)
+            if len(candidates) >= limit:
+                return candidates
+    return candidates
+
+
 def fetch_by_date(
     start_date: str,
     end_date: str,

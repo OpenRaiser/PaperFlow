@@ -10,7 +10,7 @@ import os
 import math
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import List, Dict
+from typing import List, Dict, Optional
 from dataclasses import dataclass
 from collections import defaultdict
 
@@ -53,6 +53,7 @@ build_paper_text = embedding_service_module.build_paper_text
 direction_lexicon = __import__("config.direction_lexicon", fromlist=["dummy"])
 canonicalize_direction_terms = direction_lexicon.canonicalize_direction_terms
 expand_direction_terms_from_registry = direction_lexicon.expand_direction_terms
+format_direction_label = direction_lexicon.format_direction_label
 
 # 飞书报告器（可选）
 try:
@@ -149,6 +150,10 @@ def load_scoring_weights() -> Dict:
         "bonus_must_read": 0.15,
         "threshold_high_relevant": 0.75,
         "threshold_maybe_interested": 0.50,
+        "drift_bonus_shifting": 0.08,
+        "drift_bonus_recovered": 0.04,
+        "drift_short_topic_bonus": 0.03,
+        "reading_signal_short_term_bonus": 0.05,
     }
 
 
@@ -159,6 +164,19 @@ class PaperWithScore:
     score: float
     category: str  # must_read, high_relevant, maybe_interested, edge_relevant
     relevance_signal: float = 0.0
+    drift_bonus: float = 0.0
+    drift_topics: Optional[List[str]] = None
+    reading_signal_bonus: float = 0.0
+    reading_signal_topics: Optional[List[str]] = None
+
+
+def _hard_priority_tuple(paper_with_score: PaperWithScore) -> tuple:
+    """Sort must-read hits ahead of all other candidates, then by score."""
+    return (
+        1 if paper_with_score.category == "must_read" else 0,
+        float(paper_with_score.score),
+        float(paper_with_score.relevance_signal),
+    )
 
 
 def resolve_chat_id_for_user(user_id: str, profile: Dict = None) -> str:
@@ -284,6 +302,60 @@ def compute_relevance_signal(paper: Dict, profile: Dict) -> float:
     return max(interest_sim, topic_match, author_score, institution_score)
 
 
+def compute_drift_bonus(paper: Dict, profile: Dict, weights: Dict) -> tuple[float, List[str]]:
+    """Boost papers that align with currently shifting short-term interests."""
+    drift_state = (profile or {}).get("drift_state", {}) or {}
+    status = str(drift_state.get("status", "stable"))
+    if status not in {"shifting", "recovered"}:
+        return 0.0, []
+
+    paper_topics = [str(topic).strip() for topic in paper.get("topics", []) if str(topic).strip()]
+    if not paper_topics:
+        return 0.0, []
+
+    top_shift_topics = [str(topic).strip() for topic in drift_state.get("top_shift_topics", []) or [] if str(topic).strip()]
+    short_term_topics = drift_state.get("short_term_topics", {}) or {}
+
+    matched_shift_topics = [topic for topic in paper_topics if topic in top_shift_topics]
+    short_term_strength = max(float(short_term_topics.get(topic, 0.0) or 0.0) for topic in paper_topics)
+
+    base_bonus = float(
+        weights.get("drift_bonus_shifting", 0.08)
+        if status == "shifting"
+        else weights.get("drift_bonus_recovered", 0.04)
+    )
+    short_term_bonus_cap = float(weights.get("drift_short_topic_bonus", 0.03))
+
+    bonus = 0.0
+    if matched_shift_topics:
+        bonus += base_bonus
+    if short_term_strength > 0:
+        bonus += min(short_term_bonus_cap, short_term_strength * short_term_bonus_cap)
+
+    return round(min(0.12, bonus), 4), matched_shift_topics[:3]
+
+
+def compute_reading_signal_bonus(paper: Dict, profile: Dict, weights: Dict) -> tuple[float, List[str]]:
+    """Boost papers that align with recent direct-upload reading interests."""
+    reading_signal_state = (profile or {}).get("reading_signal_state", {}) or {}
+    short_term_topics = reading_signal_state.get("short_term_topics", {}) or {}
+    if not short_term_topics:
+        return 0.0, []
+
+    paper_topics = [str(topic).strip() for topic in paper.get("topics", []) if str(topic).strip()]
+    if not paper_topics:
+        return 0.0, []
+
+    matched_topics = [topic for topic in paper_topics if topic in short_term_topics]
+    if not matched_topics:
+        return 0.0, []
+
+    strongest = max(float(short_term_topics.get(topic, 0.0) or 0.0) for topic in matched_topics)
+    bonus_cap = float(weights.get("reading_signal_short_term_bonus", 0.05))
+    bonus = min(bonus_cap, strongest * bonus_cap)
+    return round(min(0.08, bonus), 4), matched_topics[:3]
+
+
 def get_source_bucket(paper: Dict) -> str:
     """Map a paper into a source bucket for diversity balancing."""
     source = str(paper.get("source") or "").lower().strip()
@@ -302,19 +374,24 @@ def apply_source_diversity_quota(
     scored_papers: List[PaperWithScore],
     weights: Dict
 ) -> List[PaperWithScore]:
-    """Soft-cap dominant sources when multiple buckets are available."""
+    """Soft-cap dominant sources while preserving must-read inclusions."""
     if not scored_papers:
+        return scored_papers
+
+    must_read_items = [paper for paper in scored_papers if paper.category == "must_read"]
+    remainder = [paper for paper in scored_papers if paper.category != "must_read"]
+    if not remainder:
         return scored_papers
 
     min_total = int(weights.get("source_diversity_min_total", 12))
     min_per_bucket = int(weights.get("source_diversity_min_per_bucket", 3))
     max_share = float(weights.get("source_diversity_max_share", 0.7))
 
-    if len(scored_papers) < min_total or max_share >= 1.0:
+    if len(remainder) < min_total or max_share >= 1.0:
         return scored_papers
 
     buckets = defaultdict(list)
-    for paper in scored_papers:
+    for paper in remainder:
         buckets[get_source_bucket(paper.paper)].append(paper)
 
     if len(buckets) <= 1:
@@ -325,7 +402,7 @@ def apply_source_diversity_quota(
         key=lambda bucket: buckets[bucket][0].score if buckets[bucket] else 0.0,
         reverse=True,
     )
-    max_per_bucket = max(min_per_bucket, math.ceil(len(scored_papers) * max_share))
+    max_per_bucket = max(min_per_bucket, math.ceil(len(remainder) * max_share))
 
     selected_ids = set()
     bucket_counts = {bucket: 0 for bucket in buckets}
@@ -336,7 +413,7 @@ def apply_source_diversity_quota(
             selected_ids.add(id(paper))
             bucket_counts[bucket] += 1
 
-    for paper in scored_papers:
+    for paper in remainder:
         paper_id = id(paper)
         if paper_id in selected_ids:
             continue
@@ -348,7 +425,7 @@ def apply_source_diversity_quota(
         selected_ids.add(paper_id)
         bucket_counts[bucket] += 1
 
-    selected = [paper for paper in scored_papers if id(paper) in selected_ids]
+    selected = must_read_items + [paper for paper in remainder if id(paper) in selected_ids]
     dropped = len(scored_papers) - len(selected)
     if dropped > 0:
         print(
@@ -693,6 +770,9 @@ def sort_and_categorize(
     for paper in papers:
         score = calculate_paper_score(paper, profile, weights)
         relevance_signal = compute_relevance_signal(paper, profile)
+        drift_bonus, drift_topics = compute_drift_bonus(paper, profile, weights)
+        reading_signal_bonus, reading_signal_topics = compute_reading_signal_bonus(paper, profile, weights)
+        score = min(1.0, score + drift_bonus + reading_signal_bonus)
         category = categorize_paper(score, paper, profile, weights)
         result.append(
             PaperWithScore(
@@ -700,22 +780,27 @@ def sort_and_categorize(
                 score=score,
                 category=category,
                 relevance_signal=relevance_signal,
+                drift_bonus=drift_bonus,
+                drift_topics=drift_topics,
+                reading_signal_bonus=reading_signal_bonus,
+                reading_signal_topics=reading_signal_topics,
             )
         )
 
-    # 按分数降序排序
+    # 先按分数粗排，再按分类结果做硬优先级重排
     result.sort(key=lambda x: x.score, reverse=True)
 
-    # 按排名重新分类，确保每类都有论文
     result = categorize_papers_by_rank(result, profile, weights)
+    result.sort(key=_hard_priority_tuple, reverse=True)
     result = apply_source_diversity_quota(result, weights)
     result = apply_push_count_limit(result, weights)
+    result.sort(key=_hard_priority_tuple, reverse=True)
 
     return result
 
 
 def categorize_papers_by_rank(scored_papers: List[PaperWithScore], profile: Dict, weights: Dict) -> List[PaperWithScore]:
-    """Soft-filter and categorize papers while keeping must_read as a soft rule."""
+    """Categorize papers while treating must-read hits as hard-priority keepers."""
     threshold_high = weights.get("threshold_high_relevant", 0.40)
     threshold_maybe = weights.get("threshold_maybe_interested", 0.25)
     threshold_edge = weights.get("threshold_edge_relevant", 0.15)
@@ -733,23 +818,16 @@ def categorize_papers_by_rank(scored_papers: List[PaperWithScore], profile: Dict
         rank_position = rank_eligible_positions.get(id(paper_with_score))
         must_read_hit = is_must_read(paper_with_score.paper, profile)
 
+        if must_read_hit:
+            paper_with_score.category = "must_read"
+            filtered.append(paper_with_score)
+            continue
+
         if paper_with_score.relevance_signal < min_relevance_signal and not must_read_hit:
             print(
                 f"  Filtered out (low relevance={paper_with_score.relevance_signal:.2f}, score={paper_with_score.score:.2f}): "
                 f"{str(paper_with_score.paper.get('title', '') or '').strip()}"
             )
-            continue
-
-        if must_read_hit and paper_with_score.score < threshold_edge:
-            print(
-                f"  Filtered out (must_read below edge threshold, score={paper_with_score.score:.2f}): "
-                f"{str(paper_with_score.paper.get('title', '') or '').strip()}"
-            )
-            continue
-
-        if must_read_hit:
-            paper_with_score.category = "must_read"
-            filtered.append(paper_with_score)
             continue
 
         if paper_with_score.score >= threshold_high or (
@@ -799,19 +877,27 @@ def categorize_paper(score: float, paper: Dict, profile: Dict, weights: Dict) ->
 
 
 def apply_push_count_limit(scored_papers: List[PaperWithScore], weights: Dict) -> List[PaperWithScore]:
-    """Keep daily push volume manageable without reserving slots for must_read hits."""
+    """Keep daily push volume manageable while preserving all must-read hits."""
     if not scored_papers:
         return scored_papers
 
     target_count = max(1, int(weights.get("push_target_count", 50)))
     max_count = max(target_count, int(weights.get("push_max_count", target_count)))
-    limited = list(scored_papers[:max_count])
-    if len(limited) > target_count:
-        limited = limited[:target_count]
+    must_read_items = [paper for paper in scored_papers if paper.category == "must_read"]
+    remainder = [paper for paper in scored_papers if paper.category != "must_read"]
+
+    hard_target_count = max(target_count, len(must_read_items))
+    hard_max_count = max(max_count, len(must_read_items))
+    non_must_read_capacity = max(0, hard_target_count - len(must_read_items))
+
+    limited_remainder = list(remainder[: max(0, hard_max_count - len(must_read_items))])
+    if len(limited_remainder) > non_must_read_capacity:
+        limited_remainder = limited_remainder[:non_must_read_capacity]
+    limited = must_read_items + limited_remainder
 
     print(
         f"Applying push count limit: {len(scored_papers)} -> {len(limited)} "
-        f"(target={target_count}, max={max_count})"
+        f"(target={hard_target_count}, max={hard_max_count}, must_read={len(must_read_items)})"
     )
     return limited
 
@@ -821,10 +907,34 @@ def format_drift_hint(profile: Dict) -> str:
     drift_state = (profile or {}).get("drift_state", {}) or {}
     status = drift_state.get("status", "stable")
     if status == "shifting":
+        topics = [format_direction_label(topic) for topic in (drift_state.get("top_shift_topics", []) or [])[:3]]
+        if topics:
+            return f"兴趣迁移状态：迁移中，近期偏好权重已提升，当前重点关注 {', '.join(topics)}。"
         return "兴趣迁移状态：迁移中，近期偏好权重已提升。"
     if status == "recovered":
+        topics = [format_direction_label(topic) for topic in (drift_state.get("top_shift_topics", []) or [])[:3]]
+        if topics:
+            return f"兴趣迁移状态：已恢复，系统正在重新平衡短期与长期兴趣，近期变化主要围绕 {', '.join(topics)}。"
         return "兴趣迁移状态：已恢复，系统正在重新平衡短期与长期兴趣。"
     return "兴趣迁移状态：稳定，长期画像权重占优。"
+
+
+def format_reading_signal_hint(profile: Dict) -> str:
+    """Render a short hint for direct-upload reading signals."""
+    reading_signal_state = (profile or {}).get("reading_signal_state", {}) or {}
+    short_term_topics = reading_signal_state.get("short_term_topics", {}) or {}
+    if not short_term_topics:
+        return ""
+
+    ranked_topics = sorted(
+        short_term_topics.items(),
+        key=lambda item: float(item[1] or 0.0),
+        reverse=True,
+    )
+    topic_labels = [format_direction_label(topic) for topic, _ in ranked_topics[:3]]
+    if not topic_labels:
+        return ""
+    return f"近期直传精读信号：{', '.join(topic_labels)}，这些方向会被适度前置。"
 
 
 def format_push_card(
@@ -849,6 +959,9 @@ def format_push_card(
     lines.append(f"━━━ 🔒 必读清单命中（{len(must_read)} 篇）━━━")
     lines.append(format_must_read_config(profile or {}))
     lines.append(format_drift_hint(profile or {}))
+    reading_signal_hint = format_reading_signal_hint(profile or {})
+    if reading_signal_hint:
+        lines.append(reading_signal_hint)
 
     global_count = 0
     if must_read:

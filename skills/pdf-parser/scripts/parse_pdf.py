@@ -9,7 +9,7 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 # PyMuPDF
 try:
@@ -24,6 +24,30 @@ try:
     HAS_PDFPLUMBER = True
 except ImportError:
     HAS_PDFPLUMBER = False
+
+try:
+    from rapidocr_onnxruntime import RapidOCR
+    HAS_RAPIDOCR = True
+except ImportError:
+    HAS_RAPIDOCR = False
+
+try:
+    from PIL import Image
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
+
+try:
+    import pytesseract
+    HAS_PYTESSERACT = True
+except ImportError:
+    HAS_PYTESSERACT = False
+
+try:
+    import numpy as np
+    HAS_NUMPY = True
+except ImportError:
+    HAS_NUMPY = False
 
 # 常见章节标题模式
 SECTION_PATTERNS = {
@@ -89,8 +113,14 @@ SEMANTIC_DIRECTION_PROTOTYPES = {
     "Bioinformatics": "Bioinformatics, computational biology, genomics, biological sequence modeling, molecular analysis",
 }
 SEMANTIC_DIRECTION_MIN_SIMILARITY = float(os.environ.get("PDF_PARSER_MIN_EMBED_SIMILARITY", "0.30"))
+PDF_PARSER_ENABLE_OCR = os.environ.get("PDF_PARSER_ENABLE_OCR", "1").strip().lower() not in {"0", "false", "off", "no"}
+PDF_PARSER_OCR_MIN_TEXT_CHARS = int(os.environ.get("PDF_PARSER_OCR_MIN_TEXT_CHARS", "200"))
+PDF_PARSER_OCR_DPI = int(os.environ.get("PDF_PARSER_OCR_DPI", "220"))
+PDF_PARSER_OCR_MAX_PAGES = int(os.environ.get("PDF_PARSER_OCR_MAX_PAGES", "12"))
+PDF_PARSER_OCR_LANG = os.environ.get("PDF_PARSER_OCR_LANG", "eng")
 
 _EMBEDDING_SERVICE = None
+_OCR_ENGINE = None
 
 
 def clean_extracted_text(text: str) -> str:
@@ -120,6 +150,164 @@ def clean_extracted_text(text: str) -> str:
         previous_blank = False
 
     return "\n".join(cleaned_lines).strip()
+
+
+def _get_rapidocr_engine():
+    global _OCR_ENGINE
+    if _OCR_ENGINE is not None:
+        return _OCR_ENGINE or None
+
+    if not HAS_RAPIDOCR:
+        _OCR_ENGINE = False
+        return None
+
+    try:
+        _OCR_ENGINE = RapidOCR()
+    except Exception:
+        _OCR_ENGINE = False
+    return _OCR_ENGINE or None
+
+
+def _extract_text_from_pdf_with_pymupdf(pdf_path: str) -> str:
+    if not HAS_PYMUPDF:
+        return ""
+
+    doc = fitz.open(pdf_path)
+    try:
+        text = ""
+        for page in doc:
+            text += page.get_text("text", sort=True) + "\n"
+        return clean_extracted_text(text)
+    finally:
+        doc.close()
+
+
+def _extract_text_from_pdf_with_pdfplumber(pdf_path: str) -> str:
+    if not HAS_PDFPLUMBER:
+        return ""
+
+    text = ""
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            page_text = page.extract_text()
+            if page_text:
+                text += page_text + "\n"
+    return clean_extracted_text(text)
+
+
+def _should_try_ocr(text: str, pdf_path: str) -> bool:
+    if not PDF_PARSER_ENABLE_OCR or not HAS_PYMUPDF:
+        return False
+
+    normalized = clean_extracted_text(text)
+    if len(normalized) < PDF_PARSER_OCR_MIN_TEXT_CHARS:
+        return True
+
+    try:
+        doc = fitz.open(pdf_path)
+        try:
+            page_count = max(1, len(doc))
+        finally:
+            doc.close()
+    except Exception:
+        page_count = 1
+
+    avg_chars_per_page = len(normalized) / max(page_count, 1)
+    if avg_chars_per_page < max(40, PDF_PARSER_OCR_MIN_TEXT_CHARS // 2):
+        return True
+
+    return False
+
+
+def _render_page_to_numpy(page: Any):
+    if not HAS_NUMPY:
+        return None
+
+    scale = max(1.0, float(PDF_PARSER_OCR_DPI) / 72.0)
+    pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
+    channels = max(1, int(pix.n))
+    try:
+        image = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, channels)
+    except Exception:
+        return None
+    return image
+
+
+def _ocr_page_with_rapidocr(page: Any) -> str:
+    engine = _get_rapidocr_engine()
+    if engine is None:
+        return ""
+
+    image = _render_page_to_numpy(page)
+    if image is None:
+        return ""
+
+    try:
+        result, _elapsed = engine(image)
+    except Exception:
+        return ""
+
+    texts: List[str] = []
+    for item in result or []:
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            continue
+        candidate = item[1]
+        if isinstance(candidate, (list, tuple)) and candidate:
+            candidate = candidate[0]
+        text = str(candidate or "").strip()
+        if text:
+            texts.append(text)
+    return "\n".join(texts).strip()
+
+
+def _ocr_page_with_pytesseract(page: Any) -> str:
+    if not (HAS_PIL and HAS_PYTESSERACT):
+        return ""
+
+    scale = max(1.0, float(PDF_PARSER_OCR_DPI) / 72.0)
+    pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
+    mode = "RGB" if pix.n < 4 else "RGBA"
+    try:
+        image = Image.frombytes(mode, [pix.width, pix.height], pix.samples)
+        return str(pytesseract.image_to_string(image, lang=PDF_PARSER_OCR_LANG) or "").strip()
+    except Exception:
+        return ""
+
+
+def _ocr_page_with_pymupdf_ocr(page: Any) -> str:
+    textpage_ocr = getattr(page, "get_textpage_ocr", None)
+    if not callable(textpage_ocr):
+        return ""
+
+    try:
+        textpage = textpage_ocr(dpi=PDF_PARSER_OCR_DPI, language=PDF_PARSER_OCR_LANG)
+        return str(page.get_text("text", textpage=textpage) or "").strip()
+    except Exception:
+        return ""
+
+
+def _extract_text_from_pdf_with_ocr(pdf_path: str) -> str:
+    if not HAS_PYMUPDF or not PDF_PARSER_ENABLE_OCR:
+        return ""
+
+    doc = fitz.open(pdf_path)
+    try:
+        page_texts: List[str] = []
+        max_pages = max(1, int(PDF_PARSER_OCR_MAX_PAGES))
+        for page_index, page in enumerate(doc):
+            if page_index >= max_pages:
+                break
+            text = (
+                _ocr_page_with_rapidocr(page)
+                or _ocr_page_with_pytesseract(page)
+                or _ocr_page_with_pymupdf_ocr(page)
+            )
+            cleaned = clean_extracted_text(text)
+            if cleaned:
+                page_texts.append(cleaned)
+        return clean_extracted_text("\n\n".join(page_texts))
+    finally:
+        doc.close()
 
 
 def _get_embedding_service():
@@ -244,24 +432,20 @@ def extract_text_from_pdf(pdf_path: str) -> str:
     if not pdf_file.exists():
         raise FileNotFoundError(f"PDF not found: {pdf_path}")
 
+    primary_text = ""
     if HAS_PYMUPDF:
-        doc = fitz.open(pdf_path)
-        text = ""
-        for page in doc:
-            text += page.get_text("text", sort=True) + "\n"
-        doc.close()
-        return clean_extracted_text(text)
+        primary_text = _extract_text_from_pdf_with_pymupdf(pdf_path)
+    elif HAS_PDFPLUMBER:
+        primary_text = _extract_text_from_pdf_with_pdfplumber(pdf_path)
+    else:
+        raise ImportError("No PDF library available. Install pymupdf or pdfplumber.")
 
-    if HAS_PDFPLUMBER:
-        text = ""
-        with pdfplumber.open(pdf_path) as pdf:
-            for page in pdf.pages:
-                page_text = page.extract_text()
-                if page_text:
-                    text += page_text + "\n"
-        return clean_extracted_text(text)
+    if _should_try_ocr(primary_text, pdf_path):
+        ocr_text = _extract_text_from_pdf_with_ocr(pdf_path)
+        if (not primary_text and ocr_text) or len(ocr_text) > len(primary_text) + 80:
+            return ocr_text
 
-    raise ImportError("No PDF library available. Install pymupdf or pdfplumber.")
+    return primary_text
 
 
 def extract_metadata(text: str) -> Dict:

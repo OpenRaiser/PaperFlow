@@ -223,6 +223,27 @@ BUILTIN_DIRECTION_REGISTRY: Dict[str, Dict[str, Any]] = {
         aliases=["agents", "autonomous agent", "agentic system"],
         paper_terms=["agent", "agents", "autonomous", "agentic"],
     ),
+    "embodied-ai": _default_entry(
+        "embodied-ai",
+        name="Embodied AI",
+        name_cn="具身智能",
+        aliases=[
+            "embodied ai",
+            "embodied intelligence",
+            "robotics",
+            "robotic",
+            "robot learning",
+            "robot manipulation",
+        ],
+        paper_terms=[
+            "embodied ai",
+            "embodied intelligence",
+            "robotics",
+            "robot learning",
+            "robot control",
+            "robot manipulation",
+        ],
+    ),
     "optimization": _default_entry(
         "optimization",
         name="Optimization",
@@ -285,6 +306,20 @@ BUILTIN_DIRECTION_REGISTRY: Dict[str, Dict[str, Any]] = {
         name_cn="科学发现",
         aliases=["scientific discovery"],
         paper_terms=["scientific", "science", "discovery", "hypothesis", "experiment"],
+    ),
+    "ai-for-science": _default_entry(
+        "ai-for-science",
+        name="AI for Science",
+        name_cn="AI for Science",
+        aliases=["ai for science", "artificial intelligence for science", "science ai"],
+        paper_terms=["ai for science", "artificial intelligence for science", "scientific ai"],
+    ),
+    "scientific-reasoning": _default_entry(
+        "scientific-reasoning",
+        name="Scientific Reasoning",
+        name_cn="Scientific Reasoning",
+        aliases=["scientific reasoning", "science reasoning", "reasoning for science"],
+        paper_terms=["scientific reasoning", "science reasoning", "reasoning for science"],
     ),
     "ai-detection": _default_entry(
         "ai-detection",
@@ -451,6 +486,54 @@ def get_direction_entry(direction_key: str, lexicon: Optional[Dict[str, Any]] = 
     current_lexicon = lexicon or load_lexicon()
     entry = current_lexicon.get(normalized_key)
     return copy.deepcopy(entry) if entry else None
+
+
+def format_direction_label(
+    direction_key: Any,
+    *,
+    lexicon: Optional[Dict[str, Any]] = None,
+    prefer_chinese: bool = True,
+) -> str:
+    """Return a stable user-facing label for a canonical direction key or alias."""
+    cleaned = str(direction_key or "").strip()
+    if not cleaned:
+        return ""
+
+    entry = get_direction_entry(cleaned, lexicon=lexicon) or {}
+    if not entry:
+        resolved = resolve_canonical_direction(cleaned, lexicon=lexicon, include_paper_terms=True)
+        if resolved:
+            entry = resolved.get("entry") or get_direction_entry(resolved["canonical_name"], lexicon=lexicon) or {}
+
+    if entry:
+        if prefer_chinese:
+            label = str(entry.get("name_cn") or entry.get("name") or cleaned).strip()
+        else:
+            label = str(entry.get("name") or entry.get("name_cn") or cleaned).strip()
+        if label:
+            return label
+
+    if any("\u4e00" <= ch <= "\u9fff" for ch in cleaned):
+        return cleaned
+    return cleaned.replace("-", " ").replace("_", " ").title()
+
+
+def build_bootstrap_summary(
+    directions: Iterable[Any],
+    *,
+    lexicon: Optional[Dict[str, Any]] = None,
+    prefer_chinese: bool = False,
+    limit: int = 6,
+) -> str:
+    """Build a reusable summary string from canonical directions."""
+    labels = [
+        format_direction_label(direction, lexicon=lexicon, prefer_chinese=prefer_chinese)
+        for direction in directions
+    ]
+    deduped = _dedupe_strings(labels)
+    if not deduped:
+        return ""
+    return f"direction: {', '.join(deduped[: max(1, int(limit))])}"
 
 
 def _iter_match_terms(entry: Dict[str, Any], include_paper_terms: bool = True) -> Iterable[tuple[str, str]]:

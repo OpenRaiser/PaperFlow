@@ -13,9 +13,13 @@ Profile Report Agent - 画像周报代理
 import sys
 import os
 import json
+import re
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any
 from pathlib import Path
+from urllib.parse import quote
+
+import requests
 
 try:
     from dotenv import load_dotenv
@@ -44,29 +48,187 @@ get_selection_stats_by_category = db_ops.get_selection_stats_by_category
 get_direction_changes = db_ops.get_direction_changes
 get_recent_pushes = db_ops.get_recent_pushes
 get_recent_drift_updates = getattr(db_ops, "get_recent_drift_updates", lambda *args, **kwargs: [])
+get_doc_engagement_stats = getattr(db_ops, "get_doc_engagement_stats", lambda *args, **kwargs: {})
 get_paper_by_arxiv_id = db_ops.get_paper_by_arxiv_id
+direction_lexicon = importlib.import_module("config.direction_lexicon")
 
 
 def translate_direction(direction: str) -> str:
     """翻译研究方向为中文"""
-    translations = {
-        "gui-agent": "GUI Agent",
-        "multimodal-reasoning": "多模态推理",
-        "vision": "视觉",
-        "language": "语言",
-        "machine-learning": "机器学习",
-        "deep-learning": "深度学习",
-        "reinforcement-learning": "强化学习",
-        "reasoning": "推理",
-        "agent": "智能体",
-        "optimization": "优化",
-        "retrieval": "检索",
-        "generation": "生成",
-        "data-native": "数据原生",
-        "bio-molecular": "生物分子",
-        "science-discovery": "科学发现",
+    formatter = getattr(direction_lexicon, "format_direction_label", None)
+    if callable(formatter):
+        return str(formatter(direction, prefer_chinese=True) or direction)
+    return direction
+
+
+OPENALEX_TIMEOUT = float(os.environ.get("SCITASTE_WEEKLY_OPENALEX_TIMEOUT", "12"))
+OPENALEX_HEADERS = {"User-Agent": "SciTaste/0.1 WeeklyReport"}
+
+
+def _normalize_title_key(value: Any) -> str:
+    lowered = str(value or "").strip().casefold()
+    return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", lowered)
+
+
+def _extract_doi(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    match = re.search(r"(10\.\d{4,9}/\S+)", text, flags=re.I)
+    return match.group(1).rstrip(")>.,; ") if match else ""
+
+
+def _normalize_author_key(value: Any) -> str:
+    lowered = str(value or "").strip().casefold()
+    return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", lowered)
+
+
+def _fetch_openalex_impact_signal(paper: Dict[str, Any]) -> Dict[str, Any]:
+    doi = _extract_doi(paper.get("doi") or paper.get("doi_url") or paper.get("url"))
+    title = str(paper.get("title") or "").strip()
+
+    try:
+        if doi:
+            response = requests.get(
+                f"https://api.openalex.org/works?filter=doi:{quote(doi, safe='')}",
+                timeout=OPENALEX_TIMEOUT,
+                headers=OPENALEX_HEADERS,
+            )
+        elif title:
+            response = requests.get(
+                f"https://api.openalex.org/works?search={quote(title, safe='')}&per-page=1",
+                timeout=OPENALEX_TIMEOUT,
+                headers=OPENALEX_HEADERS,
+            )
+        else:
+            return {}
+        response.raise_for_status()
+        results = (response.json() or {}).get("results") or []
+        if not results:
+            return {}
+        work = results[0]
+    except Exception:
+        return {}
+
+    work_title = str(work.get("display_name") or work.get("title") or "").strip()
+    if title and not doi and _normalize_title_key(work_title) != _normalize_title_key(title):
+        return {}
+
+    return {
+        "cited_by_count": int(work.get("cited_by_count") or 0),
+        "is_open_access": bool((work.get("open_access") or {}).get("is_oa")),
+        "venue": str((((work.get("primary_location") or {}).get("source") or {}).get("display_name")) or "").strip(),
+        "publication_year": work.get("publication_year"),
+        "openalex_id": str(work.get("id") or "").strip(),
+        "cited_by_api_url": str(work.get("cited_by_api_url") or "").strip(),
     }
-    return translations.get(direction, direction)
+
+
+def _cached_openalex_impact_signal(
+    paper: Dict[str, Any],
+    cache: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
+    doi = _extract_doi(paper.get("doi") or paper.get("doi_url") or paper.get("url"))
+    title = str(paper.get("title") or "").strip()
+    cache_key = doi or _normalize_title_key(title)
+    if not cache_key:
+        return {}
+    if cache_key not in cache:
+        cache[cache_key] = _fetch_openalex_impact_signal(paper)
+    return cache.get(cache_key, {}) or {}
+
+
+def _fetch_citing_author_matches(
+    impact_signal: Dict[str, Any],
+    must_read_authors: List[str],
+) -> List[Dict[str, Any]]:
+    cited_by_api_url = str(impact_signal.get("cited_by_api_url") or "").strip()
+    if not cited_by_api_url or not must_read_authors:
+        return []
+
+    try:
+        response = requests.get(
+            f"{cited_by_api_url}&per-page=10" if "?" in cited_by_api_url else f"{cited_by_api_url}?per-page=10",
+            timeout=OPENALEX_TIMEOUT,
+            headers=OPENALEX_HEADERS,
+        )
+        response.raise_for_status()
+        results = (response.json() or {}).get("results") or []
+    except Exception:
+        return []
+
+    normalized_targets = {
+        _normalize_author_key(author): str(author).strip()
+        for author in must_read_authors
+        if str(author).strip()
+    }
+    matches: List[Dict[str, Any]] = []
+    for work in results:
+        authorships = work.get("authorships") or []
+        citing_authors = [
+            str(((authorship.get("author") or {}).get("display_name")) or "").strip()
+            for authorship in authorships
+        ]
+        matched_authors = []
+        for author in citing_authors:
+            normalized = _normalize_author_key(author)
+            if normalized and normalized in normalized_targets:
+                matched_authors.append(normalized_targets[normalized])
+        if not matched_authors:
+            continue
+        matches.append(
+            {
+                "title": str(work.get("display_name") or work.get("title") or "").strip(),
+                "matched_authors": matched_authors,
+                "cited_by_count": int(work.get("cited_by_count") or 0),
+            }
+        )
+    return matches[:3]
+
+
+def _build_accuracy_explanations(stats_by_category: Dict[str, Dict[str, Any]]) -> List[str]:
+    if not stats_by_category:
+        return ["当前样本不足，暂时无法形成稳定的推荐准确率解释。"]
+
+    high = float((stats_by_category.get("high_relevant") or {}).get("selection_rate", 0.0) or 0.0)
+    maybe = float((stats_by_category.get("maybe_interested") or {}).get("selection_rate", 0.0) or 0.0)
+    edge = float((stats_by_category.get("edge_relevant") or {}).get("selection_rate", 0.0) or 0.0)
+    must_read = float((stats_by_category.get("must_read") or {}).get("selection_rate", 0.0) or 0.0)
+
+    explanations: List[str] = []
+    if high >= maybe >= edge and high > 0:
+        explanations.append("高相关分组的选择率高于中低相关分组，说明当前排序主链路整体有效。")
+    if edge >= maybe and edge > 0.05:
+        explanations.append("边缘相关分组的选择率偏高，说明系统仍存在一定的漏排空间。")
+    if maybe > high and maybe > 0:
+        explanations.append("你更常从“可能感兴趣”中选文，说明系统对中间层候选的排序还可以继续优化。")
+    if must_read > 0 and high > 0 and must_read < high:
+        explanations.append("必读命中率低于高相关分组，说明当前 must_read 更适合作为软加分而非硬优先级。")
+
+    return explanations[:3] or ["当前分组之间的选择率差异不明显，建议继续积累更多反馈后再观察。"]
+
+
+def _build_trend_explanations(direction_changes: List[Dict[str, Any]], drift_summary: Dict[str, Any]) -> List[str]:
+    explanations: List[str] = []
+    significant_changes = [
+        change for change in direction_changes
+        if abs(float(change.get("delta", 0.0) or 0.0)) >= 0.03
+    ]
+    for change in significant_changes[:2]:
+        direction_cn = translate_direction(change.get("direction", ""))
+        delta = float(change.get("delta", 0.0) or 0.0)
+        if delta > 0:
+            explanations.append(f"{direction_cn} 本周持续上升，说明该方向正在被更多真实阅读行为强化。")
+        elif delta < 0:
+            explanations.append(f"{direction_cn} 本周出现回落，说明你近期对该方向的持续关注在减弱。")
+
+    status = str((drift_summary or {}).get("status", "stable"))
+    if status == "shifting":
+        explanations.append("系统检测到近期偏好与长期画像明显拉开，因此推荐排序已更偏向短期兴趣。")
+    elif status == "recovered":
+        explanations.append("系统判断新兴趣正在稳定化，因此开始重新平衡短期与长期画像。")
+
+    return explanations[:3]
 
 
 def _detect_missed_papers(logs: List[Dict], recent_pushes: List[Dict]) -> List[Dict]:
@@ -80,9 +242,138 @@ def _detect_missed_papers(logs: List[Dict], recent_pushes: List[Dict]) -> List[D
     Returns:
         遗漏论文列表
     """
-    # 简化版：返回空列表（完整版需要调用外部 API 获取引用情况）
-    # TODO: 集成 arxiv-fetcher 获取引用次数
-    return []
+    selected_ids = {
+        int(log.get("paper_id"))
+        for log in logs
+        if str(log.get("action_type") or "") == "selected" and log.get("paper_id") is not None
+    }
+
+    candidates: List[Dict[str, Any]] = []
+    seen_titles = set()
+    for paper in recent_pushes:
+        paper_id = paper.get("id")
+        if paper_id in selected_ids:
+            continue
+
+        title_key = _normalize_title_key(paper.get("title"))
+        if not title_key or title_key in seen_titles:
+            continue
+        seen_titles.add(title_key)
+
+        category = str(paper.get("category") or "")
+        score = float(paper.get("score") or 0.0)
+        if category not in {"high_relevant", "maybe_interested", "must_read"} and score < 0.35:
+            continue
+
+        impact = _fetch_openalex_impact_signal(paper)
+        cited_by_count = int(impact.get("cited_by_count") or 0)
+        if cited_by_count <= 0 and category != "must_read":
+            continue
+
+        candidates.append(
+            {
+                "title": paper.get("title", "Unknown"),
+                "category": category,
+                "score": score,
+                "cited_by_count": cited_by_count,
+                "impact_venue": impact.get("venue", ""),
+                "is_open_access": impact.get("is_open_access", False),
+            }
+        )
+
+    candidates.sort(
+        key=lambda item: (
+            int(item.get("cited_by_count", 0)),
+            float(item.get("score", 0.0)),
+        ),
+        reverse=True,
+    )
+    return candidates[:3]
+
+
+def _build_external_impact_summary(
+    profile: Dict[str, Any],
+    logs: List[Dict[str, Any]],
+    recent_pushes: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    selected_ids = {
+        int(log.get("paper_id"))
+        for log in logs
+        if str(log.get("action_type") or "") == "selected" and log.get("paper_id") is not None
+    }
+    must_read_authors = [str(author).strip() for author in ((profile or {}).get("must_read", {}) or {}).get("authors", []) if str(author).strip()]
+
+    impact_cache: Dict[str, Dict[str, Any]] = {}
+    selected_impacts: List[Dict[str, Any]] = []
+    skipped_impacts: List[Dict[str, Any]] = []
+    cited_by_must_read: List[Dict[str, Any]] = []
+
+    for paper in recent_pushes[:25]:
+        impact = _cached_openalex_impact_signal(paper, impact_cache)
+        cited_by_count = int(impact.get("cited_by_count") or 0)
+        if cited_by_count > 0:
+            item = {
+                "title": paper.get("title", "Unknown"),
+                "cited_by_count": cited_by_count,
+                "impact_venue": impact.get("venue", ""),
+                "category": str(paper.get("category") or ""),
+            }
+            if paper.get("id") in selected_ids:
+                selected_impacts.append(item)
+            else:
+                skipped_impacts.append(item)
+
+        if must_read_authors and impact.get("cited_by_api_url"):
+            author_matches = _fetch_citing_author_matches(impact, must_read_authors)
+            if author_matches:
+                cited_by_must_read.append(
+                    {
+                        "title": paper.get("title", "Unknown"),
+                        "matches": author_matches,
+                        "cited_by_count": cited_by_count,
+                    }
+                )
+
+    selected_impacts.sort(key=lambda item: int(item.get("cited_by_count", 0)), reverse=True)
+    skipped_impacts.sort(key=lambda item: int(item.get("cited_by_count", 0)), reverse=True)
+    cited_by_must_read.sort(
+        key=lambda item: (
+            int(item.get("cited_by_count", 0)),
+            len(item.get("matches") or []),
+        ),
+        reverse=True,
+    )
+
+    explanations: List[str] = []
+    if selected_impacts:
+        top_selected = selected_impacts[0]
+        explanations.append(
+            f"你本周选中的论文里，外部引用积累最高的是《{top_selected['title']}》"
+            f"（cited_by={top_selected['cited_by_count']}）。"
+        )
+
+    if selected_impacts and skipped_impacts:
+        avg_selected = sum(int(item.get("cited_by_count", 0)) for item in selected_impacts) / max(1, len(selected_impacts))
+        avg_skipped = sum(int(item.get("cited_by_count", 0)) for item in skipped_impacts) / max(1, len(skipped_impacts))
+        if avg_selected > avg_skipped * 1.2:
+            explanations.append("你本周选中的论文整体引用积累高于跳过论文，说明当前选择对外部影响力信号也较敏感。")
+        elif avg_skipped > avg_selected * 1.2:
+            explanations.append("你本周跳过的论文里有一批外部引用更高的候选，说明周报里的“遗漏但重要”仍值得继续补看。")
+
+    if cited_by_must_read:
+        top_relation = cited_by_must_read[0]
+        matched_authors = top_relation.get("matches", [{}])[0].get("matched_authors", []) or []
+        if matched_authors:
+            explanations.append(
+                f"《{top_relation['title']}》已被你的必读作者 {', '.join(matched_authors[:2])} 的后续工作引用，属于更强的引用关系信号。"
+            )
+
+    return {
+        "selected_impacts": selected_impacts[:3],
+        "skipped_impacts": skipped_impacts[:3],
+        "cited_by_must_read": cited_by_must_read[:3],
+        "explanations": explanations[:3],
+    }
 
 
 def _generate_suggestions(report: Dict) -> List[str]:
@@ -161,6 +452,7 @@ def generate_weekly_report(user_id: str, days: int = 7) -> Dict[str, Any]:
     logs = get_behavior_logs(user_id, start_date.isoformat(), end_date.isoformat())
     recent_pushes = get_recent_pushes(user_id, limit=100)
     drift_updates = get_recent_drift_updates(user_id, days)
+    doc_engagement = get_doc_engagement_stats(user_id, days)
 
     reading_history = profile.get("reading_history", [])
     recent_reads = [
@@ -176,6 +468,8 @@ def generate_weekly_report(user_id: str, days: int = 7) -> Dict[str, Any]:
 
     core_directions = profile.get("core_directions", {})
     top_directions = sorted(core_directions.items(), key=lambda item: -item[1])[:7]
+    drift_summary = _build_drift_summary(profile, drift_updates)
+    external_impact = _build_external_impact_summary(profile, logs, recent_pushes)
 
     return {
         "user_id": user_id,
@@ -183,13 +477,17 @@ def generate_weekly_report(user_id: str, days: int = 7) -> Dict[str, Any]:
         "direction_changes": direction_changes,
         "stats": stats,
         "stats_by_category": stats_by_category,
+        "accuracy_explanations": _build_accuracy_explanations(stats_by_category),
         "recent_reads_count": len(recent_reads),
         "top_authors": top_authors,
         "top_institutions": top_institutions,
         "top_directions": top_directions,
         "missed_papers": _detect_missed_papers(logs, recent_pushes),
         "profile_version": profile.get("version", "unknown"),
-        "drift_summary": _build_drift_summary(profile, drift_updates),
+        "drift_summary": drift_summary,
+        "trend_explanations": _build_trend_explanations(direction_changes, drift_summary),
+        "doc_engagement": doc_engagement,
+        "external_impact": external_impact,
     }
 
 
@@ -209,7 +507,8 @@ def format_report_card(report: Dict) -> str:
         if drift_summary.get("detected_at"):
             lines.append(f"最近一次检测时间：{drift_summary.get('detected_at')}")
         if drift_summary.get("top_shift_topics"):
-            lines.append(f"最近漂移主题：{', '.join(drift_summary.get('top_shift_topics', [])[:3])}")
+            topic_labels = [translate_direction(topic) for topic in drift_summary.get("top_shift_topics", [])[:3]]
+            lines.append(f"最近漂移主题：{', '.join(topic_labels)}")
         lines.append(f"更新器解释：{drift_summary.get('explanation', '')}")
         lines.append("")
 
@@ -243,6 +542,16 @@ def format_report_card(report: Dict) -> str:
     lines.append("━━━ 本周阅读统计 ━━━")
     lines.append(f"推送论文总数：{stats.get('total', 0)}")
     lines.append(f"你选择精读：{stats.get('selected', 0)}（选择率 {stats.get('selection_rate', 0):.1%}）")
+    doc_engagement = report.get("doc_engagement", {}) or {}
+    if doc_engagement.get("total_doc_opens"):
+        lines.append(
+            f"精读文档打开：{doc_engagement.get('total_doc_opens', 0)} 次"
+            f"（去重后 {doc_engagement.get('unique_doc_opens', 0)} 篇）"
+        )
+    if doc_engagement.get("dwell_proxy_count"):
+        lines.append(
+            f"精读阅读停留代理：平均 {float(doc_engagement.get('avg_dwell_proxy_seconds', 0.0)):.0f} 秒"
+        )
     lines.append("")
 
     stats_by_category = report.get("stats_by_category", {})
@@ -260,6 +569,8 @@ def format_report_card(report: Dict) -> str:
                 continue
             rate = stats_by_category[cat_key].get("selection_rate", 0)
             lines.append(f"{emoji}{label}中你选择了：{rate:.0%}")
+        for explanation in report.get("accuracy_explanations", [])[:3]:
+            lines.append(f"  · {explanation}")
         lines.append("")
 
     top_authors = report.get("top_authors", [])
@@ -280,8 +591,42 @@ def format_report_card(report: Dict) -> str:
     if missed_papers:
         lines.append("━━━ 你可能遗漏的 ━━━")
         for paper in missed_papers[:3]:
-            lines.append(f"[{paper.get('title', 'Unknown')}]")
+            impact_text = ""
+            if paper.get("cited_by_count"):
+                impact_text = f" | OpenAlex cited_by={paper.get('cited_by_count')}"
+            lines.append(f"[{paper.get('title', 'Unknown')}] {impact_text}")
         lines.append("→ 要补读吗？")
+        lines.append("")
+
+    external_impact = report.get("external_impact", {}) or {}
+    if external_impact:
+        selected_impacts = external_impact.get("selected_impacts", []) or []
+        cited_by_must_read = external_impact.get("cited_by_must_read", []) or []
+        explanations = external_impact.get("explanations", []) or []
+        if selected_impacts or cited_by_must_read or explanations:
+            lines.append("━━━ 外部影响信号 ━━━")
+            for explanation in explanations[:3]:
+                lines.append(f"  · {explanation}")
+            for paper in selected_impacts[:2]:
+                lines.append(
+                    f"  · 已选高影响论文：《{paper.get('title', 'Unknown')}》"
+                    f" | cited_by={paper.get('cited_by_count', 0)}"
+                )
+            for relation in cited_by_must_read[:2]:
+                match = (relation.get("matches") or [{}])[0]
+                matched_authors = match.get("matched_authors", []) or []
+                if matched_authors:
+                    lines.append(
+                        f"  · 必读作者引用：《{relation.get('title', 'Unknown')}》"
+                        f" ← {', '.join(matched_authors[:2])}"
+                    )
+            lines.append("")
+
+    trend_explanations = report.get("trend_explanations", [])
+    if trend_explanations:
+        lines.append("━━━ 趋势解释 ━━━")
+        for item in trend_explanations[:3]:
+            lines.append(f"  · {item}")
         lines.append("")
 
     lines.append("━━━ 画像调整建议 ━━━")

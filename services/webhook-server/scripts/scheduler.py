@@ -11,7 +11,7 @@ import logging
 import os
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -33,6 +33,7 @@ _SCHEDULER_THREAD: Optional[threading.Thread] = None
 _SCHEDULER_STOP_EVENT: Optional[threading.Event] = None
 _INFLIGHT_LOCK = threading.Lock()
 _INFLIGHT_JOBS: set[str] = set()
+_ALERT_IMPORT_ERROR = False
 
 
 def _env_flag(name: str, default: bool = True) -> bool:
@@ -115,6 +116,42 @@ def get_scheduler_grace_minutes() -> int:
         return 10
 
 
+def get_max_retries() -> int:
+    raw = os.environ.get("SCITASTE_SCHEDULER_MAX_RETRIES", "2").strip()
+    try:
+        return max(0, min(10, int(raw)))
+    except ValueError:
+        return 2
+
+
+def get_retry_backoff_minutes() -> int:
+    raw = os.environ.get("SCITASTE_SCHEDULER_RETRY_BACKOFF_MINUTES", "15").strip()
+    try:
+        return max(1, min(720, int(raw)))
+    except ValueError:
+        return 15
+
+
+def get_daily_compensation_hours() -> int:
+    raw = os.environ.get("SCITASTE_SCHEDULER_DAILY_COMPENSATION_HOURS", "6").strip()
+    try:
+        return max(0, min(48, int(raw)))
+    except ValueError:
+        return 6
+
+
+def get_weekly_compensation_hours() -> int:
+    raw = os.environ.get("SCITASTE_SCHEDULER_WEEKLY_COMPENSATION_HOURS", "6").strip()
+    try:
+        return max(0, min(168, int(raw)))
+    except ValueError:
+        return 6
+
+
+def get_scheduler_alert_chat_id() -> str:
+    return str(os.environ.get("SCITASTE_SCHEDULER_ALERT_CHAT_ID", "")).strip()
+
+
 def _minutes_since_midnight(value: datetime) -> int:
     return (value.hour * 60) + value.minute
 
@@ -176,14 +213,28 @@ def load_scheduler_state(state_path: Path = SCHEDULER_STATE_PATH) -> Dict[str, A
         state = {}
 
     jobs = state.get("jobs")
+    retries = state.get("retries")
+    runtime = state.get("runtime")
     if not isinstance(jobs, dict):
         jobs = {}
-    return {"jobs": jobs}
+    if not isinstance(retries, dict):
+        retries = {}
+    if not isinstance(runtime, dict):
+        runtime = {}
+    runtime.setdefault("heartbeat_at", "")
+    runtime.setdefault("last_loop_started_at", "")
+    runtime.setdefault("last_loop_finished_at", "")
+    runtime.setdefault("last_results", [])
+    return {"jobs": jobs, "retries": retries, "runtime": runtime}
 
 
 def save_scheduler_state(state: Dict[str, Any], state_path: Path = SCHEDULER_STATE_PATH) -> None:
     state_path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"jobs": dict(state.get("jobs") or {})}
+    payload = {
+        "jobs": dict(state.get("jobs") or {}),
+        "retries": dict(state.get("retries") or {}),
+        "runtime": dict(state.get("runtime") or {}),
+    }
     temp_path = state_path.with_suffix(".tmp")
     temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     temp_path.replace(state_path)
@@ -206,25 +257,131 @@ def _mark_ran(state: Dict[str, Any], job_key: str, marker: str) -> None:
     state.setdefault("jobs", {})[job_key] = marker
 
 
+def _scheduled_datetime(now: datetime, hour: int, minute: int, *, weekday: Optional[int] = None) -> datetime:
+    if weekday is None:
+        return now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    start_of_week = now - timedelta(days=now.weekday())
+    scheduled = start_of_week + timedelta(days=weekday)
+    return scheduled.replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+
+def _is_within_compensation_window(now: datetime, scheduled_at: datetime, hours: int) -> bool:
+    if hours <= 0 or now < scheduled_at:
+        return False
+    return now - scheduled_at <= timedelta(hours=hours)
+
+
+def _get_retry_entry(state: Dict[str, Any], job_key: str) -> Optional[Dict[str, Any]]:
+    entry = (state.get("retries") or {}).get(job_key)
+    return entry if isinstance(entry, dict) else None
+
+
+def _clear_retry(state: Dict[str, Any], job_key: str) -> None:
+    (state.get("retries") or {}).pop(job_key, None)
+
+
+def _schedule_retry(state: Dict[str, Any], job_key: str, marker: str, error: str, now: datetime) -> bool:
+    retries = state.setdefault("retries", {})
+    current = dict(retries.get(job_key) or {})
+    attempts = int(current.get("attempts", 0)) + 1
+    if attempts > get_max_retries():
+        retries.pop(job_key, None)
+        return False
+
+    backoff_minutes = get_retry_backoff_minutes() * attempts
+    retries[job_key] = {
+        "marker": marker,
+        "attempts": attempts,
+        "last_error": str(error or "").strip(),
+        "last_failed_at": now.isoformat(),
+        "next_retry_at": (now + timedelta(minutes=backoff_minutes)).isoformat(),
+    }
+    return True
+
+
+def _is_retry_due(state: Dict[str, Any], job_key: str, marker: str, now: datetime) -> bool:
+    entry = _get_retry_entry(state, job_key)
+    if not entry:
+        return False
+    if str(entry.get("marker") or "") != marker:
+        return False
+    next_retry_at = str(entry.get("next_retry_at") or "").strip()
+    if not next_retry_at:
+        return False
+    try:
+        retry_time = datetime.fromisoformat(next_retry_at)
+    except ValueError:
+        return False
+    return now >= retry_time
+
+
+def _send_scheduler_alert(message: str) -> None:
+    global _ALERT_IMPORT_ERROR
+    alert_chat_id = get_scheduler_alert_chat_id()
+    if not alert_chat_id:
+        return
+    try:
+        feishu_reporter = importlib.import_module("skills.feishu-reporter.scripts.feishu_reporter")
+        send_text_to_chat = getattr(feishu_reporter, "send_text_to_chat", None)
+        if callable(send_text_to_chat):
+            send_text_to_chat(alert_chat_id, f"[Scheduler Alert] {message}")
+    except Exception:
+        if not _ALERT_IMPORT_ERROR:
+            LOGGER.exception("Failed to send scheduler alert")
+            _ALERT_IMPORT_ERROR = True
+
+
+def _update_runtime_state(state: Dict[str, Any], *, started_at: Optional[datetime] = None, finished_at: Optional[datetime] = None, results: Optional[List[Dict[str, Any]]] = None) -> None:
+    runtime = state.setdefault("runtime", {})
+    runtime["heartbeat_at"] = datetime.now().isoformat()
+    if started_at is not None:
+        runtime["last_loop_started_at"] = started_at.isoformat()
+    if finished_at is not None:
+        runtime["last_loop_finished_at"] = finished_at.isoformat()
+    if results is not None:
+        runtime["last_results"] = results[:20]
+
+
+def get_scheduler_status_snapshot(state_path: Path = SCHEDULER_STATE_PATH) -> Dict[str, Any]:
+    state = load_scheduler_state(state_path)
+    with _THREAD_LOCK:
+        thread_alive = bool(_SCHEDULER_THREAD and _SCHEDULER_THREAD.is_alive())
+    return {
+        "enabled": scheduler_enabled(),
+        "schedule": describe_schedule(),
+        "thread_alive": thread_alive,
+        "inflight_jobs": sorted(_INFLIGHT_JOBS),
+        "runtime": state.get("runtime", {}),
+        "retry_jobs": state.get("retries", {}),
+        "completed_markers": state.get("jobs", {}),
+    }
+
+
 def should_run_daily_push(now: datetime, role_name: str, state: Dict[str, Any]) -> bool:
     marker = _daily_marker(now)
     if _already_ran(state, f"daily_push:{role_name}", marker):
         return False
 
     hour, minute = get_daily_push_time()
-    return _is_within_schedule_window(now, hour, minute)
+    scheduled_at = _scheduled_datetime(now, hour, minute)
+    return _is_within_schedule_window(now, hour, minute) or _is_within_compensation_window(
+        now,
+        scheduled_at,
+        get_daily_compensation_hours(),
+    )
 
 
 def should_run_weekly_report(now: datetime, role_name: str, state: Dict[str, Any]) -> bool:
-    if now.weekday() != get_weekly_report_weekday():
-        return False
-
     marker = _weekly_marker(now)
     if _already_ran(state, f"weekly_report:{role_name}", marker):
         return False
 
     hour, minute = get_weekly_report_time()
-    return _is_within_schedule_window(now, hour, minute)
+    weekday = get_weekly_report_weekday()
+    scheduled_at = _scheduled_datetime(now, hour, minute, weekday=weekday)
+    if now.weekday() == weekday and _is_within_schedule_window(now, hour, minute):
+        return True
+    return _is_within_compensation_window(now, scheduled_at, get_weekly_compensation_hours())
 
 
 def _trigger_daily_push(role_name: str, user_id: str, chat_id: str) -> None:
@@ -272,6 +429,7 @@ def run_due_jobs(
 
     current_time = get_scheduler_now(now)
     state = load_scheduler_state(state_path)
+    _update_runtime_state(state, started_at=current_time)
     roles = get_scheduled_roles(load_roles_meta(roles_path))
     results: List[Dict[str, str]] = []
     state_changed = False
@@ -286,31 +444,78 @@ def run_due_jobs(
             continue
 
         daily_job_key = f"daily_push:{role_name}"
-        if should_run_daily_push(current_time, role_name, state) and _acquire_job(daily_job_key):
+        daily_marker = _daily_marker(current_time)
+        daily_trigger = None
+        if _is_retry_due(state, daily_job_key, daily_marker, current_time):
+            daily_trigger = "retry"
+        elif should_run_daily_push(current_time, role_name, state):
+            scheduled_at = _scheduled_datetime(current_time, *get_daily_push_time())
+            daily_trigger = "scheduled" if _is_within_schedule_window(current_time, *get_daily_push_time()) else "compensation"
+
+        if daily_trigger and _acquire_job(daily_job_key):
             try:
                 _trigger_daily_push(role_name, user_id, chat_id)
-                _mark_ran(state, daily_job_key, _daily_marker(current_time))
+                _mark_ran(state, daily_job_key, daily_marker)
+                _clear_retry(state, daily_job_key)
                 state_changed = True
-                results.append({"job": "daily_push", "role_name": role_name, "status": "success"})
+                results.append({"job": "daily_push", "role_name": role_name, "status": "success", "trigger": daily_trigger})
             except Exception as exc:
                 LOGGER.exception("Scheduled daily push failed for %s: %s", role_name, exc)
-                results.append({"job": "daily_push", "role_name": role_name, "status": "error"})
+                retry_scheduled = _schedule_retry(state, daily_job_key, daily_marker, str(exc), current_time)
+                state_changed = True
+                results.append(
+                    {
+                        "job": "daily_push",
+                        "role_name": role_name,
+                        "status": "error",
+                        "trigger": daily_trigger,
+                        "retry_scheduled": retry_scheduled,
+                    }
+                )
+                alert_suffix = "retry scheduled" if retry_scheduled else "retries exhausted"
+                _send_scheduler_alert(f"daily_push failed for {role_name}: {exc} ({alert_suffix})")
             finally:
                 _release_job(daily_job_key)
 
         weekly_job_key = f"weekly_report:{role_name}"
-        if should_run_weekly_report(current_time, role_name, state) and _acquire_job(weekly_job_key):
+        weekly_marker = _weekly_marker(current_time)
+        weekly_trigger = None
+        if _is_retry_due(state, weekly_job_key, weekly_marker, current_time):
+            weekly_trigger = "retry"
+        elif should_run_weekly_report(current_time, role_name, state):
+            scheduled_at = _scheduled_datetime(current_time, *get_weekly_report_time(), weekday=get_weekly_report_weekday())
+            if current_time.weekday() == get_weekly_report_weekday() and _is_within_schedule_window(current_time, *get_weekly_report_time()):
+                weekly_trigger = "scheduled"
+            else:
+                weekly_trigger = "compensation"
+
+        if weekly_trigger and _acquire_job(weekly_job_key):
             try:
                 _trigger_weekly_report(role_name, user_id, chat_id)
-                _mark_ran(state, weekly_job_key, _weekly_marker(current_time))
+                _mark_ran(state, weekly_job_key, weekly_marker)
+                _clear_retry(state, weekly_job_key)
                 state_changed = True
-                results.append({"job": "weekly_report", "role_name": role_name, "status": "success"})
+                results.append({"job": "weekly_report", "role_name": role_name, "status": "success", "trigger": weekly_trigger})
             except Exception as exc:
                 LOGGER.exception("Scheduled weekly report failed for %s: %s", role_name, exc)
-                results.append({"job": "weekly_report", "role_name": role_name, "status": "error"})
+                retry_scheduled = _schedule_retry(state, weekly_job_key, weekly_marker, str(exc), current_time)
+                state_changed = True
+                results.append(
+                    {
+                        "job": "weekly_report",
+                        "role_name": role_name,
+                        "status": "error",
+                        "trigger": weekly_trigger,
+                        "retry_scheduled": retry_scheduled,
+                    }
+                )
+                alert_suffix = "retry scheduled" if retry_scheduled else "retries exhausted"
+                _send_scheduler_alert(f"weekly_report failed for {role_name}: {exc} ({alert_suffix})")
             finally:
                 _release_job(weekly_job_key)
 
+    _update_runtime_state(state, finished_at=datetime.now(), results=results)
+    state_changed = state_changed or bool(results)
     if state_changed:
         save_scheduler_state(state, state_path)
 

@@ -35,11 +35,15 @@ log_behavior = db_ops.log_behavior
 get_profile = db_ops.get_profile
 update_profile = db_ops.update_profile
 get_recent_selected_papers = getattr(db_ops, "get_recent_selected_papers", lambda *args, **kwargs: [])
+get_push_papers = getattr(db_ops, "get_push_papers", lambda push_id: None)
 
 profile_updater = importlib.import_module("skills.profile-updater.scripts.update_profile")
 update_profile_with_feedback = profile_updater.update_profile_with_feedback
 ensure_profile_schema = profile_updater.ensure_profile_schema
 get_drift_blend_weights = profile_updater.get_drift_blend_weights
+direction_lexicon = importlib.import_module("config.direction_lexicon")
+canonicalize_direction_terms = direction_lexicon.canonicalize_direction_terms
+format_direction_label = direction_lexicon.format_direction_label
 
 # 飞书报告器
 feishu_reporter = importlib.import_module("skills.feishu-reporter.scripts.feishu_reporter")
@@ -52,6 +56,67 @@ CATEGORY_LABELS = {
     "maybe_interested": "🟡 可能感兴趣",
     "edge_relevant": "🔵 边缘相关",
 }
+
+
+def _paper_topic_candidates(paper: Dict[str, Any]) -> List[str]:
+    candidates: List[str] = []
+    for key in ("topics", "keywords", "categories"):
+        value = paper.get(key) or []
+        if isinstance(value, list):
+            candidates.extend(str(item).strip() for item in value if str(item).strip())
+        elif isinstance(value, str) and value.strip():
+            candidates.append(value.strip())
+    return canonicalize_direction_terms(candidates, keep_unknown=True)
+
+
+def _build_contrastive_signals(selected: Set[int], skipped: Set[int], papers: List[Dict]) -> List[str]:
+    """Generate pairwise explanations such as 'you chose 06 but skipped 08'."""
+    contrastive_signals: List[str] = []
+    selected_candidates = []
+    skipped_candidates = []
+
+    for paper_num in sorted(selected):
+        paper = papers[paper_num - 1]
+        topics = _paper_topic_candidates(paper)
+        if topics:
+            selected_candidates.append((paper_num, paper, topics))
+
+    for paper_num in sorted(skipped):
+        paper = papers[paper_num - 1]
+        topics = _paper_topic_candidates(paper)
+        if topics:
+            skipped_candidates.append((paper_num, paper, topics))
+
+    for selected_num, selected_paper, selected_topics in selected_candidates:
+        selected_category = str(selected_paper.get("category") or "")
+        if selected_category not in {"maybe_interested", "edge_relevant", "high_relevant"}:
+            continue
+
+        for skipped_num, skipped_paper, skipped_topics in skipped_candidates:
+            if skipped_num == selected_num:
+                continue
+            skipped_category = str(skipped_paper.get("category") or "")
+            if skipped_category not in {"must_read", "high_relevant", "maybe_interested"}:
+                continue
+
+            preferred_topics = [topic for topic in selected_topics if topic not in skipped_topics]
+            deprioritized_topics = [topic for topic in skipped_topics if topic not in selected_topics]
+            if not preferred_topics or not deprioritized_topics:
+                continue
+
+            preferred_label = format_direction_label(preferred_topics[0], prefer_chinese=True)
+            deprioritized_label = format_direction_label(deprioritized_topics[0], prefer_chinese=True)
+            signal = (
+                f"✓ 你选了 {selected_num:02d}（{preferred_label}）但跳过了 {skipped_num:02d}（{deprioritized_label}）"
+                f" → 当前更偏 {preferred_label} 而非 {deprioritized_label}"
+            )
+            if signal not in contrastive_signals:
+                contrastive_signals.append(signal)
+            if len(contrastive_signals) >= 2:
+                return contrastive_signals
+            break
+
+    return contrastive_signals
 
 
 def create_reading_reports_for_selection(
@@ -268,13 +333,18 @@ def build_learning_signals(selected: Set[int], skipped: Set[int], papers: List[D
         dominant_label = CATEGORY_LABELS.get(dominant_category, dominant_category)
         signals.append(f"✓ 本次选择主要集中在“{dominant_label}”分组，后续我会优先沿这条线细化推荐")
 
-    return signals[:3]
+    signals.extend(_build_contrastive_signals(selected, skipped, papers))
+
+    return signals[:4]
 
 
 def format_selection_summary(
     selected: Set[int],
     total_papers: int,
-    papers: List[Dict]
+    papers: List[Dict],
+    *,
+    profile_updated: bool = True,
+    reliability_note: str = "",
 ) -> str:
     """
     格式化选择摘要
@@ -305,8 +375,13 @@ def format_selection_summary(
         lines.append("学到的信号：")
         lines.extend(learning_signals)
 
+    if reliability_note:
+        lines.append(reliability_note)
     lines.append("以上推断我会继续用后续行为自动校正；如果哪条明显不对，直接补一句纠正我就行。")
-    lines.append("画像已更新，下次推送会据此调整。")
+    if profile_updated:
+        lines.append("画像已更新，下次推送会据此调整。")
+    else:
+        lines.append("本次只记录选择结果，不更新偏好模型；下次完整浏览后再继续学习。")
 
     return "\n".join(lines)
 
@@ -318,6 +393,7 @@ def update_profile_based_on_selection(
     skipped_paper_ids: Optional[List[int]] = None,
     historical_selected_papers: Optional[List[Dict[str, Any]]] = None,
     current_timestamp: Optional[datetime] = None,
+    feedback_strength_multiplier: float = 1.0,
 ) -> Dict:
     """Update the profile via the unified drift-aware updater."""
     profile = get_profile(user_id)
@@ -350,9 +426,39 @@ def update_profile_based_on_selection(
         skipped_papers,
         historical_selected_papers=historical_selected_papers or [],
         current_time=now,
+        feedback_strength_multiplier=feedback_strength_multiplier,
     )
     update_profile(user_id, updated_profile)
     return updated_profile
+
+
+def estimate_feedback_strength_multiplier(push_id: str, current_timestamp: datetime) -> tuple[float, Optional[float]]:
+    """Use reply latency as a lightweight reliability signal."""
+    push_info = get_push_papers(push_id) or {}
+    push_time_raw = push_info.get("push_time")
+    if not push_time_raw:
+        return 1.0, None
+    try:
+        push_time = datetime.fromisoformat(str(push_time_raw).replace("Z", "+00:00"))
+    except ValueError:
+        return 1.0, None
+
+    now = current_timestamp
+    if push_time.tzinfo and now.tzinfo is None:
+        now = now.replace(tzinfo=push_time.tzinfo)
+    elif now.tzinfo and push_time.tzinfo is None:
+        push_time = push_time.replace(tzinfo=now.tzinfo)
+
+    latency_seconds = max(0.0, (now - push_time).total_seconds())
+    if latency_seconds <= 15 * 60:
+        return 1.15, latency_seconds
+    if latency_seconds <= 60 * 60:
+        return 1.05, latency_seconds
+    if latency_seconds >= 12 * 60 * 60:
+        return 0.85, latency_seconds
+    if latency_seconds >= 6 * 60 * 60:
+        return 0.92, latency_seconds
+    return 1.0, latency_seconds
 
 
 def process_feedback(
@@ -400,6 +506,7 @@ def process_feedback(
 
     print(f"Selected paper numbers: {sorted(selected)}")
     current_timestamp = datetime.now()
+    feedback_strength_multiplier, feedback_latency_seconds = estimate_feedback_strength_multiplier(push_id, current_timestamp)
     history_before_update = get_recent_selected_papers(
         user_id,
         limit=60,
@@ -451,37 +558,56 @@ def process_feedback(
                 }
             )
 
-    # 3. 更新画像
-    updated_profile = update_profile_based_on_selection(
-        user_id,
-        list(selected),
-        papers,
-        skipped_paper_ids=list(skipped),
-        historical_selected_papers=history_before_update,
-        current_timestamp=current_timestamp,
-    )
-    drift_state = (updated_profile or {}).get("drift_state", {}) or {}
-    log_behavior(
-        user_id=user_id,
-        push_id=push_id,
-        paper_id=None,
-        action="profile_updated",
-        action_type="drift_update",
-        category=drift_state.get("status", "stable"),
-        metadata={
-            "drift_status": drift_state.get("status", "stable"),
-            "drift_score": drift_state.get("score", 0.0),
-            "adaptive_alpha": drift_state.get("adaptive_alpha", 0.0),
-            "top_shift_topics": drift_state.get("top_shift_topics", []),
-            "interest_vector_descriptor": _build_interest_vector_descriptor(updated_profile or {}),
-            "selected_count": len(selected),
-            "skipped_count": len(skipped),
-            "explanation": drift_state.get("explanation", ""),
-        },
-    )
+    skip_profile_learning = reply_lower == "all lock"
+    reliability_note = ""
+    updated_profile: Dict[str, Any] = {}
+    if skip_profile_learning:
+        reliability_note = "本次使用了 all lock 快捷模式，我会把它视为忙碌日结果，只保留阅读队列，不把这次反馈计入偏好学习。"
+    else:
+        updated_profile = update_profile_based_on_selection(
+            user_id,
+            list(selected),
+            papers,
+            skipped_paper_ids=list(skipped),
+            historical_selected_papers=history_before_update,
+            current_timestamp=current_timestamp,
+            feedback_strength_multiplier=feedback_strength_multiplier,
+        )
+        drift_state = (updated_profile or {}).get("drift_state", {}) or {}
+        log_behavior(
+            user_id=user_id,
+            push_id=push_id,
+            paper_id=None,
+            action="profile_updated",
+            action_type="drift_update",
+            category=drift_state.get("status", "stable"),
+            metadata={
+                "drift_status": drift_state.get("status", "stable"),
+                "drift_score": drift_state.get("score", 0.0),
+                "adaptive_alpha": drift_state.get("adaptive_alpha", 0.0),
+                "top_shift_topics": drift_state.get("top_shift_topics", []),
+                "interest_vector_descriptor": _build_interest_vector_descriptor(updated_profile or {}),
+                "selected_count": len(selected),
+                "skipped_count": len(skipped),
+                "feedback_latency_seconds": round(float(feedback_latency_seconds), 2) if feedback_latency_seconds is not None else None,
+                "feedback_strength_multiplier": round(float(feedback_strength_multiplier), 4),
+                "explanation": drift_state.get("explanation", ""),
+            },
+        )
 
     # 4. 发送确认消息
-    summary = format_selection_summary(selected, len(papers), papers)
+    if not reliability_note and feedback_latency_seconds is not None:
+        if feedback_strength_multiplier > 1.0:
+            reliability_note = "这次反馈比较及时，我会略微提高本轮信号权重。"
+        elif feedback_strength_multiplier < 1.0:
+            reliability_note = "这次反馈和推送间隔较久，我会保守一些吸收这轮信号。"
+    summary = format_selection_summary(
+        selected,
+        len(papers),
+        papers,
+        profile_updated=not skip_profile_learning,
+        reliability_note=reliability_note,
+    )
 
     if target_id and send_to_feishu:
         send_text(target_id, summary, use_chat_id=use_chat_id)

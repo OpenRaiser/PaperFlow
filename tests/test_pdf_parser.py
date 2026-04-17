@@ -78,6 +78,40 @@ def test_parse_pdf_extracts_methodology_and_full_text(tmp_path, monkeypatch):
     assert "framework uses a benchmark dataset" in result["full_text"].lower()
 
 
+def test_extract_text_from_pdf_uses_ocr_when_primary_text_is_too_short(tmp_path, monkeypatch):
+    pdf_path = _create_pdf(tmp_path, "scan placeholder")
+
+    monkeypatch.setattr(pdf_parser, "HAS_PYMUPDF", True)
+    monkeypatch.setattr(pdf_parser, "_extract_text_from_pdf_with_pymupdf", lambda path: "")
+    monkeypatch.setattr(pdf_parser, "_should_try_ocr", lambda text, path: True)
+    monkeypatch.setattr(
+        pdf_parser,
+        "_extract_text_from_pdf_with_ocr",
+        lambda path: "OCR recovered abstract text with method details and results.",
+    )
+
+    text = pdf_parser.extract_text_from_pdf(pdf_path)
+
+    assert text == "OCR recovered abstract text with method details and results."
+
+
+def test_extract_text_from_pdf_keeps_primary_text_when_ocr_is_not_better(tmp_path, monkeypatch):
+    pdf_path = _create_pdf(tmp_path, "text layer placeholder")
+
+    monkeypatch.setattr(pdf_parser, "HAS_PYMUPDF", True)
+    monkeypatch.setattr(
+        pdf_parser,
+        "_extract_text_from_pdf_with_pymupdf",
+        lambda path: "Primary extracted text with enough content to keep.",
+    )
+    monkeypatch.setattr(pdf_parser, "_should_try_ocr", lambda text, path: True)
+    monkeypatch.setattr(pdf_parser, "_extract_text_from_pdf_with_ocr", lambda path: "short ocr")
+
+    text = pdf_parser.extract_text_from_pdf(pdf_path)
+
+    assert text == "Primary extracted text with enough content to keep."
+
+
 def test_infer_research_directions_can_use_embedding_service(monkeypatch):
     class FakeEmbeddingService:
         def embed_text(self, text):

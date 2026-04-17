@@ -338,6 +338,41 @@ def test_parse_article_detail_html_returns_source_page_sections_and_full_text():
     assert "direct PDF is unavailable" in source_page["full_text"]
 
 
+def test_parse_article_detail_html_preserves_long_source_page_abstract():
+    long_paragraph = (
+        "This abstract paragraph describes a source-page reading workflow with detailed motivation, "
+        "method design, implementation choices, and experimental observations for multimodal scientific "
+        "reading systems. "
+    ) * 6
+    second_paragraph = (
+        "A second long paragraph explains benchmark setup, evaluation criteria, robustness checks, and "
+        "observed improvements across multiple domains without relying on a PDF download step. "
+    ) * 5
+
+    html = f"""
+    <html>
+      <body>
+        <article>
+          <section data-title="Abstract">
+            <p>{long_paragraph}</p>
+            <p>{second_paragraph}</p>
+          </section>
+        </article>
+      </body>
+    </html>
+    """
+
+    parsed = journal_fetcher._parse_article_detail_html(
+        html,
+        "https://www.nature.com/articles/s41586-026-00004-4",
+    )
+
+    abstract = parsed["abstract"]
+    assert len(abstract) > 1200
+    assert "benchmark setup" in abstract
+    assert not abstract.endswith("...")
+
+
 def test_fetch_journal_papers_skips_nature_news_style_article_ids(monkeypatch):
     news_entry = FakeEntry(
         title="Interesting scientific development",
@@ -467,3 +502,62 @@ def test_fetch_article_detail_falls_back_to_scholarly_metadata_when_page_is_bloc
     assert detail["authors"] == ["Alice", "Bob"]
     assert detail["doi"] == "10.1145/example"
     assert detail["pdf_url"] == "https://dl.acm.org/doi/pdf/10.1145/example"
+
+
+def test_fetch_article_detail_uses_openalex_landing_page_as_fulltext_fallback(monkeypatch):
+    class FakeResponse:
+        def __init__(self, url, text, content_type="text/html"):
+            self.url = url
+            self.text = text
+            self.headers = {"Content-Type": content_type}
+
+    def fake_http_get(url, **kwargs):
+        if "doi.org" in url:
+            raise RuntimeError("403 forbidden")
+        if "authors.example.com" in url:
+            return FakeResponse(
+                "https://authors.example.com/paper",
+                """
+                <html>
+                  <head>
+                    <meta name="citation_title" content="Recovered ACM Paper">
+                    <meta name="citation_pdf_url" content="https://authors.example.com/paper.pdf">
+                  </head>
+                  <body>
+                    <article>
+                      <section data-title="Abstract">
+                        <p>Recovered full-text abstract from the author manuscript landing page.</p>
+                      </section>
+                      <h2>Method</h2>
+                      <p>The author manuscript preserves a method section that can be reused as source-page fallback.</p>
+                    </article>
+                  </body>
+                </html>
+                """,
+            )
+        raise AssertionError(f"Unexpected URL: {url}")
+
+    monkeypatch.setattr(journal_fetcher, "_http_get", fake_http_get)
+    monkeypatch.setattr(
+        journal_fetcher,
+        "_fetch_openalex_metadata",
+        lambda doi: {
+            "title": "Recovered ACM Paper",
+            "abstract": "",
+            "authors": ["Alice", "Bob"],
+            "doi": "10.1145/example",
+            "pdf_url": "",
+            "landing_page_url": "https://authors.example.com/paper",
+            "venue": "ACM Multimedia",
+            "publish_date": "2026-04-16",
+        },
+    )
+    monkeypatch.setattr(journal_fetcher, "_fetch_crossref_metadata", lambda doi: {})
+
+    detail = journal_fetcher._fetch_article_detail("https://doi.org/10.1145/example")
+
+    assert detail["title"] == "Recovered ACM Paper"
+    assert detail["abstract"] == "Recovered full-text abstract from the author manuscript landing page."
+    assert detail["pdf_url"] == "https://authors.example.com/paper.pdf"
+    assert detail["metadata"]["source_page"]["source_url"] == "https://authors.example.com/paper"
+    assert "method" in detail["metadata"]["source_page"]["sections"]

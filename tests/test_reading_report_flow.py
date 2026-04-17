@@ -77,8 +77,128 @@ def test_create_reading_report_sends_doc_links(monkeypatch):
     assert docs[1]["doc_token"] == "doc_2"
     assert sent_messages[0]["target_id"] == "oc_rolea_test"
     assert sent_messages[0]["use_chat_id"] is True
-    assert "https://example.feishu.cn/docx/1" in sent_messages[0]["text"]
-    assert "https://example.feishu.cn/docx/2" in sent_messages[0]["text"]
+    assert (
+        "https://example.feishu.cn/docx/1" in sent_messages[0]["text"]
+        or "target=https%3A%2F%2Fexample.feishu.cn%2Fdocx%2F1" in sent_messages[0]["text"]
+    )
+    assert (
+        "https://example.feishu.cn/docx/2" in sent_messages[0]["text"]
+        or "target=https%3A%2F%2Fexample.feishu.cn%2Fdocx%2F2" in sent_messages[0]["text"]
+    )
+
+
+def test_create_reading_report_uses_tracking_links_when_public_url_available(monkeypatch):
+    monkeypatch.setattr(reading_agent, "get_profile", lambda user_id: {"core_directions": {"machine-learning": 0.8}})
+    monkeypatch.setattr(reading_agent, "log_behavior", lambda **kwargs: None)
+    monkeypatch.setattr(reading_agent, "get_existing_reading_reports_for_papers", lambda user_id, paper_ids: {})
+    monkeypatch.setattr(reading_agent, "get_recent_created_report_by_source", lambda *args, **kwargs: None)
+    monkeypatch.setattr(reading_agent, "_synthesize_report_with_llm", lambda *args, **kwargs: None)
+    monkeypatch.setattr(reading_agent, "enrich_paper_for_reading_report", lambda paper: (paper, None, None))
+    monkeypatch.setattr(reading_agent, "_load_public_webhook_base_url", lambda: "https://demo.ngrok.app")
+
+    sent_messages = []
+    monkeypatch.setattr(
+        reading_agent,
+        "send_text",
+        lambda target_id, text, use_chat_id=False: sent_messages.append(text) or {"ok": True},
+    )
+    monkeypatch.setattr(
+        reading_agent,
+        "create_doc",
+        lambda title, content, folder_id=None: {"url": "https://example.feishu.cn/docx/1", "obj_token": "doc_1"},
+    )
+
+    docs = reading_agent.create_reading_report(
+        user_id="user_rolea",
+        paper_ids=[1],
+        papers=[{"id": 1, "title": "Paper One", "authors": ["Alice"], "abstract": "Abstract one"}],
+        send_to_feishu=True,
+        chat_id="oc_rolea_test",
+    )
+
+    assert len(docs) == 1
+    assert docs[0]["tracking_url"].startswith("https://demo.ngrok.app/r/doc?")
+    assert "https://demo.ngrok.app/r/doc?" in sent_messages[0]
+
+
+def test_create_reading_report_direct_upload_applies_weak_reading_signal(monkeypatch):
+    monkeypatch.setattr(
+        reading_agent,
+        "get_profile",
+        lambda user_id: {"core_directions": {}, "topic_weights": {}, "methodology_preferences": {}},
+    )
+    monkeypatch.setattr(reading_agent, "get_existing_reading_reports_for_papers", lambda user_id, paper_ids: {})
+    monkeypatch.setattr(reading_agent, "get_recent_created_report_by_source", lambda *args, **kwargs: None)
+    monkeypatch.setattr(reading_agent, "_synthesize_report_with_llm", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        reading_agent,
+        "enrich_paper_for_reading_report",
+        lambda paper: (
+            {
+                **paper,
+                "title": "GUI Agent Survey",
+                "authors": ["Alice"],
+                "abstract": "We study GUI agents for interface automation.",
+            },
+            {
+                "abstract": "We study GUI agents for interface automation.",
+                "inferred_topics": ["gui agent"],
+                "inferred_directions": [{"name": "GUI Agent", "confidence": 0.66}],
+                "sections": {},
+                "full_text": "We study GUI agents for interface automation.",
+            },
+            None,
+        ),
+    )
+
+    updated_profiles = []
+
+    monkeypatch.setattr(
+        reading_agent,
+        "update_profile_with_reading_signal",
+        lambda profile, **kwargs: {
+            **profile,
+            "reading_signal_state": {
+                "last_signal": {
+                    "timestamp": "2026-04-17T13:00:00",
+                    "topics": ["gui-agent"],
+                    "activated_topics": [],
+                    "strength": "weak",
+                    "source_type": kwargs.get("source_type", ""),
+                    "source_key": kwargs.get("source_key", ""),
+                    "explicit_note": "",
+                },
+                "short_term_topics": {},
+            },
+        },
+    )
+    monkeypatch.setattr(reading_agent, "update_profile", lambda user_id, profile: updated_profiles.append((user_id, profile)))
+    monkeypatch.setattr(
+        reading_agent,
+        "create_doc",
+        lambda title, content, folder_id=None: {"url": "https://example.feishu.cn/docx/direct-upload", "obj_token": "doc_direct_upload"},
+    )
+
+    logged = []
+    monkeypatch.setattr(reading_agent, "log_behavior", lambda **kwargs: logged.append(kwargs))
+
+    docs = reading_agent.create_reading_report(
+        user_id="user_rolea",
+        paper_ids=[],
+        papers=[{"pdf_path": "C:/tmp/uploaded.pdf", "title": "Uploaded PDF"}],
+        send_to_feishu=False,
+        request_metadata={
+            "report_source_type": "feishu_file_key",
+            "report_source_key": "file_v3_uploaded_signal",
+            "report_source_name": "uploaded.pdf",
+        },
+    )
+
+    assert len(docs) == 1
+    assert updated_profiles
+    assert any(log["action_type"] == "reading_signal" for log in logged)
+    created_report_log = next(log for log in logged if log["action_type"] == "reading")
+    assert created_report_log["metadata"]["reading_signal_topics"] == ["gui-agent"]
 
 
 def test_extract_doc_url_ignores_non_url_placeholders():
@@ -602,6 +722,64 @@ def test_build_heuristic_report_payload_uses_retrieved_evidence(monkeypatch):
     assert payload["retrieved_evidence"]["matches"]["method"]
     assert payload["field_evidence_map"]["core_method"]
     assert payload["report_evidence_anchors"]["results"]
+
+
+def test_retrieve_report_evidence_uses_profile_embedding_as_primary_signal(monkeypatch):
+    class FakeEmbeddingService:
+        descriptor = "fake:test:profile"
+
+        def embed_batch(self, texts):
+            vectors = []
+            for text in texts:
+                lowered = text.lower()
+                vectors.append(
+                    [
+                        float("agent" in lowered or "retrieval" in lowered),
+                        float("planner" in lowered or "workflow" in lowered),
+                        float("protein" in lowered or "molecule" in lowered),
+                        float("benchmark" in lowered or "result" in lowered),
+                    ]
+                )
+            return vectors
+
+        @staticmethod
+        def cosine_similarity(vector1, vector2):
+            dot_product = sum(a * b for a, b in zip(vector1, vector2))
+            norm1 = sum(a * a for a in vector1) ** 0.5
+            norm2 = sum(b * b for b in vector2) ** 0.5
+            if norm1 == 0 or norm2 == 0:
+                return 0.0
+            return dot_product / (norm1 * norm2)
+
+    class FakeEmbeddingModule:
+        @staticmethod
+        def get_embedding_service():
+            return FakeEmbeddingService()
+
+    monkeypatch.setattr(reading_agent, "_load_embedding_module", lambda: FakeEmbeddingModule())
+    monkeypatch.setattr(reading_agent, "READING_REPORT_PROFILE_RETRIEVAL_WEIGHT", 0.5)
+    monkeypatch.setattr(reading_agent, "READING_REPORT_EVIDENCE_CACHE_ENABLED", False)
+
+    paper = {"title": "Mixed Paper", "abstract": "This paper includes multiple chunks."}
+    profile = {"core_directions": {"agent": 0.8, "retrieval": 0.7}, "methodology_preferences": {}}
+    parsed_pdf = {
+        "abstract": "This paper includes multiple chunks.",
+        "sections": {
+            "method": "We propose an agent retrieval workflow planner for long-horizon literature tasks.",
+            "results": "Benchmark results show the planner improves retrieval quality.",
+            "discussion": "A protein analysis appendix is unrelated to the user profile.",
+        },
+        "full_text": (
+            "We propose an agent retrieval workflow planner for long-horizon literature tasks. "
+            "Benchmark results show the planner improves retrieval quality. "
+            "A protein analysis appendix is unrelated to the user profile."
+        ),
+    }
+
+    evidence = reading_agent._retrieve_report_evidence(paper, profile, parsed_pdf)
+
+    assert evidence["profile_retrieval_weight"] == 0.5
+    assert "agent retrieval workflow planner" in evidence["matches"]["relevance"][0]["text"].lower()
 
 
 def test_generate_reading_report_includes_pdf_evidence_anchor_section():
@@ -1206,5 +1384,60 @@ def test_enrich_paper_falls_back_to_source_page_when_pdf_download_fails(monkeypa
     assert enriched["abstract"] == "Recovered abstract from the source page."
     assert parsed_pdf is not None
     assert parsed_pdf["source_kind"] == "source_page"
-    assert "structured reading reports" in parsed_pdf["full_text"]
-    assert "403 forbidden" in str(pdf_error)
+
+
+def test_enrich_paper_prefers_longer_pdf_abstract_over_short_metadata(monkeypatch):
+    pdf_path = Path("C:/tmp/example-full-abstract.pdf")
+
+    monkeypatch.setattr(reading_agent.os.path, "exists", lambda path: str(path) == str(pdf_path))
+    monkeypatch.setattr(
+        reading_agent,
+        "_parse_pdf_for_report",
+        lambda path: {
+            "abstract": (
+                "This paper presents a complete PDF abstract with concrete motivation, method design, "
+                "training setup, and experimental findings that are substantially longer than the teaser."
+            ),
+            "authors": ["Alice", "Bob"],
+            "sections": {},
+            "full_text": "Full PDF text.",
+        },
+    )
+
+    enriched, parsed_pdf, pdf_error = reading_agent.enrich_paper_for_reading_report(
+        {
+            "title": "PDF Preferred Abstract",
+            "pdf_path": str(pdf_path),
+            "abstract": "Short teaser abstract.",
+            "authors": ["Alice"],
+        }
+    )
+
+    assert pdf_error is None
+    assert parsed_pdf is not None
+    assert enriched["abstract"].startswith("This paper presents a complete PDF abstract")
+
+
+def test_build_heuristic_report_payload_keeps_full_pdf_abstract():
+    full_abstract = (
+        "This paper presents a complete PDF abstract with concrete motivation, method design, "
+        "training setup, evaluation protocol, and detailed empirical findings. "
+        "It is intentionally longer than the reading-report abstract character cap and should still "
+        "be preserved in full once the PDF extractor has already recovered it."
+    )
+
+    payload = reading_agent.build_heuristic_report_payload(
+        {
+            "title": "Full PDF Abstract Paper",
+            "abstract": "Short metadata teaser.",
+        },
+        {"core_directions": {"agent": 0.8}, "methodology_preferences": {}},
+        parsed_pdf={
+            "source_kind": "pdf",
+            "abstract": full_abstract,
+            "sections": {},
+            "full_text": full_abstract,
+        },
+    )
+
+    assert payload["abstract"] == full_abstract

@@ -622,6 +622,155 @@ def get_recent_created_report_by_source(
     return None
 
 
+def get_recent_created_report(
+    user_id: str,
+    *,
+    minutes: int = 180,
+) -> Optional[Dict[str, Any]]:
+    """
+    Return the latest created reading report for a user.
+    """
+    since_timestamp = (datetime.now() - timedelta(minutes=max(1, int(minutes)))).isoformat(sep=" ")
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT bl.paper_id, bl.timestamp, bl.metadata, p.title AS paper_title
+        FROM behavior_logs bl
+        LEFT JOIN papers p ON p.id = bl.paper_id
+        WHERE bl.user_id = ?
+          AND bl.action = 'created_report'
+          AND bl.action_type = 'reading'
+          AND bl.timestamp >= ?
+        ORDER BY bl.timestamp DESC, bl.id DESC
+        LIMIT 1
+        """,
+        (user_id, since_timestamp),
+    )
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        return None
+    return _build_created_report_record(row)
+
+
+def get_pending_doc_open_for_dwell(
+    user_id: str,
+    *,
+    within_minutes: int = 240,
+) -> Optional[Dict[str, Any]]:
+    """
+    Return the latest tracked doc-open event that has not yet produced a dwell proxy.
+    """
+    since_timestamp = (datetime.now() - timedelta(minutes=max(1, int(within_minutes)))).isoformat(sep=" ")
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT id, user_id, push_id, paper_id, action, action_type, category, timestamp, metadata
+        FROM behavior_logs
+        WHERE user_id = ?
+          AND action = 'opened_report'
+          AND action_type = 'doc_open'
+          AND timestamp >= ?
+        ORDER BY timestamp DESC, id DESC
+        LIMIT 20
+        """,
+        (user_id, since_timestamp),
+    )
+    open_rows = cursor.fetchall()
+    if not open_rows:
+        conn.close()
+        return None
+
+    for row in open_rows:
+        metadata = _load_json_metadata(row["metadata"])
+        doc_token = _normalize_identifier(metadata.get("doc_token"))
+        doc_url = _normalize_identifier(metadata.get("doc_url"))
+        already_consumed = False
+        cursor.execute(
+            """
+            SELECT metadata
+            FROM behavior_logs
+            WHERE user_id = ?
+              AND action = 'doc_dwell_proxy'
+              AND action_type = 'doc_engagement'
+              AND timestamp >= ?
+            ORDER BY timestamp DESC, id DESC
+            LIMIT 20
+            """,
+            (user_id, row["timestamp"]),
+        )
+        for dwell_row in cursor.fetchall():
+            dwell_metadata = _load_json_metadata(dwell_row["metadata"])
+            if doc_token and _normalize_identifier(dwell_metadata.get("doc_token")) == doc_token:
+                already_consumed = True
+                break
+            if doc_url and _normalize_identifier(dwell_metadata.get("doc_url")) == doc_url:
+                already_consumed = True
+                break
+        if already_consumed:
+            continue
+        conn.close()
+        record = dict(row)
+        record["metadata"] = metadata
+        return record
+
+    conn.close()
+    return None
+
+
+def get_doc_engagement_stats(user_id: str, days: int = 7) -> Dict[str, Any]:
+    """
+    Aggregate lightweight doc engagement proxies.
+    """
+    since_timestamp = (datetime.now() - timedelta(days=max(1, int(days)))).isoformat(sep=" ")
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT action, action_type, metadata, timestamp
+        FROM behavior_logs
+        WHERE user_id = ?
+          AND timestamp >= ?
+          AND (
+            (action = 'opened_report' AND action_type = 'doc_open')
+            OR (action = 'doc_dwell_proxy' AND action_type = 'doc_engagement')
+          )
+        ORDER BY timestamp ASC, id ASC
+        """,
+        (user_id, since_timestamp),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+
+    unique_docs = set()
+    total_opens = 0
+    dwell_values: List[float] = []
+    for row in rows:
+        metadata = _load_json_metadata(row["metadata"])
+        doc_key = _normalize_identifier(metadata.get("doc_token")) or _normalize_identifier(metadata.get("doc_url"))
+        if row["action"] == "opened_report":
+            total_opens += 1
+            if doc_key:
+                unique_docs.add(doc_key)
+        elif row["action"] == "doc_dwell_proxy":
+            try:
+                dwell_seconds = float(metadata.get("dwell_seconds") or 0.0)
+            except (TypeError, ValueError):
+                dwell_seconds = 0.0
+            if dwell_seconds > 0:
+                dwell_values.append(dwell_seconds)
+
+    average_dwell_seconds = round(sum(dwell_values) / len(dwell_values), 2) if dwell_values else 0.0
+    return {
+        "total_doc_opens": total_opens,
+        "unique_doc_opens": len(unique_docs),
+        "avg_dwell_proxy_seconds": average_dwell_seconds,
+        "dwell_proxy_count": len(dwell_values),
+    }
+
+
 def get_behavior_logs(user_id: str, start_date: str, end_date: str) -> List[Dict]:
     """Get behavior logs for a date range"""
     conn = get_connection()
@@ -1052,6 +1201,61 @@ def get_recent_drift_updates(user_id: str, days: int = 7) -> List[Dict[str, Any]
         results.append(record)
 
     return results
+
+
+def get_recent_reading_signal(
+    user_id: str,
+    minutes: int = 30,
+    *,
+    source_prefix: str = "feishu_",
+) -> Optional[Dict[str, Any]]:
+    """
+    Return the latest reading-signal profile update for a user.
+
+    This is used to reinforce the most recent direct-upload PDF topics when the
+    user follows up with a generic phrase like "这类我最近想多看".
+    """
+    since_timestamp = (datetime.now() - timedelta(minutes=max(1, int(minutes)))).isoformat(sep=" ")
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT id, user_id, push_id, paper_id, action, action_type, category, timestamp, metadata
+        FROM behavior_logs
+        WHERE user_id = ?
+          AND action = 'profile_updated'
+          AND action_type = 'reading_signal'
+          AND timestamp >= ?
+        ORDER BY timestamp DESC, id DESC
+        LIMIT 20
+        """,
+        (user_id, since_timestamp),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+
+    for row in rows:
+        record = dict(row)
+        metadata = _load_json_metadata(record.get("metadata"))
+        source_type = _normalize_identifier(metadata.get("source_type") or metadata.get("report_source_type"))
+        if source_prefix and (not source_type or not source_type.startswith(source_prefix)):
+            continue
+
+        topics = _deserialize_json_list(metadata.get("signal_topics") or metadata.get("topics"))
+        activated_topics = _deserialize_json_list(metadata.get("activated_topics"))
+        if not topics:
+            continue
+
+        record["metadata"] = metadata
+        record["topics"] = topics
+        record["activated_topics"] = activated_topics
+        record["source_type"] = source_type
+        record["source_key"] = _normalize_identifier(metadata.get("source_key") or metadata.get("report_source_key"))
+        record["signal_strength"] = str(metadata.get("signal_strength") or metadata.get("strength") or "").strip()
+        return record
+
+    return None
 
 
 def get_push_papers(push_id: str) -> Optional[Dict]:

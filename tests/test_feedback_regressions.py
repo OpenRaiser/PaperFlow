@@ -149,6 +149,27 @@ def test_selection_summary_uses_pdf_style_ranges():
     assert "05" in summary
 
 
+def test_build_learning_signals_includes_contrastive_pair_explanation():
+    papers = [
+        {
+            "id": 1,
+            "title": "Emergence in Biological Models",
+            "category": "maybe_interested",
+            "topics": ["bio-molecular", "emergence"],
+        },
+        {
+            "id": 2,
+            "title": "AutoML for Science",
+            "category": "high_relevant",
+            "topics": ["optimization", "science-discovery"],
+        },
+    ]
+
+    signals = feedback_agent.build_learning_signals({1}, {2}, papers)
+
+    assert any("你选了 01" in signal and "跳过了 02" in signal for signal in signals)
+
+
 def test_process_feedback_triggers_reading_report_generation_for_selected_papers(
     test_db_path,
     sample_profile,
@@ -316,3 +337,51 @@ def test_process_feedback_logs_drift_snapshot_for_legacy_profile(test_db_path, s
     assert "drift_state" in updated_profile
     assert updated_profile["drift_state"]["status"] in {"stable", "shifting", "recovered"}
     assert len(drift_logs) == 1
+
+
+def test_process_feedback_all_lock_skips_profile_learning(
+    test_db_path,
+    sample_profile,
+    monkeypatch,
+):
+    _use_test_db(test_db_path)
+
+    profile = copy.deepcopy(sample_profile)
+    profile["user_id"] = "user_rolea"
+    db_ops.create_profile("user_rolea", profile)
+
+    monkeypatch.setattr(
+        feedback_agent,
+        "update_profile_based_on_selection",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("all lock should skip profile learning")),
+    )
+
+    result = feedback_agent.process_feedback(
+        user_id="user_rolea",
+        push_id="push_all_lock",
+        reply="all lock",
+        papers=[
+            {"id": 1, "title": "Must Read A", "authors": ["Alice"], "category": "must_read"},
+            {"id": 2, "title": "Other B", "authors": ["Bob"], "category": "high_relevant"},
+        ],
+        send_to_feishu=False,
+    )
+
+    assert result["status"] == "success"
+    assert result["selected_count"] == 1
+    assert result["skipped_count"] == 1
+
+
+def test_estimate_feedback_strength_multiplier_uses_push_latency(monkeypatch):
+    now = feedback_agent.datetime(2026, 4, 18, 10, 0, 0)
+
+    monkeypatch.setattr(
+        feedback_agent,
+        "get_push_papers",
+        lambda push_id: {"push_time": "2026-04-18 09:50:00"},
+    )
+
+    multiplier, latency_seconds = feedback_agent.estimate_feedback_strength_multiplier("push_1", now)
+
+    assert multiplier > 1.0
+    assert latency_seconds == 600.0

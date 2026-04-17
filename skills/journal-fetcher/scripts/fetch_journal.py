@@ -461,7 +461,7 @@ def _extract_body_summary_from_html(html: str) -> str:
 
     summary = " ".join(paragraphs[:3])
     summary = re.sub(r"\s+", " ", summary).strip()
-    return summary[:1200]
+    return summary
 
 
 def _extract_main_html_fragment(html: str) -> str:
@@ -524,6 +524,9 @@ def _extract_source_page_sections_and_full_text(
     def store(section_key: str, value: str) -> None:
         cleaned_value = re.sub(r"\s+", " ", _clean_html_text(value)).strip()
         if len(cleaned_value) < 60:
+            return
+        if section_key == "abstract":
+            sections[section_key] = cleaned_value[:6000]
             return
         previous = sections.get(section_key, "")
         if len(cleaned_value) > len(previous):
@@ -602,7 +605,7 @@ def _extract_nature_abstract_from_html(html: str) -> str:
         for fragment in re.findall(pattern, html, flags=re.I | re.S):
             paragraphs = _extract_paragraphs_from_fragment(fragment, min_length=40)
             if paragraphs:
-                return re.sub(r"\s+", " ", " ".join(paragraphs)).strip()[:1200]
+                return re.sub(r"\s+", " ", " ".join(paragraphs)).strip()
     return ""
 
 
@@ -750,6 +753,7 @@ def _fetch_openalex_metadata(doi: str) -> Dict[str, Any]:
 
     primary_location = work.get("primary_location") or {}
     best_oa_location = work.get("best_oa_location") or {}
+    primary_source = primary_location.get("source") or {}
 
     return {
         "title": _clean_html_text(work.get("display_name") or work.get("title")),
@@ -760,12 +764,65 @@ def _fetch_openalex_metadata(doi: str) -> Dict[str, Any]:
             str(best_oa_location.get("pdf_url") or "").strip()
             or str(primary_location.get("pdf_url") or "").strip()
         ),
+        "landing_page_url": (
+            str(best_oa_location.get("landing_page_url") or "").strip()
+            or str(primary_location.get("landing_page_url") or "").strip()
+        ),
         "venue": _clean_html_text(
-            ((primary_location.get("source") or {}).get("display_name"))
+            primary_source.get("display_name")
             or work.get("primary_location", {}).get("raw_source_name")
         ),
         "publish_date": str(work.get("publication_date") or "").strip(),
     }
+
+
+def _fetch_open_access_source_detail(url: Any) -> Dict[str, Any]:
+    candidate = str(url or "").strip()
+    if not candidate.startswith(("http://", "https://")):
+        return {}
+
+    if candidate.lower().endswith(".pdf"):
+        return {"pdf_url": candidate}
+
+    try:
+        response = _http_get(candidate, timeout=JOURNAL_REQUEST_TIMEOUT)
+    except Exception:
+        return {
+            "metadata": {
+                "source_page": {
+                    "source_kind": "source_page",
+                    "source_url": candidate,
+                    "abstract": "",
+                    "sections": {},
+                    "full_text": "",
+                }
+            }
+        }
+
+    final_url = str(response.url or candidate)
+    content_type = str(response.headers.get("Content-Type") or "").lower()
+    if "application/pdf" in content_type or final_url.lower().endswith(".pdf"):
+        return {"pdf_url": final_url}
+
+    parsed = _parse_article_detail_html(response.text or "", final_url)
+    metadata = dict(parsed.get("metadata") or {})
+    source_page = dict(metadata.get("source_page") or {})
+    source_page_abstract = _clean_html_text(source_page.get("abstract"))
+    parsed_abstract = _clean_html_text(parsed.get("abstract"))
+    if source_page_abstract and (not parsed_abstract or len(source_page_abstract) > len(parsed_abstract) + 40):
+        parsed["abstract"] = source_page_abstract
+    metadata.setdefault(
+        "source_page",
+        {
+            "source_kind": "source_page",
+            "source_url": final_url,
+            "abstract": "",
+            "sections": {},
+            "full_text": "",
+        },
+    )
+    parsed["metadata"] = metadata
+    return parsed
 
 
 def _fetch_scholarly_metadata_fallback(url_or_doi: Any) -> Dict[str, Any]:
@@ -797,6 +854,26 @@ def _fetch_scholarly_metadata_fallback(url_or_doi: Any) -> Dict[str, Any]:
         or merged.get("abstract")
         or ""
     )
+
+    oa_source_url = str(openalex_detail.get("landing_page_url") or "").strip()
+    if oa_source_url:
+        oa_source_detail = _fetch_open_access_source_detail(oa_source_url)
+        if oa_source_detail:
+            merged = _merge_detail_into_paper(merged, oa_source_detail)
+        else:
+            existing_metadata = dict(merged.get("metadata") or {})
+            existing_metadata.setdefault(
+                "source_page",
+                {
+                    "source_kind": "source_page",
+                    "source_url": oa_source_url,
+                    "abstract": "",
+                    "sections": {},
+                    "full_text": "",
+                },
+            )
+            merged["metadata"] = existing_metadata
+
     if merged:
         merged["doi"] = merged.get("doi") or doi
     return merged
@@ -847,6 +924,9 @@ def _parse_article_detail_html(html: str, page_url: str) -> Dict[str, Any]:
     if body_summary and (not abstract or len(_clean_html_text(abstract)) < 120):
         abstract = body_summary
     sections, full_text = _extract_source_page_sections_and_full_text(html, abstract=abstract)
+    section_abstract = _clean_html_text(sections.get("abstract"))
+    if section_abstract:
+        abstract = section_abstract
     authors = _extract_meta_contents(html, ["citation_author", "dc.creator", "author"])
     doi = _extract_first_meta_content(html, ["citation_doi", "dc.identifier"])
     article_type = (

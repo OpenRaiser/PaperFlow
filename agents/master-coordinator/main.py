@@ -48,9 +48,14 @@ update_profile = db_ops.update_profile
 get_latest_push = db_ops.get_latest_push
 get_latest_selected_papers = getattr(db_ops, "get_latest_selected_papers", lambda user_id: None)
 get_recent_pushes = db_ops.get_recent_pushes
+get_recent_created_report = getattr(db_ops, "get_recent_created_report", lambda user_id, minutes=180: None)
+log_behavior = db_ops.log_behavior
 profile_updater = importlib.import_module("skills.profile-updater.scripts.update_profile")
 build_default_drift_state = profile_updater.build_default_drift_state
+ensure_profile_schema = profile_updater.ensure_profile_schema
+update_profile_with_reading_signal = profile_updater.update_profile_with_reading_signal
 direction_lexicon = importlib.import_module("config.direction_lexicon")
+canonicalize_direction_terms = direction_lexicon.canonicalize_direction_terms
 confirm_pending_direction_candidate = direction_lexicon.confirm_pending_direction_candidate
 find_pending_direction_candidate = direction_lexicon.find_pending_direction_candidate
 get_direction_entry = direction_lexicon.get_direction_entry
@@ -120,6 +125,20 @@ TOPIC_KEY_ALIASES = {
     },
 }
 
+PUSH_CATEGORY_LABELS = {
+    "must_read": "🔒 必读",
+    "high_relevant": "🔴 高度相关",
+    "maybe_interested": "🟡 可能感兴趣",
+    "edge_relevant": "🔵 边缘相关",
+}
+
+CATEGORY_PRIORITY = {
+    "must_read": 4,
+    "high_relevant": 3,
+    "maybe_interested": 2,
+    "edge_relevant": 1,
+}
+
 
 def get_current_user_id() -> str:
     """
@@ -160,6 +179,9 @@ def send_message(text: str, chat_id: Optional[str] = None, user_id: Optional[str
 
 def format_direction_label(direction: str) -> str:
     """Format internal topic keys into user-facing labels."""
+    formatter = getattr(direction_lexicon, "format_direction_label", None)
+    if callable(formatter):
+        return str(formatter(direction, prefer_chinese=True) or direction)
     entry = get_direction_entry(direction)
     if entry:
         return str(entry.get("name_cn") or entry.get("name") or direction)
@@ -231,7 +253,12 @@ def repair_profile_from_role_description(user_id: str, profile: Dict[str, Any]) 
     if not role_meta:
         return profile
 
-    bootstrap_text = (role_meta.get("natural_language") or role_meta.get("description") or "").strip()
+    bootstrap_text = (
+        role_meta.get("natural_language")
+        or role_meta.get("bootstrap_summary")
+        or role_meta.get("description")
+        or ""
+    ).strip()
     if not bootstrap_text:
         return profile
 
@@ -258,7 +285,7 @@ def format_profile_message(profile: Dict[str, Any]) -> str:
     lines = [f"📋 你的学术画像（v{version} - {stage}）", ""]
 
     lines.append("━━━ 核心方向 ━━━")
-    core_directions = profile.get("core_directions", {})
+    core_directions = profile.get("core_directions", {}) or {}
     if core_directions:
         for direction, weight in sorted(core_directions.items(), key=lambda item: -item[1]):
             label = format_direction_label(direction)
@@ -271,18 +298,24 @@ def format_profile_message(profile: Dict[str, Any]) -> str:
     lines.append("")
 
     lines.append("━━━ 方法论偏好 ━━━")
-    method_prefs = profile.get("methodology_preferences", {})
+    method_prefs = profile.get("methodology_preferences", {}) or {}
     if method_prefs:
-        lines.append(
-            "├── 偏好数据驱动 > 纯理论"
-            if method_prefs.get("preference_data_driven_over_theory")
-            else "├── 偏好纯理论 > 数据驱动"
-        )
-        lines.append(
-            "├── 偏好系统性工作 > 单点改进"
-            if method_prefs.get("preference_systematic_work_over_incremental")
-            else "├── 偏好单点改进 > 系统性工作"
-        )
+        data_pref = method_prefs.get("preference_data_driven_over_theory")
+        if data_pref is True:
+            lines.append("├── 偏好数据驱动 > 纯理论")
+        elif data_pref is False:
+            lines.append("├── 偏好纯理论 > 数据驱动")
+        else:
+            lines.append("├── 数据驱动 / 纯理论：暂无明确信号")
+
+        systematic_pref = method_prefs.get("preference_systematic_work_over_incremental")
+        if systematic_pref is True:
+            lines.append("├── 偏好系统性工作 > 单点改进")
+        elif systematic_pref is False:
+            lines.append("├── 偏好单点改进 > 系统性工作")
+        else:
+            lines.append("├── 系统性工作 / 单点改进：暂无明确信号")
+
         lines.append(
             "├── 偏好有开源代码的工作"
             if method_prefs.get("preference_open_source_code")
@@ -294,19 +327,18 @@ def format_profile_message(profile: Dict[str, Any]) -> str:
             else "└── 当前偏向通用研究场景"
         )
     else:
-        lines.append("（暂无数据，后续会根据你的选择继续学习）")
+        lines.append("（暂无方法论偏好信号）")
     lines.append("")
 
     lines.append("━━━ 必读清单 ━━━")
-    must_read = profile.get("must_read", {})
+    must_read = profile.get("must_read", {}) or {}
     lines.append(f"作者：{', '.join(must_read.get('authors', [])) or '（空，待你添加）'}")
     lines.append(f"机构：{', '.join(must_read.get('institutions', [])) or '（空，待你添加）'}")
     lines.append(f"关键词：{', '.join(must_read.get('keywords', [])) or '（空，待你添加）'}")
 
-    author_heat = profile.get("author_heat", {})
+    author_heat = profile.get("author_heat", {}) or {}
     filtered_author_heat = {
-        author: heat for author, heat in author_heat.items()
-        if is_displayable_author_name(author)
+        author: heat for author, heat in author_heat.items() if is_displayable_author_name(author)
     }
     if filtered_author_heat:
         top_authors = sorted(filtered_author_heat.items(), key=lambda item: -item[1])[:3]
@@ -315,12 +347,16 @@ def format_profile_message(profile: Dict[str, Any]) -> str:
         for author, heat in top_authors:
             lines.append(f"{author}（热度：{heat:.2f}）")
 
-    lines.append("")
-    lines.append("━━━━━━━━━━━━")
-    lines.append("你可以直接说：")
-    lines.append('  "加个必读作者：XXX"')
-    lines.append('  "降低 GUI Agent 权重"')
-    lines.append('  "我最近对 protein language model 更感兴趣了"')
+    lines.extend(
+        [
+            "",
+            "━━━━━━━━━━━━",
+            "你可以直接说：",
+            '  "加个必读作者：XXX"',
+            '  "降低 GUI Agent 权重"',
+            '  "我最近对 protein language model 更感兴趣了"',
+        ]
+    )
 
     return "\n".join(lines)
 
@@ -345,6 +381,11 @@ def build_empty_profile(user_id: str) -> Dict[str, Any]:
         "institution_heat": {},
         "interest_vector": [],
         "taste_profile": {},
+        "report_preferences": {
+            "positive_feedback_count": 0,
+            "negative_feedback_count": 0,
+            "preferred_evidence_top_k": 3,
+        },
         "reading_history": [],
         "behavior_logs": [],
         "drift_state": build_default_drift_state(now),
@@ -692,179 +733,10 @@ BOT_AUTHORED_PREFIXES = (
 def first_meaningful_line(text: Any) -> str:
     """Use only the leading content line so bot examples do not get reparsed as user input."""
     for raw_line in str(text or "").splitlines():
-        cleaned = raw_line.strip().strip("“”\"'")
+        cleaned = raw_line.strip().strip("\"'")
         if cleaned:
             return cleaned
     return ""
-
-
-'''
-# legacy duplicate intent parser separator
-def detect_explicit_command_intent(text: Any) -> Optional[Dict[str, Any]]:
-    """Fast-path obvious commands so they never go through the profile-update LLM."""
-    cleaned = first_meaningful_line(text)
-    lowered = cleaned.lower().strip()
-    if not lowered:
-        return None
-
-    if lowered in {"冷启动", "重新冷启动", "cold start", "cold-start"}:
-        return {"intent": "cold_start", "confidence": 1.0, "slots": {"text": cleaned}}
-
-    if lowered in {"推送", "daily push", "今日论文", "今天论文", "来一篇", "来几篇"}:
-        return {"intent": "daily_push", "confidence": 1.0, "slots": {}}
-
-    if lowered in {"精读", "read this", "deep read"}:
-        return {"intent": "reading_report", "confidence": 1.0, "slots": {}}
-
-    if lowered in {"周报", "weekly report"}:
-        return {"intent": "weekly_report", "confidence": 1.0, "slots": {}}
-
-    if lowered in {"必读", "必读清单"}:
-        return {"intent": "must_read", "confidence": 1.0, "slots": {"command": cleaned}}
-
-    if lowered in {"画像", "学术画像", "我的画像", "我的学术画像", "显示画像", "显示学术画像", "profile"}:
-        return {"intent": "show_profile", "confidence": 1.0, "slots": {}}
-
-    if lowered in {"all red", "all lock", "none", "全部", "没有"}:
-        return {"intent": "feedback", "confidence": 1.0, "slots": {"reply": cleaned}}
-
-    if re.fullmatch(r"[\d\s,\-，、]+", cleaned) and re.search(r"\d", cleaned):
-        return {"intent": "feedback", "confidence": 1.0, "slots": {"reply": cleaned}}
-
-    return None
-# legacy duplicate intent parser separator
-
-# legacy duplicate intent parser separator
-def detect_explicit_command_intent(text: Any) -> Optional[Dict[str, Any]]:
-    """Fast-path obvious commands so they never go through the profile-update LLM."""
-    cleaned = first_meaningful_line(text)
-    lowered = cleaned.lower().strip()
-    if not lowered:
-        return None
-
-    confirmed_direction = parse_confirm_direction_request(cleaned)
-    if confirmed_direction:
-        return {
-            "intent": "confirm_direction",
-            "confidence": 1.0,
-            "slots": {"topic": confirmed_direction},
-        }
-
-    if lowered in {"鍐峰惎鍔?, "閲嶆柊鍐峰惎鍔?, "cold start", "cold-start"}:
-        return {"intent": "cold_start", "confidence": 1.0, "slots": {"text": cleaned}}
-
-    if lowered in {"鎺ㄩ€?, "daily push", "浠婃棩璁烘枃", "浠婂ぉ璁烘枃", "鏉ヤ竴绡?, "鏉ュ嚑绡?}:
-        return {"intent": "daily_push", "confidence": 1.0, "slots": {}}
-
-    if lowered in {"绮捐", "read this", "deep read"}:
-        return {"intent": "reading_report", "confidence": 1.0, "slots": {}}
-
-    if lowered in {"鍛ㄦ姤", "weekly report"}:
-        return {"intent": "weekly_report", "confidence": 1.0, "slots": {}}
-
-    if lowered in {"蹇呰", "蹇呰娓呭崟"}:
-        return {"intent": "must_read", "confidence": 1.0, "slots": {"command": cleaned}}
-
-    if lowered in {"鐢诲儚", "瀛︽湳鐢诲儚", "鎴戠殑鐢诲儚", "鎴戠殑瀛︽湳鐢诲儚", "鏄剧ず鐢诲儚", "鏄剧ず瀛︽湳鐢诲儚", "profile"}:
-        return {"intent": "show_profile", "confidence": 1.0, "slots": {}}
-
-    if lowered in {"all red", "all lock", "none", "鍏ㄩ儴", "娌℃湁"}:
-        return {"intent": "feedback", "confidence": 1.0, "slots": {"reply": cleaned}}
-
-    if re.fullmatch(r"[\d\s,\-锛屻€乚+", cleaned) and re.search(r"\d", cleaned):
-        return {"intent": "feedback", "confidence": 1.0, "slots": {"reply": cleaned}}
-
-    return None
-
-
-# legacy duplicate intent parser separator
-
-# legacy duplicate intent parser separator
-def detect_explicit_command_intent(text: Any) -> Optional[Dict[str, Any]]:
-    """Fast-path obvious commands so they never go through the profile-update LLM."""
-    cleaned = first_meaningful_line(text)
-    lowered = cleaned.lower().strip()
-    if not lowered:
-        return None
-
-    confirmed_direction = parse_confirm_direction_request(cleaned)
-    if confirmed_direction:
-        return {
-            "intent": "confirm_direction",
-            "confidence": 1.0,
-            "slots": {"topic": confirmed_direction},
-        }
-
-    if lowered in {"冷启动", "重新冷启动", "cold start", "cold-start"}:
-        return {"intent": "cold_start", "confidence": 1.0, "slots": {"text": cleaned}}
-
-    if lowered in {"推送", "daily push", "今日论文", "今天论文", "来一篇", "来几篇"}:
-        return {"intent": "daily_push", "confidence": 1.0, "slots": {}}
-
-    if lowered in {"精读", "read this", "deep read"}:
-        return {"intent": "reading_report", "confidence": 1.0, "slots": {}}
-
-    if lowered in {"周报", "weekly report"}:
-        return {"intent": "weekly_report", "confidence": 1.0, "slots": {}}
-
-    if lowered in {"必读", "必读清单"}:
-        return {"intent": "must_read", "confidence": 1.0, "slots": {"command": cleaned}}
-
-    if lowered in {"画像", "学术画像", "我的画像", "我的学术画像", "显示画像", "显示学术画像", "profile"}:
-        return {"intent": "show_profile", "confidence": 1.0, "slots": {}}
-
-    if lowered in {"all red", "all lock", "none", "全部", "没有"}:
-        return {"intent": "feedback", "confidence": 1.0, "slots": {"reply": cleaned}}
-
-    if re.fullmatch(r"[\d\s,\-，、]+", cleaned) and re.search(r"\d", cleaned):
-        return {"intent": "feedback", "confidence": 1.0, "slots": {"reply": cleaned}}
-
-    return None
-
-
-def detect_explicit_command_intent(text: Any) -> Optional[Dict[str, Any]]:
-    """Fast-path obvious commands so they never go through the profile-update LLM."""
-    cleaned = first_meaningful_line(text)
-    lowered = cleaned.lower().strip()
-    if not lowered:
-        return None
-
-    confirmed_direction = parse_confirm_direction_request(cleaned)
-    if confirmed_direction:
-        return {
-            "intent": "confirm_direction",
-            "confidence": 1.0,
-            "slots": {"topic": confirmed_direction},
-        }
-
-    if lowered in {"冷启动", "重新冷启动", "cold start", "cold-start"}:
-        return {"intent": "cold_start", "confidence": 1.0, "slots": {"text": cleaned}}
-
-    if lowered in {"推送", "daily push", "今日论文", "今天论文", "来一篇", "来几篇"}:
-        return {"intent": "daily_push", "confidence": 1.0, "slots": {}}
-
-    if lowered in {"精读", "read this", "deep read"}:
-        return {"intent": "reading_report", "confidence": 1.0, "slots": {}}
-
-    if lowered in {"周报", "weekly report"}:
-        return {"intent": "weekly_report", "confidence": 1.0, "slots": {}}
-
-    if lowered in {"必读", "必读清单"}:
-        return {"intent": "must_read", "confidence": 1.0, "slots": {"command": cleaned}}
-
-    if lowered in {"画像", "学术画像", "我的画像", "我的学术画像", "显示画像", "显示学术画像", "profile"}:
-        return {"intent": "show_profile", "confidence": 1.0, "slots": {}}
-
-    if lowered in {"all red", "all lock", "none", "全部", "没有"}:
-        return {"intent": "feedback", "confidence": 1.0, "slots": {"reply": cleaned}}
-
-    if re.fullmatch(r"[\d\s,\-，、]+", cleaned) and re.search(r"\d", cleaned):
-        return {"intent": "feedback", "confidence": 1.0, "slots": {"reply": cleaned}}
-
-    return None
-
-
-'''
 
 
 def detect_explicit_command_intent(text: Any) -> Optional[Dict[str, Any]]:
@@ -898,6 +770,33 @@ def detect_explicit_command_intent(text: Any) -> Optional[Dict[str, Any]]:
     }
     feedback_commands = {"all red", "all lock", "none", "全部", "没有"}
 
+    scholar_url = extract_google_scholar_url(cleaned)
+    if scholar_url:
+        return {
+            "intent": "cold_start",
+            "confidence": 1.0,
+            "slots": {"text": cleaned, "scholar_url": scholar_url},
+        }
+
+    pdf_url = extract_pdf_url(text)
+    if pdf_url:
+        return {
+            "intent": "reading_report",
+            "confidence": 1.0,
+            "slots": {
+                "pdf_url": pdf_url,
+                "title_hint": normalize_direct_pdf_title_hint(strip_pdf_url(text)),
+            },
+        }
+
+    homepage_url = extract_homepage_url(cleaned)
+    if homepage_url:
+        return {
+            "intent": "cold_start",
+            "confidence": 1.0,
+            "slots": {"text": cleaned, "homepage_url": homepage_url},
+        }
+
     if lowered in cold_start_commands:
         return {"intent": "cold_start", "confidence": 1.0, "slots": {"text": cleaned}}
     if lowered in daily_push_commands:
@@ -912,7 +811,7 @@ def detect_explicit_command_intent(text: Any) -> Optional[Dict[str, Any]]:
         return {"intent": "show_profile", "confidence": 1.0, "slots": {}}
     if lowered in feedback_commands:
         return {"intent": "feedback", "confidence": 1.0, "slots": {"reply": cleaned}}
-    if re.fullmatch(r"[\d\s,\-\uFF0C\u3001]+", cleaned) and re.search(r"\d", cleaned):
+    if re.fullmatch(r"[\d\s,\-，、]+", cleaned) and re.search(r"\d", cleaned):
         return {"intent": "feedback", "confidence": 1.0, "slots": {"reply": cleaned}}
 
     return None
@@ -1070,6 +969,16 @@ COLD_START_BOOTSTRAP_HINTS = (
     "my research",
 )
 
+GOOGLE_SCHOLAR_URL_RE = re.compile(
+    r"(?P<url>(?:https?://)?(?:scholar\.google\.[^/\s]+)/(?:citations|scholar)\?[^\s]*\buser=[A-Za-z0-9_-]+[^\s]*)",
+    re.IGNORECASE,
+)
+
+GENERIC_HTTP_URL_RE = re.compile(
+    r"(?P<url>(?:https?://)?(?:www\.)?[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?:/[^\s]*)?)",
+    re.IGNORECASE,
+)
+
 
 def looks_like_must_read_command(text: Any) -> bool:
     """Detect must-read list operations without colliding with profile edits."""
@@ -1097,6 +1006,232 @@ def looks_like_must_read_command(text: Any) -> bool:
     return False
 
 
+def extract_google_scholar_url(text: Any) -> Optional[str]:
+    """Extract the first Google Scholar profile URL from arbitrary user text."""
+    match = GOOGLE_SCHOLAR_URL_RE.search(str(text or ""))
+    if not match:
+        return None
+    url = str(match.group("url") or "").strip().rstrip(".,);]\u3002\uff0c\uff1b")
+    if not url:
+        return None
+    if "://" not in url:
+        url = f"https://{url.lstrip('/')}"
+    return url
+
+
+def looks_like_pdf_http_url(url: Any) -> bool:
+    """Heuristic filter for direct PDF-style URLs used for reading reports."""
+    candidate = str(url or "").strip()
+    if not candidate:
+        return False
+    if "://" not in candidate:
+        candidate = f"https://{candidate.lstrip('/')}"
+    lowered = candidate.casefold()
+    return (
+        lowered.startswith(("http://", "https://"))
+        and (
+            ".pdf" in lowered
+            or "/pdf?" in lowered
+            or "/pdf/" in lowered
+            or "arxiv.org/pdf/" in lowered
+            or "openreview.net/pdf" in lowered
+        )
+    )
+
+
+def extract_pdf_url(text: Any) -> Optional[str]:
+    """Extract the first PDF-like URL from arbitrary user text."""
+    for match in GENERIC_HTTP_URL_RE.finditer(str(text or "")):
+        url = str(match.group("url") or "").strip().rstrip(".,);]\u3002\uff0c\uff1b")
+        if not url:
+            continue
+        if "://" not in url:
+            url = f"https://{url.lstrip('/')}"
+        if looks_like_pdf_http_url(url):
+            return url
+    return None
+
+
+def strip_pdf_url(text: Any) -> str:
+    """Remove the first PDF URL and lightweight reading command text."""
+    raw_text = str(text or "")
+    stripped = raw_text
+    for match in GENERIC_HTTP_URL_RE.finditer(raw_text):
+        raw_url = str(match.group("url") or "").strip().rstrip(".,);]\u3002\uff0c\uff1b")
+        if not raw_url:
+            continue
+        normalized_url = raw_url if "://" in raw_url else f"https://{raw_url.lstrip('/')}"
+        if looks_like_pdf_http_url(normalized_url):
+            stripped = f"{raw_text[:match.start()]} {raw_text[match.end():]}"
+            break
+    stripped = re.sub(r"(?i)\b(read this|deep read)\b", " ", stripped)
+    stripped = re.sub(r"精读", " ", stripped)
+    return first_meaningful_line(re.sub(r"\s+", " ", stripped)).strip(" \t\r\n:：-")
+
+
+def normalize_direct_pdf_title_hint(text: Any) -> str:
+    """Keep only meaningful custom title hints for direct PDF-link reading."""
+    candidate = str(text or "").strip()
+    if not candidate:
+        return ""
+    normalized = candidate.casefold()
+    generic_hints = {
+        "paper",
+        "pdf",
+        "论文",
+        "这篇",
+        "这个",
+        "这个pdf",
+        "这篇论文",
+        "帮我看看这个",
+        "帮我读一下",
+        "读一下",
+        "看看这个",
+    }
+    if normalized in generic_hints or len(candidate) <= 4:
+        return ""
+    return candidate
+
+
+def strip_google_scholar_url(text: Any) -> str:
+    """Remove the first Google Scholar URL from user text and normalize whitespace."""
+    stripped = GOOGLE_SCHOLAR_URL_RE.sub(" ", str(text or ""), count=1)
+    return first_meaningful_line(re.sub(r"\s+", " ", stripped)).strip()
+
+
+def looks_like_homepage_url(url: Any) -> bool:
+    """Heuristic filter for personal / lab homepages used in cold start."""
+    candidate = str(url or "").strip()
+    if not candidate:
+        return False
+    lowered = candidate.casefold()
+    if "scholar.google." in lowered:
+        return False
+    blocked_markers = (
+        "arxiv.org",
+        "openreview.net",
+        "doi.org",
+        "science.org",
+        "nature.com",
+        "cell.com",
+        "pnas.org",
+        "pubmed",
+        ".pdf",
+        "/abs/",
+        "/pdf/",
+        "/doi/",
+        "/article/",
+    )
+    return not any(marker in lowered for marker in blocked_markers)
+
+
+def extract_homepage_url(text: Any) -> Optional[str]:
+    """Extract the first plausible personal homepage URL from arbitrary user text."""
+    for match in GENERIC_HTTP_URL_RE.finditer(str(text or "")):
+        url = str(match.group("url") or "").strip().rstrip(".,);]\u3002\uff0c\uff1b")
+        if not url:
+            continue
+        if "://" not in url:
+            url = f"https://{url.lstrip('/')}"
+        if looks_like_homepage_url(url):
+            return url
+    return None
+
+
+def strip_bootstrap_urls(text: Any) -> str:
+    """Remove Scholar / homepage URLs from bootstrap text and normalize whitespace."""
+    stripped = GOOGLE_SCHOLAR_URL_RE.sub(" ", str(text or ""), count=1)
+    stripped = GENERIC_HTTP_URL_RE.sub(" ", stripped, count=1)
+    return first_meaningful_line(re.sub(r"\s+", " ", stripped)).strip()
+
+
+def detect_expand_push_request(text: Any) -> Optional[Dict[str, Any]]:
+    cleaned = first_meaningful_line(text)
+    lowered = cleaned.lower().strip()
+    if not lowered:
+        return None
+    if not any(token in cleaned for token in ("展开", "再看看", "遗漏", "补看", "看看")):
+        return None
+
+    category = ""
+    if any(token in cleaned for token in ("🔒", "必读", "lock")):
+        category = "must_read"
+    elif any(token in cleaned for token in ("🔴", "红", "高度相关", "red")):
+        category = "high_relevant"
+    elif any(token in cleaned for token in ("🟡", "黄", "可能感兴趣")):
+        category = "maybe_interested"
+    elif any(token in cleaned for token in ("🔵", "蓝", "边缘相关")):
+        category = "edge_relevant"
+
+    query = ""
+    match = re.search(r"展开\s*([^\s，。,；;]+?)\s*(?:分组|方向)?$", cleaned)
+    if match:
+        query = match.group(1).strip()
+    elif "遗漏" in cleaned and not category:
+        category = "maybe_interested"
+
+    if not category and not query:
+        return None
+    return {"category": category, "query": query}
+
+
+def detect_classification_correction_request(text: Any) -> Optional[Dict[str, Any]]:
+    cleaned = first_meaningful_line(text)
+    if not cleaned or "应该" not in cleaned:
+        return None
+
+    number_match = re.search(r"(\d{1,3})", cleaned)
+    if not number_match:
+        return None
+    paper_number = int(number_match.group(1))
+
+    target_category = ""
+    if any(token in cleaned for token in ("🔒", "必读")):
+        target_category = "must_read"
+    elif any(token in cleaned for token in ("🔴", "红", "高度相关")):
+        target_category = "high_relevant"
+    elif any(token in cleaned for token in ("🟡", "黄", "可能感兴趣")):
+        target_category = "maybe_interested"
+    elif any(token in cleaned for token in ("🔵", "蓝", "边缘相关")):
+        target_category = "edge_relevant"
+
+    if not target_category:
+        return None
+    return {"paper_number": paper_number, "target_category": target_category}
+
+
+def detect_report_feedback_request(text: Any) -> Optional[Dict[str, Any]]:
+    cleaned = first_meaningful_line(text)
+    lowered = cleaned.lower().strip()
+    if not lowered:
+        return None
+
+    positive_markers = ("写得好", "很好", "有用", "抓住重点", "挺好", "不错")
+    negative_markers = ("没抓住重点", "不够完整", "太浅", "太空", "不太行", "没用", "一般")
+    if "报告" not in cleaned and "精读" not in cleaned and "这篇" not in cleaned:
+        return None
+    if any(token in cleaned for token in negative_markers):
+        return {"sentiment": "negative"}
+    if any(token in cleaned for token in positive_markers):
+        return {"sentiment": "positive"}
+    return None
+
+
+def detect_reviewer_watch_request(text: Any) -> Optional[Dict[str, Any]]:
+    cleaned = first_meaningful_line(text)
+    lowered = cleaned.lower().strip()
+    if "reviewer" not in lowered and "审稿" not in cleaned:
+        return None
+    conference_match = re.search(r"\b(ICLR|NeurIPS|ICML|ACL|EMNLP)\b", cleaned, flags=re.I)
+    year_match = re.search(r"\b(20\d{2})\b", cleaned)
+    if not conference_match:
+        return None
+    return {
+        "conference": conference_match.group(1).lower(),
+        "year": int(year_match.group(1)) if year_match else datetime.now().year,
+    }
+
+
 def looks_like_cold_start_description(text: Any, profile: Optional[Dict[str, Any]] = None) -> bool:
     """Route free-form self-descriptions to cold start only when bootstrap is actually needed."""
     cleaned = first_meaningful_line(text)
@@ -1111,6 +1246,11 @@ def looks_like_cold_start_description(text: Any, profile: Optional[Dict[str, Any
         return True
 
     if any(token in lowered for token in ("初始画像", "设置方向")):
+        return True
+
+    if extract_google_scholar_url(cleaned):
+        return True
+    if extract_homepage_url(cleaned):
         return True
 
     if profile and not profile_needs_bootstrap(profile):
@@ -1318,6 +1458,22 @@ class MasterCoordinator:
         if looks_like_must_read_command(text):
             return {"intent": "must_read", "confidence": 0.95, "slots": {"command": cleaned}}
 
+        expand_request = detect_expand_push_request(text)
+        if expand_request:
+            return {"intent": "expand_push", "confidence": 0.9, "slots": expand_request}
+
+        correction_request = detect_classification_correction_request(text)
+        if correction_request:
+            return {"intent": "classification_correction", "confidence": 0.92, "slots": correction_request}
+
+        report_feedback = detect_report_feedback_request(text)
+        if report_feedback:
+            return {"intent": "report_feedback", "confidence": 0.88, "slots": report_feedback}
+
+        reviewer_watch = detect_reviewer_watch_request(text)
+        if reviewer_watch:
+            return {"intent": "reviewer_watch", "confidence": 0.82, "slots": reviewer_watch}
+
         profile_update = parse_profile_update_request(text, profile=self.profile)
         if profile_update:
             return {"intent": "profile_update", "confidence": 0.9, "slots": profile_update}
@@ -1419,16 +1575,27 @@ class MasterCoordinator:
         try:
             coldstart_agent = importlib.import_module("agents.coldstart-agent.main")
             explicit_command = detect_explicit_command_intent(text)
-            natural_language = text
+            scholar_url = extract_google_scholar_url(text)
+            homepage_url = extract_homepage_url(text)
+            natural_language = strip_bootstrap_urls(text) if (scholar_url or homepage_url) else text
+
             if explicit_command and explicit_command.get("intent") == "cold_start":
-                natural_language = (
-                    self.role_meta.get("natural_language")
-                    or self.role_meta.get("description")
-                    or ""
-                ).strip()
+                if not scholar_url and not homepage_url:
+                    natural_language = (
+                        self.role_meta.get("natural_language")
+                        or self.role_meta.get("bootstrap_summary")
+                        or self.role_meta.get("description")
+                        or ""
+                    ).strip()
+                elif (scholar_url or homepage_url) and not natural_language:
+                    natural_language = None
+
             coldstart_agent.cold_start(
                 user_id=self.user_id,
                 natural_language=natural_language or None,
+                scholar_url=scholar_url,
+                homepage_url=homepage_url,
+                reset_existing=True,
                 send_to_feishu=True,
                 feishu_user_id=self.feishu_user_id,
                 chat_id=self.chat_id
@@ -1490,9 +1657,40 @@ class MasterCoordinator:
         except Exception as e:
             return {"success": False, "message": str(e)}
 
-    def handle_reading_report(self, paper_ids: Optional[List[int]] = None) -> Dict[str, Any]:
+    def handle_reading_report(
+        self,
+        paper_ids: Optional[List[int]] = None,
+        pdf_url: Optional[str] = None,
+        title_hint: str = "",
+    ) -> Dict[str, Any]:
         """处理精读报告"""
-        print(f"Intent: Reading Report - papers: {paper_ids}")
+        print(f"Intent: Reading Report - papers: {paper_ids}, pdf_url: {pdf_url}")
+
+        direct_pdf_url = str(pdf_url or "").strip()
+        if direct_pdf_url:
+            try:
+                reading_agent = importlib.import_module("agents.reading-agent.main")
+                resolved_title = str(title_hint or "").strip() or "Paper"
+                created_docs = reading_agent.create_reading_report(
+                    user_id=self.user_id,
+                    paper_ids=[],
+                    papers=[{"pdf_url": direct_pdf_url, "title": resolved_title, "url": direct_pdf_url}],
+                    send_to_feishu=True,
+                    feishu_user_id=self.feishu_user_id,
+                    chat_id=self.chat_id,
+                    request_metadata={
+                        "report_source_type": "text_pdf_url",
+                        "report_source_key": direct_pdf_url,
+                        "report_source_name": resolved_title,
+                    },
+                )
+                return {
+                    "success": bool(created_docs),
+                    "docs": created_docs,
+                    "message": "Reading reports created" if created_docs else "No reading reports were created",
+                }
+            except Exception as e:
+                return {"success": False, "message": str(e)}
 
         selected_info = None
         if paper_ids is None:
@@ -1578,6 +1776,253 @@ class MasterCoordinator:
             return result
         except Exception as e:
             return {"success": False, "message": str(e)}
+
+    def handle_expand_push(self, category: str = "", query: str = "") -> Dict[str, Any]:
+        """Expand a category bucket or a topic slice from the latest push."""
+        push_info = get_latest_push(self.user_id)
+        if not push_info:
+            msg = "当前没有可展开的最近推送。请先执行一次“推送”。"
+            send_message(msg, chat_id=self.chat_id, user_id=self.feishu_user_id)
+            return {"success": False, "message": msg}
+
+        papers = list(push_info.get("papers") or [])
+        filtered = papers
+        if category:
+            filtered = [paper for paper in filtered if str(paper.get("category") or "") == category]
+
+        normalized_query = normalize_topic_token(query)
+        if normalized_query:
+            query_filtered = []
+            for paper in filtered:
+                search_fields = [
+                    paper.get("title", ""),
+                    paper.get("abstract", ""),
+                    paper.get("institution", ""),
+                    " ".join(str(author) for author in (paper.get("authors") or [])),
+                    " ".join(str(item) for item in (paper.get("topics") or [])),
+                    " ".join(str(item) for item in (paper.get("keywords") or [])),
+                    " ".join(str(item) for item in (paper.get("categories") or [])),
+                ]
+                search_blob = normalize_topic_token(" ".join(search_fields))
+                if normalized_query and normalized_query in search_blob:
+                    query_filtered.append(paper)
+            filtered = query_filtered
+
+        if not filtered:
+            label = PUSH_CATEGORY_LABELS.get(category, query or "目标分组")
+            msg = f"最近一次推送里没有找到可展开的“{label}”候选。"
+            send_message(msg, chat_id=self.chat_id, user_id=self.feishu_user_id)
+            return {"success": False, "message": msg}
+
+        lines = [
+            f"📎 补充展开 | {PUSH_CATEGORY_LABELS.get(category, query or '候选分组')} | {len(filtered)} 篇",
+            "",
+        ]
+        for index, paper in enumerate(filtered[:25], start=1):
+            position = paper.get("rank") or paper.get("paper_number") or papers.index(paper) + 1
+            category_label = PUSH_CATEGORY_LABELS.get(str(paper.get("category") or ""), str(paper.get("category") or "候选"))
+            authors = paper.get("authors") or []
+            first_author = authors[0].split(",")[0].strip() if authors else "Unknown"
+            title = str(paper.get("title") or "Unknown").strip()
+            lines.append(f"{int(position):02d}. {category_label} | {first_author} — {title}")
+        if len(filtered) > 25:
+            lines.append("")
+            lines.append(f"其余 {len(filtered) - 25} 篇先省略；如果你还想继续，我可以再往下展开。")
+
+        send_message("\n".join(lines), chat_id=self.chat_id, user_id=self.feishu_user_id)
+        return {"success": True, "expanded_count": len(filtered), "category": category, "query": query}
+
+    def handle_classification_correction(self, paper_number: int, target_category: str) -> Dict[str, Any]:
+        """Apply a strong explicit signal when the user corrects push categorization."""
+        push_info = get_latest_push(self.user_id)
+        if not push_info:
+            msg = "当前没有可纠正的最近推送。请先执行一次“推送”。"
+            send_message(msg, chat_id=self.chat_id, user_id=self.feishu_user_id)
+            return {"success": False, "message": msg}
+
+        papers = list(push_info.get("papers") or [])
+        if not (1 <= int(paper_number) <= len(papers)):
+            msg = f"最近一次推送里没有编号 {paper_number}。"
+            send_message(msg, chat_id=self.chat_id, user_id=self.feishu_user_id)
+            return {"success": False, "message": msg}
+
+        paper = dict(papers[int(paper_number) - 1])
+        current_category = str(paper.get("category") or "")
+        target_priority = CATEGORY_PRIORITY.get(target_category, 0)
+        current_priority = CATEGORY_PRIORITY.get(current_category, 0)
+
+        profile = ensure_profile_schema(get_profile(self.user_id) or build_empty_profile(self.user_id))
+        updated_profile = profile
+        touched_topics: List[str] = []
+
+        paper_topics = canonicalize_direction_terms(
+            [
+                *(paper.get("topics") or []),
+                *(paper.get("keywords") or []),
+                *(paper.get("categories") or []),
+            ],
+            keep_unknown=False,
+        )
+        touched_topics = list(paper_topics)
+
+        if target_priority >= current_priority:
+            updated_profile = update_profile_with_reading_signal(
+                profile,
+                paper=paper,
+                signal_topics=paper_topics,
+                signal_strength="strong",
+                explicit_text=f"分类纠错：{paper_number} 应该是 {target_category}",
+                current_time=datetime.now(),
+                source_type="classification_correction",
+                source_key=str(paper.get("id") or paper.get("title") or paper_number),
+            )
+        else:
+            updated_profile = ensure_profile_schema(profile)
+            for topic in paper_topics:
+                if topic in updated_profile.get("topic_weights", {}):
+                    updated_profile["topic_weights"][topic] = clamp_weight(
+                        float(updated_profile["topic_weights"].get(topic, 0.3)) - 0.08,
+                        minimum=0.0,
+                        maximum=1.0,
+                    )
+                if topic in updated_profile.get("core_directions", {}):
+                    updated_profile["core_directions"][topic] = clamp_weight(
+                        float(updated_profile["core_directions"].get(topic, 0.3)) - 0.05,
+                        minimum=0.0,
+                        maximum=1.0,
+                    )
+            updated_profile["updated_at"] = datetime.now().isoformat()
+
+        update_profile(self.user_id, updated_profile)
+        self.profile = updated_profile
+
+        log_behavior(
+            user_id=self.user_id,
+            push_id=str(push_info.get("push_id") or "latest_push"),
+            paper_id=paper.get("id"),
+            action="classification_correction",
+            action_type="manual_override",
+            category=target_category,
+            metadata={
+                "paper_number": int(paper_number),
+                "previous_category": current_category,
+                "target_category": target_category,
+                "topics": touched_topics,
+                "paper_title": paper.get("title", ""),
+            },
+        )
+
+        topic_labels = [format_direction_label(topic) for topic in touched_topics[:3]]
+        summary = (
+            f"已记录：{paper_number:02d} 我会按 {PUSH_CATEGORY_LABELS.get(target_category, target_category)} 来理解。"
+        )
+        if topic_labels:
+            summary += f"\n同步强化的主题：{', '.join(topic_labels)}。"
+        send_message(summary, chat_id=self.chat_id, user_id=self.feishu_user_id)
+        return {"success": True, "paper_number": int(paper_number), "target_category": target_category}
+
+    def handle_report_feedback(self, sentiment: str) -> Dict[str, Any]:
+        """Store lightweight quality feedback for future reading-report generation."""
+        report_record = get_recent_created_report(self.user_id, minutes=720)
+        if not report_record:
+            msg = "最近没有可关联的精读报告，我先记不下这条反馈。"
+            send_message(msg, chat_id=self.chat_id, user_id=self.feishu_user_id)
+            return {"success": False, "message": msg}
+
+        profile = ensure_profile_schema(get_profile(self.user_id) or build_empty_profile(self.user_id))
+        report_preferences = dict(profile.get("report_preferences", {}) or {})
+        report_preferences["positive_feedback_count"] = int(report_preferences.get("positive_feedback_count", 0) or 0)
+        report_preferences["negative_feedback_count"] = int(report_preferences.get("negative_feedback_count", 0) or 0)
+        report_preferences["preferred_evidence_top_k"] = int(report_preferences.get("preferred_evidence_top_k", 3) or 3)
+
+        if sentiment == "positive":
+            report_preferences["positive_feedback_count"] += 1
+            report_preferences["last_feedback"] = "positive"
+        else:
+            report_preferences["negative_feedback_count"] += 1
+            report_preferences["last_feedback"] = "negative"
+            report_preferences["prefer_more_evidence"] = True
+            report_preferences["preferred_evidence_top_k"] = min(
+                5,
+                max(3, int(report_preferences.get("preferred_evidence_top_k", 3) or 3) + 1),
+            )
+            report_preferences["preferred_style"] = "evidence_first"
+
+        profile["report_preferences"] = report_preferences
+        profile["updated_at"] = datetime.now().isoformat()
+        update_profile(self.user_id, profile)
+        self.profile = profile
+
+        log_behavior(
+            user_id=self.user_id,
+            push_id="reading_report",
+            paper_id=report_record.get("paper_id"),
+            action="report_feedback",
+            action_type="reading_quality",
+            category=sentiment,
+            metadata={
+                "doc_token": report_record.get("doc_token"),
+                "doc_url": report_record.get("doc_url"),
+                "paper_title": report_record.get("paper_title"),
+            },
+        )
+
+        if sentiment == "positive":
+            msg = "收到，这条精读报告会记为正反馈；我会保持当前的报告组织方式。"
+        else:
+            msg = "收到，我会把这条精读记为“没抓住重点”，后续会提高证据密度并优先按 evidence-first 方式组织。"
+        send_message(msg, chat_id=self.chat_id, user_id=self.feishu_user_id)
+        return {"success": True, "sentiment": sentiment}
+
+    def handle_reviewer_watch(self, conference: str, year: int, raw_text: str) -> Dict[str, Any]:
+        """Best-effort fetch a reviewer watchlist from public OpenReview groups."""
+        try:
+            openreview_fetcher = importlib.import_module("skills.openreview-fetcher.scripts.fetch_openreview")
+            fetcher = getattr(openreview_fetcher, "get_active_reviewer_candidates", None)
+            if not callable(fetcher):
+                raise RuntimeError("reviewer candidate fetcher unavailable")
+            candidates = list(fetcher(conference, year, limit=8) or [])
+        except Exception as e:
+            candidates = []
+            logger.warning(f"Reviewer watch fetch failed: {e}")
+
+        if not candidates:
+            msg = (
+                f"当前没法稳定拿到 {conference.upper()} {year} 的公开 reviewer 身份清单。"
+                "如果该 venue 没公开 reviewer group，我这边先无法自动追踪。"
+            )
+            send_message(msg, chat_id=self.chat_id, user_id=self.feishu_user_id)
+            return {"success": False, "message": msg}
+
+        if "加上" in raw_text or "加入" in raw_text:
+            profile = get_profile(self.user_id) or build_empty_profile(self.user_id)
+            must_read = dict(profile.get("must_read", {}) or {})
+            existing_authors = [str(author).strip() for author in must_read.get("authors", []) if str(author).strip()]
+            merged_authors = []
+            seen = set()
+            for author in existing_authors + candidates[:5]:
+                marker = author.casefold()
+                if marker in seen:
+                    continue
+                seen.add(marker)
+                merged_authors.append(author)
+            must_read["authors"] = merged_authors
+            profile["must_read"] = must_read
+            profile["updated_at"] = datetime.now().isoformat()
+            update_profile(self.user_id, profile)
+            self.profile = profile
+            msg = (
+                f"已把这些公开 reviewer 候选加入必读作者：{', '.join(candidates[:5])}。"
+            )
+            send_message(msg, chat_id=self.chat_id, user_id=self.feishu_user_id)
+            return {"success": True, "reviewers": candidates[:5], "added": True}
+
+        msg = (
+            f"{conference.upper()} {year} 可见 reviewer / AC 候选（公开数据可得部分）：\n"
+            + "\n".join(f"- {name}" for name in candidates[:8])
+        )
+        send_message(msg, chat_id=self.chat_id, user_id=self.feishu_user_id)
+        return {"success": True, "reviewers": candidates[:8], "added": False}
 
     def handle_show_profile(self) -> Dict[str, Any]:
         """处理查看画像"""
@@ -1857,7 +2302,25 @@ class MasterCoordinator:
             "cold_start": lambda: self.handle_cold_start(text),
             "daily_push": self.handle_daily_push,
             "feedback": lambda: self.handle_feedback(intent["slots"].get("reply", text)),
-            "reading_report": self.handle_reading_report,
+            "expand_push": lambda: self.handle_expand_push(
+                category=intent["slots"].get("category", ""),
+                query=intent["slots"].get("query", ""),
+            ),
+            "classification_correction": lambda: self.handle_classification_correction(
+                int(intent["slots"].get("paper_number", 0)),
+                intent["slots"].get("target_category", ""),
+            ),
+            "report_feedback": lambda: self.handle_report_feedback(intent["slots"].get("sentiment", "")),
+            "reviewer_watch": lambda: self.handle_reviewer_watch(
+                intent["slots"].get("conference", ""),
+                int(intent["slots"].get("year", datetime.now().year)),
+                text,
+            ),
+            "reading_report": lambda: self.handle_reading_report(
+                paper_ids=intent["slots"].get("paper_ids"),
+                pdf_url=intent["slots"].get("pdf_url"),
+                title_hint=intent["slots"].get("title_hint", ""),
+            ),
             "weekly_report": self.handle_weekly_report,
             "must_read": lambda: self.handle_must_read(intent["slots"].get("command", text)),
             "show_profile": self.handle_show_profile,

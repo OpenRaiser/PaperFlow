@@ -278,6 +278,36 @@ def test_non_pdf_file_like_message_is_ignored(monkeypatch):
     assert called["reading_report"] is False
 
 
+def test_recent_upload_interest_phrase_short_circuits_to_reinforcement(monkeypatch):
+    webhook_server.PROCESSED_MESSAGE_IDS.clear()
+    webhook_server.RECENT_TEXT_MESSAGE_FINGERPRINTS.clear()
+    handler = webhook_server.FeishuEventHandler()
+
+    monkeypatch.setattr(handler, "_find_role_by_chat_id", lambda chat_id: "rolea")
+    monkeypatch.setattr(
+        handler,
+        "_handle_recent_upload_interest_reinforcement",
+        lambda user_id, chat_id, open_id, text: {
+            "status": "success",
+            "intent": "reading_signal_reinforce",
+            "user_id": user_id,
+            "chat_id": chat_id,
+            "topics": ["gui-agent"],
+            "activated_topics": ["gui-agent"],
+        },
+    )
+    monkeypatch.setattr(
+        handler,
+        "_route_to_coordinator",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("coordinator should not run for recent-upload reinforcement")),
+    )
+
+    result = handler._handle_message(_build_text_event("om_recent_upload_signal", "这类我最近想多看"))
+
+    assert result["intent"] == "reading_signal_reinforce"
+    assert result["topics"] == ["gui-agent"]
+
+
 def test_text_message_retry_with_new_message_id_is_deduplicated(monkeypatch, tmp_path):
     webhook_server.PROCESSED_MESSAGE_IDS.clear()
     webhook_server.RECENT_TEXT_MESSAGE_FINGERPRINTS.clear()
@@ -330,6 +360,105 @@ def test_feedback_messages_run_async_to_avoid_retry_duplicates(monkeypatch, tmp_
     assert result["mode"] == "async"
     assert result["intent"] == "feedback"
     assert captured["called"] is True
+
+
+def test_text_pdf_url_routes_to_async_reading_report(monkeypatch, tmp_path):
+    webhook_server.PROCESSED_MESSAGE_IDS.clear()
+    webhook_server.RECENT_TEXT_MESSAGE_FINGERPRINTS.clear()
+    webhook_server.INFLIGHT_COORDINATOR_TASKS.clear()
+    handler = webhook_server.FeishuEventHandler()
+    captured = {}
+
+    monkeypatch.setattr(webhook_server, "ASYNC_TASK_LOCK_DIR", tmp_path / "webhook_task_locks")
+    monkeypatch.setattr(handler, "_find_role_by_chat_id", lambda chat_id: "rolea")
+    monkeypatch.setattr(
+        handler,
+        "_send_async_ack_async",
+        lambda chat_id, open_id, text: captured.update({"ack": (chat_id, open_id, text)}),
+    )
+    monkeypatch.setattr(
+        handler,
+        "_route_to_coordinator_async",
+        lambda task_key, user_id, message, chat_id, sender_open_id=None: captured.update(
+            {
+                "route": {
+                    "task_key": task_key,
+                    "user_id": user_id,
+                    "message": message,
+                    "chat_id": chat_id,
+                    "sender_open_id": sender_open_id,
+                }
+            }
+        ),
+    )
+
+    result = handler._handle_message(
+        _build_text_event("om_pdf_link_1", "https://arxiv.org/pdf/2401.00001.pdf")
+    )
+
+    assert result["status"] == "accepted"
+    assert result["mode"] == "async"
+    assert result["intent"] == "reading_report"
+    assert captured["ack"][2] == webhook_server.ASYNC_INTENT_ACKS["reading_report"]
+    assert captured["route"]["message"] == "https://arxiv.org/pdf/2401.00001.pdf"
+
+
+def test_menu_button_routes_command_to_coordinator(monkeypatch):
+    handler = webhook_server.FeishuEventHandler()
+    captured = {}
+
+    monkeypatch.setattr(handler, "_resolve_user_id_for_chat", lambda chat_id, open_id: "user_rolea")
+    monkeypatch.setattr(
+        handler,
+        "_route_to_coordinator",
+        lambda user_id, message, chat_id, sender_open_id=None: captured.update(
+            {
+                "user_id": user_id,
+                "message": message,
+                "chat_id": chat_id,
+                "sender_open_id": sender_open_id,
+            }
+        ) or {"success": True},
+    )
+
+    result = handler._handle_menu_button(
+        {
+            "event": {
+                "chat_id": "oc_rolea",
+                "operator": {"operator_id": {"open_id": "ou_test"}},
+                "action": {"value": json.dumps({"command": "推送"}, ensure_ascii=False)},
+            }
+        }
+    )
+
+    assert result["status"] == "success"
+    assert captured["message"] == "推送"
+
+
+def test_reaction_routes_thumbs_feedback_to_report_feedback(monkeypatch):
+    handler = webhook_server.FeishuEventHandler()
+    captured = {"messages": []}
+
+    monkeypatch.setattr(handler, "_resolve_user_id_for_chat", lambda chat_id, open_id: "user_rolea")
+    monkeypatch.setattr(
+        handler,
+        "_route_to_coordinator",
+        lambda user_id, message, chat_id, sender_open_id=None: captured["messages"].append(message) or {"success": True},
+    )
+
+    result = handler._handle_reaction(
+        {
+            "event": {
+                "message_id": "om_reaction_1",
+                "reaction_type": "thumbsup",
+                "chat_id": "oc_rolea",
+                "operator": {"operator_id": {"open_id": "ou_test"}},
+            }
+        }
+    )
+
+    assert result["status"] == "success"
+    assert "这篇报告写得好" in captured["messages"][0]
 
 
 def test_daily_push_duplicate_is_blocked_by_inflight_task_lock(monkeypatch, tmp_path):

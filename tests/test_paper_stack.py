@@ -976,6 +976,92 @@ def test_format_push_card_preserves_full_titles():
     assert long_title in card
 
 
+def test_compute_drift_bonus_boosts_shift_topics():
+    profile = {
+        "drift_state": {
+            "status": "shifting",
+            "top_shift_topics": ["protein-language-model"],
+            "short_term_topics": {"protein-language-model": 0.8},
+        }
+    }
+    weights = {
+        "drift_bonus_shifting": 0.08,
+        "drift_bonus_recovered": 0.04,
+        "drift_short_topic_bonus": 0.03,
+    }
+
+    bonus, matched = daily_push_agent.compute_drift_bonus(
+        {"topics": ["protein-language-model", "bio-molecular"]},
+        profile,
+        weights,
+    )
+
+    assert bonus > 0.08
+    assert matched == ["protein-language-model"]
+
+
+def test_compute_reading_signal_bonus_boosts_recent_upload_topics():
+    profile = {
+        "reading_signal_state": {
+            "short_term_topics": {"gui-agent": 0.7},
+        }
+    }
+    weights = {
+        "reading_signal_short_term_bonus": 0.05,
+    }
+
+    bonus, matched = daily_push_agent.compute_reading_signal_bonus(
+        {"topics": ["gui-agent", "agent"]},
+        profile,
+        weights,
+    )
+
+    assert bonus > 0
+    assert matched == ["gui-agent"]
+
+
+def test_format_push_card_mentions_shift_topics_when_drifting():
+    card = daily_push_agent.format_push_card(
+        [
+            daily_push_agent.PaperWithScore(
+                paper={"title": "Protein Language Models for Discovery", "authors": ["Alice"], "categories": ["cs.CL"]},
+                score=0.81,
+                category="high_relevant",
+                relevance_signal=0.92,
+            )
+        ],
+        profile={
+            "must_read": {"authors": [], "institutions": [], "keywords": []},
+            "drift_state": {"status": "shifting", "top_shift_topics": ["protein-language-model"]},
+        },
+        date="04-17",
+        total_fetched=5,
+    )
+
+    assert "蛋白语言模型" in card or "Protein Language Model" in card
+
+
+def test_format_push_card_mentions_recent_upload_short_term_topics():
+    card = daily_push_agent.format_push_card(
+        [
+            daily_push_agent.PaperWithScore(
+                paper={"title": "GUI Agent Reader", "authors": ["Alice"], "categories": ["cs.AI"]},
+                score=0.78,
+                category="high_relevant",
+                relevance_signal=0.81,
+            )
+        ],
+        profile={
+            "must_read": {"authors": [], "institutions": [], "keywords": []},
+            "reading_signal_state": {"short_term_topics": {"gui-agent": 0.7}},
+        },
+        date="04-17",
+        total_fetched=3,
+    )
+
+    assert "近期直传精读信号" in card
+
+
 def test_fetch_and_process_papers_passes_days_to_journal_fetcher(monkeypatch):
     journal_calls = []
 
@@ -1141,7 +1227,7 @@ def test_apply_source_diversity_quota_keeps_single_source_results():
     assert [paper.paper["title"] for paper in balanced] == [paper.paper["title"] for paper in papers]
 
 
-def test_apply_push_count_limit_does_not_reserve_slots_for_must_read_hits():
+def test_apply_push_count_limit_preserves_must_read_hits():
     weights = {
         "push_target_count": 1,
         "push_max_count": 2,
@@ -1164,7 +1250,39 @@ def test_apply_push_count_limit_does_not_reserve_slots_for_must_read_hits():
     limited = daily_push_agent.apply_push_count_limit(papers, weights)
 
     assert len(limited) == 1
-    assert limited[0].paper["title"] == "Top Relevant"
+    assert limited[0].paper["title"] == "Soft Must Read"
+
+
+def test_apply_source_diversity_quota_keeps_must_read_items():
+    weights = {
+        "source_diversity_min_total": 2,
+        "source_diversity_min_per_bucket": 1,
+        "source_diversity_max_share": 0.5,
+    }
+    papers = [
+        daily_push_agent.PaperWithScore(
+            paper={"title": "Must Read Journal", "source": "journal", "journal": "nature"},
+            score=0.21,
+            category="must_read",
+            relevance_signal=0.01,
+        ),
+        daily_push_agent.PaperWithScore(
+            paper={"title": "arXiv 1", "source": "arxiv"},
+            score=0.8,
+            category="high_relevant",
+            relevance_signal=0.8,
+        ),
+        daily_push_agent.PaperWithScore(
+            paper={"title": "arXiv 2", "source": "arxiv"},
+            score=0.79,
+            category="high_relevant",
+            relevance_signal=0.79,
+        ),
+    ]
+
+    balanced = daily_push_agent.apply_source_diversity_quota(papers, weights)
+
+    assert any(paper.paper["title"] == "Must Read Journal" for paper in balanced)
 
 
 def test_save_paper_persists_embedding_payload(test_db_path):

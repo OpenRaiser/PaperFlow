@@ -8,7 +8,7 @@ w3_author_institution: 0.20 # 作者/机构热度
 w4_quality_signal: 0.20     # 论文质量信号（venue 声誉、引用预期等）
 
 # 必读清单加成
-bonus_must_read: 0.15       # 必读命中改为软加分，不再天然置顶
+bonus_must_read: 0.15       # 必读命中仍保留 bonus，但推送排序层已改为硬优先保留 + 顶部展示
 
 # 分类阈值
 # 注意：冷启动阶段 interest_vector 为零向量，分数主要依赖 topic_match 和 quality_signal

@@ -1567,6 +1567,11 @@ def synthesize_reading_report_with_llm(
         ensure_ascii=False,
         sort_keys=True,
     )
+    report_preference_summary = json.dumps(
+        user_profile.get("report_preferences") or {},
+        ensure_ascii=False,
+        sort_keys=True,
+    )
 
     user_text = json.dumps(
         {
@@ -1589,6 +1594,7 @@ def synthesize_reading_report_with_llm(
             "user_profile": {
                 "top_directions": profile_directions,
                 "methodology_preferences": preference_summary,
+                "report_preferences": report_preference_summary,
             },
             "heuristic_draft": {
                 "one_sentence_summary": heuristic_payload.get("one_sentence_summary"),
@@ -1613,6 +1619,8 @@ def synthesize_reading_report_with_llm(
         "再结合 heuristic_draft 做润色和补全；当二者冲突时，优先采用 retrieved_evidence。"
         "如果提供了 field_evidence_map，请让每个输出字段优先参考它对应的证据锚点，"
         "不要把 results 证据写到 research_background，也不要把 background 证据误写成方法贡献。"
+        "如果 user_profile.report_preferences 显示 prefer_more_evidence=true 或 preferred_style=evidence_first，"
+        "请优先写出更具体的证据锚点和方法/结果依据，不要只给空泛总结。"
         "不要编造具体实验数值；如果信息不足，请保持克制并明确指出需要回原文核对。"
         "可以改写证据，不要大段逐字复制。"
         "输出 JSON，字段包括："

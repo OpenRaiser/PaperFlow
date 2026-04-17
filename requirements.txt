@@ -12,6 +12,8 @@ numpy>=1.24.0
 # PDF parsing
 PyMuPDF>=1.23.0
 pdfplumber>=0.10.0
+Pillow>=10.0.0
+rapidocr-onnxruntime>=1.3.0
 
 # RSS parsing
 feedparser>=6.0.10
