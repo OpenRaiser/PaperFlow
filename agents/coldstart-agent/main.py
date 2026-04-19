@@ -175,6 +175,48 @@ def ensure_profile_shape(profile: Optional[Dict[str, Any]], user_id: str) -> Dic
     for key, default_value in build_default_drift_state(normalized["updated_at"]).items():
         normalized["drift_state"].setdefault(key, copy.deepcopy(default_value))
 
+    raw_core_directions = dict(normalized.get("core_directions") or {})
+    raw_topic_weights = dict(normalized.get("topic_weights") or {})
+    normalized["core_directions"] = _normalize_direction_weight_map(raw_core_directions)
+    normalized["topic_weights"] = _normalize_direction_weight_map(raw_topic_weights)
+
+    if normalized["core_directions"] and normalized["core_directions"] != raw_core_directions:
+        normalized["interest_vector"] = generate_interest_vector(normalized["core_directions"])
+
+    return normalized
+
+
+def _normalize_direction_weight_map(raw_weights: Any) -> Dict[str, float]:
+    """Collapse duplicate direction aliases into canonical keys while preserving unknown topics."""
+    if not isinstance(raw_weights, dict):
+        return {}
+
+    try:
+        direction_lexicon = importlib.import_module("config.direction_lexicon")
+        resolve_canonical_direction = getattr(direction_lexicon, "resolve_canonical_direction", None)
+    except Exception:
+        resolve_canonical_direction = None
+
+    normalized: Dict[str, float] = {}
+    for raw_key, raw_weight in raw_weights.items():
+        key_text = _collapse_whitespace(raw_key)
+        if not key_text:
+            continue
+        try:
+            weight = round(float(raw_weight or 0.0), 4)
+        except (TypeError, ValueError):
+            continue
+
+        canonical_key = key_text
+        if callable(resolve_canonical_direction):
+            try:
+                resolved = resolve_canonical_direction(key_text, include_paper_terms=True)
+            except Exception:
+                resolved = None
+            canonical_key = str((resolved or {}).get("canonical_name") or key_text).strip() or key_text
+
+        normalized[canonical_key] = round(max(float(normalized.get(canonical_key, 0.0)), weight), 4)
+
     return normalized
 
 

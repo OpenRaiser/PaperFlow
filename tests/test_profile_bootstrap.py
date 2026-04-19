@@ -226,6 +226,48 @@ def test_format_profile_message_mentions_cold_start_and_reading_queue_hints(samp
     assert "清空精读列表" in message
 
 
+def test_ensure_profile_shape_collapses_duplicate_direction_aliases():
+    profile = coldstart_agent.build_empty_profile("user_role_alias")
+    profile["core_directions"] = {
+        "GUI Agent": 0.6789,
+        "gui-agent": 0.6675,
+        "Vision": 0.6789,
+        "vision": 0.6675,
+        "Computer Vision": 0.6,
+        "computer-vision": 0.6,
+    }
+    profile["topic_weights"] = {
+        "GUI Agent": 0.6789,
+        "gui-agent": 0.6675,
+        "Vision": 0.6789,
+        "vision": 0.6675,
+        "Computer Vision": 0.6,
+        "computer-vision": 0.6,
+        "screen understanding": 0.55,
+    }
+
+    normalized = coldstart_agent.ensure_profile_shape(profile, "user_role_alias")
+
+    assert normalized["core_directions"] == {
+        "gui-agent": 0.6789,
+        "vision": 0.6789,
+        "computer-vision": 0.6,
+    }
+    assert normalized["topic_weights"]["gui-agent"] == 0.6789
+    assert normalized["topic_weights"]["vision"] == 0.6789
+    assert normalized["topic_weights"]["computer-vision"] == 0.6
+    assert normalized["topic_weights"]["screen understanding"] == 0.55
+
+
+def test_direction_lexicon_prefers_computer_vision_over_generic_vision():
+    direction_lexicon = importlib.import_module("config.direction_lexicon")
+
+    resolved = direction_lexicon.resolve_canonical_direction("Computer Vision", include_paper_terms=True)
+
+    assert resolved is not None
+    assert resolved["canonical_name"] == "computer-vision"
+
+
 def test_detect_intent_routes_profile_updates_correctly():
     coordinator = master_coordinator.MasterCoordinator(user_id="user_rolea")
 

@@ -657,7 +657,6 @@
     "aliases": [
       "vision",
       "视觉",
-      "computer vision",
       "visual understanding",
       "image understanding"
     ],
@@ -666,8 +665,7 @@
       "vision",
       "visual",
       "image",
-      "video",
-      "computer vision"
+      "video"
     ],
     "name": "Vision",
     "name_cn": "视觉",
@@ -675,8 +673,7 @@
       "vision",
       "visual",
       "image",
-      "video",
-      "computer vision"
+      "video"
     ]
   },
   "vision-language": {

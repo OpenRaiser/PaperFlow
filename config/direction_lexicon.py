@@ -164,8 +164,8 @@ BUILTIN_DIRECTION_REGISTRY: Dict[str, Dict[str, Any]] = {
         "vision",
         name="Vision",
         name_cn="视觉",
-        aliases=["computer vision", "visual understanding", "image understanding"],
-        paper_terms=["vision", "visual", "image", "video", "computer vision"],
+        aliases=["visual understanding", "image understanding"],
+        paper_terms=["vision", "visual", "image", "video"],
     ),
     "computer-vision": _default_entry(
         "computer-vision",
