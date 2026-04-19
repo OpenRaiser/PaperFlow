@@ -49,15 +49,27 @@ try:
 except ImportError:
     HAS_NUMPY = False
 
-# 常见章节标题模式
+# Common section heading patterns, including numbered headings like
+# "1 Introduction" and "II. Method".
+SECTION_HEADING_PREFIX = r"(?:\d+(?:\.\d+)*[.)]?|[IVXivx]+[.)]?|[一二三四五六七八九十]+[、.)]?)?"
+
+
+def _section_heading_pattern(*titles: str) -> str:
+    joined_titles = "|".join(re.escape(title) for title in titles)
+    return (
+        rf"(?:^|\n)\s*{SECTION_HEADING_PREFIX}\s*"
+        rf"(?:{joined_titles})\s*[:：]?\s*(?:$|\n)"
+    )
+
+
 SECTION_PATTERNS = {
-    "abstract": r"(?:^|\n)\s*(?:abstract|summary)\s*(?:$|\n)",
-    "introduction": r"(?:^|\n)\s*(?:introduction|background|related work)\s*(?:$|\n)",
-    "method": r"(?:^|\n)\s*(?:method|methodology|approach|our method|model)\s*(?:$|\n)",
-    "results": r"(?:^|\n)\s*(?:results|experiments|evaluation|experiments and results)\s*(?:$|\n)",
-    "discussion": r"(?:^|\n)\s*(?:discussion|analysis)\s*(?:$|\n)",
-    "conclusion": r"(?:^|\n)\s*(?:conclusion|summary|future work)\s*(?:$|\n)",
-    "references": r"(?:^|\n)\s*(?:references|bibliography)\s*(?:$|\n)"
+    "abstract": _section_heading_pattern("abstract", "summary", "摘要"),
+    "introduction": _section_heading_pattern("introduction", "background", "related work"),
+    "method": _section_heading_pattern("method", "methodology", "approach", "our method", "model"),
+    "results": _section_heading_pattern("results", "experiments", "evaluation", "experiments and results"),
+    "discussion": _section_heading_pattern("discussion", "analysis"),
+    "conclusion": _section_heading_pattern("conclusion", "summary", "future work"),
+    "references": _section_heading_pattern("references", "bibliography"),
 }
 
 SECTION_TITLES = {
@@ -80,6 +92,9 @@ SECTION_TITLES = {
     "bibliography",
     "摘要",
 }
+
+ABSTRACT_HEADINGS = {"abstract", "summary", "摘要"}
+KEYWORD_HEADINGS = {"keywords", "keyword", "关键词"}
 
 # 研究领域关键词
 RESEARCH_AREA_KEYWORDS = {
@@ -150,6 +165,15 @@ def clean_extracted_text(text: str) -> str:
         previous_blank = False
 
     return "\n".join(cleaned_lines).strip()
+
+
+def _normalize_heading_line(line: str) -> str:
+    normalized = re.sub(
+        r"^\s*(?:(?:\d+(?:\.\d+)*[.)]?)|(?:[IVXivx]+[.)]?)|(?:[一二三四五六七八九十]+[、.)]?))?\s*",
+        "",
+        (line or "").strip(),
+    )
+    return normalized.strip().lower().rstrip(":：")
 
 
 def _get_rapidocr_engine():
@@ -332,8 +356,7 @@ def score_semantic_direction_confidence(similarity: float) -> float:
 
 def is_section_heading(line: str) -> bool:
     """Return True when a line looks like a section title rather than content."""
-    normalized = re.sub(r"^[\dIVXivx.\-() ]+", "", (line or "").strip()).lower().rstrip(":：")
-    return normalized in SECTION_TITLES
+    return _normalize_heading_line(line) in SECTION_TITLES
 
 
 def split_author_names(line: str) -> List[str]:
@@ -415,6 +438,41 @@ def extract_title_and_authors(lines: List[str]) -> Dict[str, Any]:
 
 def extract_abstract(text: str) -> str:
     """Extract the abstract/summary block when present."""
+    normalized_text = clean_extracted_text(text)
+    if normalized_text:
+        lines = normalized_text.split("\n")
+        start_index = None
+        for index, line in enumerate(lines):
+            if _normalize_heading_line(line) in ABSTRACT_HEADINGS:
+                start_index = index + 1
+                break
+
+        if start_index is not None:
+            body_lines: List[str] = []
+            previous_blank = False
+            for line in lines[start_index:]:
+                stripped = line.strip()
+                if not stripped:
+                    if body_lines and not previous_blank:
+                        body_lines.append("")
+                    previous_blank = True
+                    continue
+
+                previous_blank = False
+                normalized_heading = _normalize_heading_line(stripped)
+                if body_lines and (
+                    normalized_heading in SECTION_TITLES
+                    or normalized_heading in KEYWORD_HEADINGS
+                    or stripped.lower().startswith("keywords:")
+                    or stripped.startswith("关键词")
+                ):
+                    break
+                body_lines.append(stripped)
+
+            abstract = "\n".join(body_lines).strip()
+            if abstract:
+                return abstract
+
     patterns = [
         r"(?:^|\n)\s*(?:abstract|summary|摘要)\s*[:：]?\s*\n+(?P<body>.+?)(?=\n\s*(?:keywords?|introduction|background|related work|1\.|i\.|一、)\b|\Z)",
         r"(?:^|\n)\s*(?:abstract|summary|摘要)\s*[:：]?\s*(?P<body>.+?)(?=\n\s*\n|\n\s*(?:introduction|background|1\.|i\.)\b|\Z)",

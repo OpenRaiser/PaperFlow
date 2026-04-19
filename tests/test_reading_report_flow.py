@@ -643,6 +643,65 @@ def test_retrieve_report_evidence_ranks_expected_pdf_chunks(monkeypatch):
     assert "small number of domains" in evidence["matches"]["limitations"][0]["text"].lower()
 
 
+def test_retrieve_report_evidence_diversifies_bucket_matches_when_scores_tie(monkeypatch):
+    class FakeEmbeddingService:
+        descriptor = "fake:test:tied"
+
+        def embed_batch(self, texts):
+            return [[1.0, 1.0, 1.0] for _ in texts]
+
+        @staticmethod
+        def cosine_similarity(vector1, vector2):
+            return 1.0
+
+    class FakeEmbeddingModule:
+        @staticmethod
+        def get_embedding_service():
+            return FakeEmbeddingService()
+
+    monkeypatch.setattr(reading_agent, "_load_embedding_module", lambda: FakeEmbeddingModule())
+    monkeypatch.setattr(reading_agent, "READING_REPORT_EVIDENCE_CACHE_ENABLED", False)
+
+    paper = {
+        "title": "Scientific Planner",
+        "abstract": "A short abstract that should not dominate every bucket.",
+    }
+    profile = {
+        "core_directions": {"agent": 0.8, "retrieval": 0.7},
+        "methodology_preferences": {},
+    }
+    parsed_pdf = {
+        "abstract": "A short abstract that should not dominate every bucket.",
+        "sections": {
+            "introduction": "The main challenge is dataset shift across scientific domains.",
+            "method": "We propose a two-stage planner with an evidence retriever.",
+            "results": "The planner improves ranking quality by 12% over the baseline.",
+            "discussion": "One limitation is the small number of evaluation domains.",
+        },
+        "full_text": (
+            "The main challenge is dataset shift across scientific domains. "
+            "We propose a two-stage planner with an evidence retriever. "
+            "The planner improves ranking quality by 12% over the baseline. "
+            "One limitation is the small number of evaluation domains."
+        ),
+    }
+
+    evidence = reading_agent._retrieve_report_evidence(paper, profile, parsed_pdf)
+
+    assert evidence["matches"]["background"][0]["section"] in {"abstract", "introduction", "background"}
+    assert evidence["matches"]["method"][0]["section"] == "method"
+    assert evidence["matches"]["results"][0]["section"] == "results"
+    assert evidence["matches"]["limitations"][0]["section"] in {"discussion", "limitations", "conclusion"}
+
+    anchors = reading_agent._build_report_evidence_anchors(evidence)
+    top_anchor_texts = [
+        anchors[bucket][0].split("|", 2)[-1].strip()
+        for bucket in ("background", "method", "results", "limitations")
+        if anchors.get(bucket)
+    ]
+    assert len(top_anchor_texts) == len(set(top_anchor_texts))
+
+
 def test_build_heuristic_report_payload_uses_retrieved_evidence(monkeypatch):
     class FakeEmbeddingService:
         descriptor = "fake:test:4"

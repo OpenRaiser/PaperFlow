@@ -1002,6 +1002,25 @@ def get_latest_push(user_id: str) -> Optional[Dict]:
     }
 
 
+def _get_latest_selection_clear_log_id(cursor: sqlite3.Cursor, user_id: str) -> Optional[int]:
+    """Return the latest marker that clears the pending reading queue."""
+    cursor.execute(
+        """
+        SELECT MAX(id) AS clear_id
+        FROM behavior_logs
+        WHERE user_id = ?
+          AND action = 'selection_cleared'
+          AND action_type = 'selection_queue'
+        """,
+        (user_id,),
+    )
+    row = cursor.fetchone()
+    if not row:
+        return None
+    clear_id = row["clear_id"]
+    return int(clear_id) if clear_id is not None else None
+
+
 def get_latest_selected_papers(user_id: str) -> Optional[Dict]:
     """
     Get the latest selected-paper batch for a user.
@@ -1012,18 +1031,23 @@ def get_latest_selected_papers(user_id: str) -> Optional[Dict]:
     conn = get_connection()
     cursor = conn.cursor()
 
-    cursor.execute(
-        """
+    clear_after_log_id = _get_latest_selection_clear_log_id(cursor, user_id)
+    latest_batch_sql = """
         SELECT push_id, MAX(timestamp) AS timestamp
         FROM behavior_logs
         WHERE user_id = ?
           AND action = 'selected'
+    """
+    latest_batch_params: List[Any] = [user_id]
+    if clear_after_log_id is not None:
+        latest_batch_sql += " AND id > ?"
+        latest_batch_params.append(clear_after_log_id)
+    latest_batch_sql += """
         GROUP BY push_id
         ORDER BY timestamp DESC, push_id DESC
         LIMIT 1
-        """,
-        (user_id,),
-    )
+    """
+    cursor.execute(latest_batch_sql, latest_batch_params)
 
     row = cursor.fetchone()
     if not row:
@@ -1075,6 +1099,50 @@ def get_latest_selected_papers(user_id: str) -> Optional[Dict]:
     return {
         "push_id": push_id,
         "selection_time": selection_time,
+        "papers": papers,
+    }
+
+
+def clear_pending_selected_papers(user_id: str) -> Dict[str, Any]:
+    """
+    Clear the current pending reading queue without deleting selection history.
+
+    This inserts a queue-clear marker so historical selections remain available
+    for analytics and profile learning, while future `get_latest_selected_papers`
+    calls only consider selections made after the clear action.
+    """
+    pending = get_latest_selected_papers(user_id)
+    if not pending:
+        return {
+            "cleared": False,
+            "cleared_count": 0,
+            "push_id": None,
+            "selection_time": None,
+            "papers": [],
+        }
+
+    papers = list(pending.get("papers") or [])
+    metadata = {
+        "cleared_push_id": pending.get("push_id"),
+        "selection_time": pending.get("selection_time"),
+        "cleared_count": len(papers),
+        "paper_ids": [paper.get("id") for paper in papers if paper.get("id") is not None],
+        "paper_titles": [str(paper.get("title")).strip() for paper in papers if str(paper.get("title")).strip()],
+    }
+    log_behavior(
+        user_id=user_id,
+        push_id=str(pending.get("push_id") or "selection_queue"),
+        paper_id=None,
+        action="selection_cleared",
+        action_type="selection_queue",
+        category="reading_queue",
+        metadata=metadata,
+    )
+    return {
+        "cleared": True,
+        "cleared_count": len(papers),
+        "push_id": pending.get("push_id"),
+        "selection_time": pending.get("selection_time"),
         "papers": papers,
     }
 

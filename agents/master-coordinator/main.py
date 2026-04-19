@@ -47,6 +47,11 @@ create_profile = db_ops.create_profile
 update_profile = db_ops.update_profile
 get_latest_push = db_ops.get_latest_push
 get_latest_selected_papers = getattr(db_ops, "get_latest_selected_papers", lambda user_id: None)
+clear_pending_selected_papers = getattr(
+    db_ops,
+    "clear_pending_selected_papers",
+    lambda user_id: {"cleared": False, "cleared_count": 0, "push_id": None, "papers": []},
+)
 get_recent_pushes = db_ops.get_recent_pushes
 get_recent_created_report = getattr(db_ops, "get_recent_created_report", lambda user_id, minutes=180: None)
 log_behavior = db_ops.log_behavior
@@ -335,6 +340,7 @@ def format_profile_message(profile: Dict[str, Any]) -> str:
     lines.append(f"作者：{', '.join(must_read.get('authors', [])) or '（空，待你添加）'}")
     lines.append(f"机构：{', '.join(must_read.get('institutions', [])) or '（空，待你添加）'}")
     lines.append(f"关键词：{', '.join(must_read.get('keywords', [])) or '（空，待你添加）'}")
+    lines.append(COLD_START_MUST_READ_NOTE)
 
     author_heat = profile.get("author_heat", {}) or {}
     filtered_author_heat = {
@@ -353,6 +359,7 @@ def format_profile_message(profile: Dict[str, Any]) -> str:
             "━━━━━━━━━━━━",
             "你可以直接说：",
             '  "加个必读作者：XXX"',
+            CLEAR_READING_LIST_HINT,
             '  "降低 GUI Agent 权重"',
             '  "我最近对 protein language model 更感兴趣了"',
         ]
@@ -729,6 +736,9 @@ BOT_AUTHORED_PREFIXES = (
     "已将 ",
 )
 
+COLD_START_MUST_READ_NOTE = "说明：普通“冷启动”会保留这份必读清单；只有“重新冷启动”才会重置。"
+CLEAR_READING_LIST_HINT = '  "清空精读列表"'
+
 
 def first_meaningful_line(text: Any) -> str:
     """Use only the leading content line so bot examples do not get reparsed as user input."""
@@ -796,6 +806,9 @@ def detect_explicit_command_intent(text: Any) -> Optional[Dict[str, Any]]:
             "confidence": 1.0,
             "slots": {"text": cleaned, "homepage_url": homepage_url},
         }
+
+    if looks_like_clear_reading_list_command(cleaned):
+        return {"intent": "clear_reading_list", "confidence": 1.0, "slots": {}}
 
     if lowered in cold_start_commands:
         return {"intent": "cold_start", "confidence": 1.0, "slots": {"text": cleaned}}
@@ -1261,6 +1274,36 @@ def looks_like_cold_start_description(text: Any, profile: Optional[Dict[str, Any
     )
 
 
+def should_reset_existing_profile_for_cold_start(text: Any) -> bool:
+    """Reset only for explicit rebuild commands, not ordinary cold-start refreshes."""
+    cleaned = first_meaningful_line(text)
+    lowered = cleaned.lower().strip()
+    if not lowered:
+        return False
+
+    return (
+        cleaned.startswith("重新冷启动")
+        or lowered.startswith("reset cold start")
+        or lowered.startswith("re-cold-start")
+        or lowered.startswith("re cold start")
+    )
+
+
+def looks_like_clear_reading_list_command(text: Any) -> bool:
+    """Detect explicit requests to clear the current pending reading queue."""
+    cleaned = first_meaningful_line(text)
+    lowered = cleaned.lower().strip()
+    if not lowered:
+        return False
+
+    if lowered in {"clear reading list", "clear reading queue"}:
+        return True
+
+    return bool(
+        re.search(r"(清空|清理|清掉|重置).*(精读列表|精读队列|待精读|已选论文)", cleaned)
+    )
+
+
 def clean_profile_topic_text(topic: str, *, strip_domain_suffix: bool = False) -> str:
     """Trim topic text extracted from profile-update messages."""
     cleaned = re.sub(r"\s+", " ", (topic or "").strip().strip("“”\"'`"))
@@ -1474,6 +1517,9 @@ class MasterCoordinator:
         if reviewer_watch:
             return {"intent": "reviewer_watch", "confidence": 0.82, "slots": reviewer_watch}
 
+        if looks_like_clear_reading_list_command(text):
+            return {"intent": "clear_reading_list", "confidence": 0.95, "slots": {}}
+
         profile_update = parse_profile_update_request(text, profile=self.profile)
         if profile_update:
             return {"intent": "profile_update", "confidence": 0.9, "slots": profile_update}
@@ -1578,6 +1624,7 @@ class MasterCoordinator:
             scholar_url = extract_google_scholar_url(text)
             homepage_url = extract_homepage_url(text)
             natural_language = strip_bootstrap_urls(text) if (scholar_url or homepage_url) else text
+            reset_existing = should_reset_existing_profile_for_cold_start(text)
 
             if explicit_command and explicit_command.get("intent") == "cold_start":
                 if not scholar_url and not homepage_url:
@@ -1595,7 +1642,7 @@ class MasterCoordinator:
                 natural_language=natural_language or None,
                 scholar_url=scholar_url,
                 homepage_url=homepage_url,
-                reset_existing=True,
+                reset_existing=reset_existing,
                 send_to_feishu=True,
                 feishu_user_id=self.feishu_user_id,
                 chat_id=self.chat_id
@@ -1743,6 +1790,34 @@ class MasterCoordinator:
             }
         except Exception as e:
             return {"success": False, "message": str(e)}
+
+    def handle_clear_reading_list(self) -> Dict[str, Any]:
+        """Clear the current pending reading queue while preserving learning history."""
+        print("Intent: Clear Reading List")
+
+        try:
+            result = clear_pending_selected_papers(self.user_id)
+        except Exception as e:
+            return {"success": False, "message": str(e)}
+
+        if result.get("cleared"):
+            cleared_count = int(result.get("cleared_count", 0) or 0)
+            paper_titles = [
+                str(paper.get("title")).strip()
+                for paper in result.get("papers", [])
+                if str(paper.get("title")).strip()
+            ]
+            msg = f"已清空当前精读列表，共移除 {cleared_count} 篇待精读论文。"
+            if paper_titles:
+                msg += f"\n本次清空：{'; '.join(paper_titles[:3])}"
+                if len(paper_titles) > 3:
+                    msg += " ..."
+            msg += "\n之后重新回复编号，新的论文才会进入精读列表。"
+        else:
+            msg = "当前没有待清空的精读列表。先推送并回复编号后，系统才会形成精读列表。"
+
+        send_message(msg, chat_id=self.chat_id, user_id=self.feishu_user_id)
+        return {"success": True, **result, "message": msg}
 
     def handle_weekly_report(self) -> Dict[str, Any]:
         """处理周报"""
@@ -2272,7 +2347,7 @@ class MasterCoordinator:
 
     def handle_unknown(self, text: str) -> Dict[str, Any]:
         """处理未知意图"""
-        msg = f"抱歉，我还不太理解你的意思。\n\n我可以帮你：\n• 每日推送：说'推送'\n• 反馈选择：回复数字如'1 2 3'\n• 精读报告：说'精读'\n• 查看周报：说'周报'\n• 管理必读：说'加个必读作者'\n\n当前输入：{text[:50]}"
+        msg = f"抱歉，我还不太理解你的意思。\n\n我可以帮你：\n• 每日推送：说'推送'\n• 反馈选择：回复数字如'1 2 3'\n• 精读报告：说'精读'\n• 清空精读列表：说'清空精读列表'\n• 查看周报：说'周报'\n• 管理必读：说'加个必读作者'\n\n当前输入：{text[:50]}"
         send_message(msg, chat_id=self.chat_id, user_id=self.feishu_user_id)
         return {"success": False, "message": "Unknown intent"}
 
@@ -2321,6 +2396,7 @@ class MasterCoordinator:
                 pdf_url=intent["slots"].get("pdf_url"),
                 title_hint=intent["slots"].get("title_hint", ""),
             ),
+            "clear_reading_list": self.handle_clear_reading_list,
             "weekly_report": self.handle_weekly_report,
             "must_read": lambda: self.handle_must_read(intent["slots"].get("command", text)),
             "show_profile": self.handle_show_profile,

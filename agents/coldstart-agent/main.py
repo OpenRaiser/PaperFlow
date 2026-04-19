@@ -118,6 +118,8 @@ SCHOLAR_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 COLD_START_COMMAND_HINTS = {"冷启动", "重新冷启动", "cold start", "cold-start"}
+COLD_START_MUST_READ_NOTE = "说明：普通“冷启动”会保留这份必读清单；只有“重新冷启动”才会重置。"
+CLEAR_READING_LIST_HINT = '  "清空精读列表"'
 
 
 def build_empty_profile(user_id: str) -> Dict[str, Any]:
@@ -1659,10 +1661,12 @@ def format_profile_card(profile: Dict[str, Any], user_id: str = "user_001") -> s
             f"作者：{', '.join(must_read.get('authors', [])) or '（空，待你添加）'}",
             f"机构：{', '.join(must_read.get('institutions', [])) or '（空，待你添加）'}",
             f"关键词：{', '.join(must_read.get('keywords', [])) or '（空，待你添加）'}",
+            COLD_START_MUST_READ_NOTE,
             "",
             "━━━━━━━━━━━━",
             "你可以直接说：",
             '  "加个必读作者：XXX"',
+            CLEAR_READING_LIST_HINT,
             '  "降低 GUI Agent 权重"',
             '  "我最近对 protein language model 更感兴趣了"',
         ]

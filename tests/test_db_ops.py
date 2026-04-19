@@ -17,7 +17,9 @@ from db_ops import (
     get_paper_by_arxiv,
     log_behavior,
     get_behavior_logs,
-    get_selection_stats
+    get_selection_stats,
+    get_latest_selected_papers,
+    clear_pending_selected_papers,
 )
 
 
@@ -187,3 +189,61 @@ class TestSelectionStats:
         assert stats["selected"] == 5
         assert stats["skipped"] == 5
         assert abs(stats["selection_rate"] - 0.5) < 0.01
+
+
+class TestReadingQueueOperations:
+    """Tests for the pending reading queue helpers."""
+
+    def test_clear_pending_selected_papers_hides_old_queue_until_new_selection(self, test_db_path, sample_paper):
+        import db_ops
+        db_ops.DB_PATH = test_db_path
+
+        paper_a = dict(sample_paper)
+        paper_b = dict(sample_paper)
+        paper_b["arxiv_id"] = "2404.00002"
+        paper_b["doi"] = "10.48550/arXiv.2404.00002"
+        paper_b["title"] = "Follow-up GUI Agent with Grounded Planning"
+
+        paper_a_id = add_paper(paper_a)
+        paper_b_id = add_paper(paper_b)
+
+        log_behavior(
+            "test_user",
+            "push_001",
+            paper_a_id,
+            "selected",
+            "selected",
+            "selected",
+            metadata={"paper_number": 1},
+        )
+        latest_before_clear = get_latest_selected_papers("test_user")
+        assert latest_before_clear is not None
+        assert latest_before_clear["push_id"] == "push_001"
+
+        cleared = clear_pending_selected_papers("test_user")
+        assert cleared["cleared"] is True
+        assert cleared["cleared_count"] == 1
+        assert cleared["push_id"] == "push_001"
+        assert get_latest_selected_papers("test_user") is None
+
+        log_behavior(
+            "test_user",
+            "push_002",
+            paper_b_id,
+            "selected",
+            "selected",
+            "selected",
+            metadata={"paper_number": 1},
+        )
+        latest_after_new_selection = get_latest_selected_papers("test_user")
+        assert latest_after_new_selection is not None
+        assert latest_after_new_selection["push_id"] == "push_002"
+
+    def test_clear_pending_selected_papers_returns_empty_when_queue_is_already_clear(self, test_db_path):
+        import db_ops
+        db_ops.DB_PATH = test_db_path
+
+        cleared = clear_pending_selected_papers("test_user")
+
+        assert cleared["cleared"] is False
+        assert cleared["cleared_count"] == 0

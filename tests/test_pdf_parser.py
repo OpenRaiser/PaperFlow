@@ -78,6 +78,56 @@ def test_parse_pdf_extracts_methodology_and_full_text(tmp_path, monkeypatch):
     assert "framework uses a benchmark dataset" in result["full_text"].lower()
 
 
+def test_extract_abstract_stops_before_numbered_introduction():
+    text = pdf_parser.clean_extracted_text(
+        "\n".join(
+            [
+                "Paper Title",
+                "",
+                "Abstract",
+                "This is the actual abstract body.",
+                "1 Introduction",
+                "This line belongs to the introduction.",
+                "2 Method",
+                "This line belongs to the method.",
+            ]
+        )
+    )
+
+    abstract = pdf_parser.extract_abstract(text)
+
+    assert abstract == "This is the actual abstract body."
+
+
+def test_extract_sections_handles_numbered_headings():
+    text = pdf_parser.clean_extracted_text(
+        "\n".join(
+            [
+                "Paper Title",
+                "",
+                "1 Introduction",
+                "This is the introduction.",
+                "",
+                "2 Method",
+                "This is the method section.",
+                "",
+                "3 Results",
+                "This is the results section.",
+                "",
+                "4 Conclusion",
+                "This is the conclusion section.",
+            ]
+        )
+    )
+
+    sections = pdf_parser.extract_sections(text)
+
+    assert sections["introduction"] == "This is the introduction."
+    assert sections["method"] == "This is the method section."
+    assert sections["results"] == "This is the results section."
+    assert sections["conclusion"] == "This is the conclusion section."
+
+
 def test_extract_text_from_pdf_uses_ocr_when_primary_text_is_too_short(tmp_path, monkeypatch):
     pdf_path = _create_pdf(tmp_path, "scan placeholder")
 

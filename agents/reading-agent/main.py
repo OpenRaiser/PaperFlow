@@ -78,6 +78,10 @@ MAX_SECTION_CHARS = int(os.environ.get("READING_REPORT_SECTION_CHARS", "1800"))
 READING_REPORT_CHUNK_CHARS = int(os.environ.get("READING_REPORT_CHUNK_CHARS", "1200"))
 READING_REPORT_CHUNK_OVERLAP = int(os.environ.get("READING_REPORT_CHUNK_OVERLAP", "180"))
 READING_REPORT_EVIDENCE_TOP_K = int(os.environ.get("READING_REPORT_EVIDENCE_TOP_K", "3"))
+READING_REPORT_EVIDENCE_VERSION = (
+    os.environ.get("READING_REPORT_EVIDENCE_VERSION", "2026-04-19-v3").strip()
+    or "2026-04-19-v3"
+)
 READING_REPORT_EVIDENCE_CACHE_ENABLED = os.environ.get("READING_REPORT_EVIDENCE_CACHE_ENABLED", "1").strip().lower() not in {"0", "false", "off", "no"}
 READING_REPORT_OUTPUT_VERSION = os.environ.get("READING_REPORT_OUTPUT_VERSION", "2026-04-14-v1").strip() or "2026-04-14-v1"
 READING_REPORT_PROFILE_RETRIEVAL_WEIGHT = float(os.environ.get("READING_REPORT_PROFILE_RETRIEVAL_WEIGHT", "0.25"))
@@ -1577,6 +1581,7 @@ def _build_evidence_cache_key(
     descriptor: str,
 ) -> str:
     sections = dict((parsed_pdf or {}).get("sections") or {})
+    preferred_top_k = _preferred_evidence_top_k(user_profile)
     payload = {
         "paper": {
             "id": paper.get("id"),
@@ -1586,10 +1591,11 @@ def _build_evidence_cache_key(
         },
         "profile_summary": _summarize_profile_for_embedding(user_profile),
         "profile_preferences": user_profile.get("methodology_preferences") or {},
+        "evidence_version": READING_REPORT_EVIDENCE_VERSION,
         "descriptor": descriptor,
         "chunk_chars": READING_REPORT_CHUNK_CHARS,
         "chunk_overlap": READING_REPORT_CHUNK_OVERLAP,
-        "top_k": READING_REPORT_EVIDENCE_TOP_K,
+        "top_k": preferred_top_k,
         "profile_retrieval_weight": READING_REPORT_PROFILE_RETRIEVAL_WEIGHT,
         "pdf": {
             "abstract": _clean_text((parsed_pdf or {}).get("abstract")),
@@ -1798,11 +1804,26 @@ def _build_report_evidence_anchors(retrieved_evidence: Dict[str, Any]) -> Dict[s
     matches = (retrieved_evidence or {}).get("matches") or {}
     top_k = int((retrieved_evidence or {}).get("top_k") or READING_REPORT_EVIDENCE_TOP_K)
     anchors: Dict[str, List[str]] = {}
+    seen_texts: set[str] = set()
     for bucket in ("background", "method", "results", "limitations", "relevance"):
         bucket_matches = matches.get(bucket) or []
-        items = [_format_evidence_anchor(match) for match in bucket_matches if isinstance(match, dict)]
+        preferred_items: List[str] = []
+        fallback_items: List[str] = []
+        for match in bucket_matches:
+            if not isinstance(match, dict):
+                continue
+            text_key = _clean_text(match.get("text")).casefold()
+            item = _format_evidence_anchor(match)
+            if text_key and text_key not in seen_texts:
+                preferred_items.append(item)
+                seen_texts.add(text_key)
+            else:
+                fallback_items.append(item)
+        items = _unique_preserve_order(preferred_items)[:top_k]
+        if not items:
+            items = _unique_preserve_order(fallback_items)[: min(top_k, 1)]
         if items:
-            anchors[bucket] = _unique_preserve_order(items)[:top_k]
+            anchors[bucket] = items
     return anchors
 
 
@@ -1868,37 +1889,84 @@ def _retrieve_report_evidence(
 
         top_k = _preferred_evidence_top_k(user_profile)
         matches: Dict[str, List[Dict[str, Any]]] = {}
+        used_texts_global: set[str] = set()
         for query_spec, query_vector in zip(query_specs, query_vectors):
             preferred_sections = set(query_spec["preferred_sections"])
+            preferred_available = any((chunk.get("section") or "") in preferred_sections for chunk in chunks)
             ranked: List[Dict[str, Any]] = []
             for chunk, chunk_vector in zip(chunks, chunk_vectors):
+                section = _clean_text(chunk.get("section")).lower() or "full_text"
                 score = float(service.cosine_similarity(query_vector, chunk_vector))
                 profile_score = float(service.cosine_similarity(profile_vector, chunk_vector)) if profile_query_text else 0.0
-                if chunk.get("section") in preferred_sections:
-                    score += 0.08
-                elif chunk.get("section") == "abstract":
-                    score += 0.03
+                if section in preferred_sections:
+                    score += 0.14
+                elif preferred_available:
+                    score -= 0.10
+                elif section == "abstract":
+                    score += 0.02
+
+                bucket = query_spec["bucket"]
+                if bucket == "background":
+                    if section in {"method", "approach", "model", "results", "experiments", "evaluation"}:
+                        score -= 0.08
+                elif bucket == "method":
+                    if preferred_available and section in {"abstract", "introduction", "background", "discussion", "conclusion"}:
+                        score -= 0.12
+                elif bucket == "results":
+                    if preferred_available and section in {"abstract", "introduction", "background", "method", "approach", "model"}:
+                        score -= 0.12
+                elif bucket == "limitations":
+                    if preferred_available and section in {
+                        "abstract",
+                        "introduction",
+                        "background",
+                        "method",
+                        "approach",
+                        "model",
+                        "results",
+                        "experiments",
+                        "evaluation",
+                    }:
+                        score -= 0.14
+
                 score += profile_score * READING_REPORT_PROFILE_RETRIEVAL_WEIGHT
-                if query_spec["bucket"] == "relevance":
+                if bucket == "relevance":
                     score += profile_score * READING_REPORT_PROFILE_RETRIEVAL_WEIGHT
-                    if chunk.get("section") in {"method", "results", "discussion", "conclusion"}:
+                    if section in {"method", "results", "discussion", "conclusion"}:
                         score += 0.05
-                    elif chunk.get("section") == "abstract":
+                    elif section == "abstract":
                         score -= 0.02
                 ranked.append({**chunk, "score": score, "profile_score": profile_score})
 
             ranked.sort(key=lambda item: item["score"], reverse=True)
+            primary_ranked = (
+                [item for item in ranked if _clean_text(item.get("section")).lower() in preferred_sections]
+                if preferred_available
+                else list(ranked)
+            )
+            if not primary_ranked:
+                primary_ranked = list(ranked)
             selected: List[Dict[str, Any]] = []
-            seen_texts = set()
-            for item in ranked:
+            seen_texts_local = set()
+            fallback_selected: List[Dict[str, Any]] = []
+            for item in primary_ranked:
                 key = item["text"].casefold()
-                if key in seen_texts:
+                if key in seen_texts_local:
                     continue
-                seen_texts.add(key)
+                seen_texts_local.add(key)
+                if key in used_texts_global:
+                    fallback_selected.append(item)
+                    continue
                 selected.append(item)
                 if len(selected) >= top_k:
                     break
+            if len(selected) < top_k:
+                for item in fallback_selected:
+                    selected.append(item)
+                    if len(selected) >= top_k:
+                        break
             matches[query_spec["bucket"]] = selected
+            used_texts_global.update(item["text"].casefold() for item in selected if item.get("text"))
 
         result = {
             "descriptor": getattr(service, "descriptor", ""),

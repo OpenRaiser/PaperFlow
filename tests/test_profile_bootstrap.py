@@ -218,6 +218,14 @@ def test_format_profile_message_uses_pdf_style_sections(sample_profile):
     assert "━━━ 必读清单 ━━━" in message
 
 
+def test_format_profile_message_mentions_cold_start_and_reading_queue_hints(sample_profile):
+    message = master_coordinator.format_profile_message(sample_profile)
+
+    assert "普通“冷启动”会保留这份必读清单" in message
+    assert "重新冷启动" in message
+    assert "清空精读列表" in message
+
+
 def test_detect_intent_routes_profile_updates_correctly():
     coordinator = master_coordinator.MasterCoordinator(user_id="user_rolea")
 
@@ -1124,6 +1132,14 @@ def test_detect_intent_routes_academic_profile_to_show_profile():
     assert intent["intent"] == "show_profile"
 
 
+def test_detect_intent_routes_clear_reading_list_command():
+    coordinator = master_coordinator.MasterCoordinator(user_id="user_rolea")
+
+    intent = coordinator.detect_intent("清空精读列表")
+
+    assert intent["intent"] == "clear_reading_list"
+
+
 def test_detect_intent_routes_confirm_direction_command():
     coordinator = master_coordinator.MasterCoordinator(user_id="user_rolea")
 
@@ -1247,6 +1263,7 @@ def test_handle_cold_start_uses_role_description_for_explicit_command(monkeypatc
 
     assert result["success"] is True
     assert captured["natural_language"] == "direction: gui agent, bio-molecular data infrastructure"
+    assert captured["reset_existing"] is False
 
 
 def test_detect_intent_routes_google_scholar_url_to_cold_start():
@@ -1463,7 +1480,7 @@ def test_handle_cold_start_passes_scholar_url_and_stripped_text(monkeypatch):
     assert captured["scholar_url"] == "https://scholar.google.com/citations?user=test123&hl=en"
     assert "机器人工程" in captured["natural_language"]
     assert "scholar.google.com" not in captured["natural_language"]
-    assert captured["reset_existing"] is True
+    assert captured["reset_existing"] is False
 
 
 def test_handle_cold_start_passes_homepage_url_and_stripped_text(monkeypatch):
@@ -1491,7 +1508,7 @@ def test_handle_cold_start_passes_homepage_url_and_stripped_text(monkeypatch):
     assert captured["homepage_url"] == "https://ada.example.com"
     assert "ada.example.com" not in captured["natural_language"]
     assert "scientific reasoning" in captured["natural_language"]
-    assert captured["reset_existing"] is True
+    assert captured["reset_existing"] is False
 
 
 def test_handle_cold_start_falls_back_to_role_bootstrap_summary(monkeypatch, tmp_path):
@@ -1535,6 +1552,32 @@ def test_handle_cold_start_falls_back_to_role_bootstrap_summary(monkeypatch, tmp
 
     assert result["success"] is True
     assert captured["natural_language"] == "direction: scientific reasoning, ai for science"
+    assert captured["reset_existing"] is False
+
+
+def test_handle_re_cold_start_resets_existing_profile(monkeypatch):
+    captured = {}
+
+    class FakeColdStartModule:
+        @staticmethod
+        def cold_start(**kwargs):
+            captured.update(kwargs)
+            return {"success": True}
+
+    real_import = importlib.import_module
+
+    def fake_import(name):
+        if name == "agents.coldstart-agent.main":
+            return FakeColdStartModule()
+        return real_import(name)
+
+    monkeypatch.setattr(master_coordinator.importlib, "import_module", fake_import)
+
+    coordinator = master_coordinator.MasterCoordinator(user_id="user_rolea")
+    result = coordinator.handle_cold_start("重新冷启动")
+
+    assert result["success"] is True
+    assert captured["reset_existing"] is True
 
 
 def test_cold_start_reset_existing_rebuilds_profile_from_scratch(test_db_path):
@@ -1555,6 +1598,30 @@ def test_cold_start_reset_existing_rebuilds_profile_from_scratch(test_db_path):
 
     assert rebuilt["core_directions"] == {}
     assert rebuilt["topic_weights"] == {}
+
+
+def test_cold_start_without_reset_preserves_must_read_state(test_db_path):
+    db_ops.DB_PATH = test_db_path
+    coldstart_agent.db_ops.DB_PATH = test_db_path
+
+    original = coldstart_agent.build_empty_profile("user_rolec")
+    original["must_read"] = {
+        "authors": ["Geoffrey Hinton"],
+        "institutions": [],
+        "keywords": ["scientific reasoning"],
+    }
+    db_ops.create_profile("user_rolec", original)
+
+    updated = coldstart_agent.cold_start(
+        user_id="user_rolec",
+        natural_language="direction: gui agent, bio-molecular data infrastructure",
+        send_to_feishu=False,
+        reset_existing=False,
+    )
+
+    assert updated["must_read"]["authors"] == ["Geoffrey Hinton"]
+    assert updated["must_read"]["keywords"] == ["scientific reasoning"]
+    assert "gui-agent" in updated["core_directions"]
 
 
 def test_reading_agent_resolves_actual_paper_ids_without_silently_dropping_all(monkeypatch):
@@ -1639,3 +1706,35 @@ def test_handle_reading_report_prefers_latest_selected_papers(monkeypatch):
     assert captured["paper_ids"] == [1, 2]
     assert [paper["id"] for paper in captured["papers"]] == [91, 75]
     assert captured["request_metadata"] == {"selection_push_id": "push_selected_1"}
+
+
+def test_handle_clear_reading_list_sends_summary(monkeypatch):
+    messages = []
+
+    monkeypatch.setattr(
+        master_coordinator,
+        "clear_pending_selected_papers",
+        lambda user_id: {
+            "cleared": True,
+            "cleared_count": 2,
+            "push_id": "push_selected_1",
+            "papers": [
+                {"title": "Selected A"},
+                {"title": "Selected B"},
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        master_coordinator,
+        "send_message",
+        lambda text, **kwargs: messages.append(text) or {"success": True},
+    )
+
+    coordinator = master_coordinator.MasterCoordinator(user_id="user_rolea")
+    result = coordinator.handle_clear_reading_list()
+
+    assert result["success"] is True
+    assert result["cleared"] is True
+    assert messages
+    assert "已清空当前精读列表，共移除 2 篇待精读论文。" in messages[0]
+    assert "Selected A; Selected B" in messages[0]

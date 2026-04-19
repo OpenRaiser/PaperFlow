@@ -1246,6 +1246,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
         if parsed.path == "/health":
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
+            self.send_header('ngrok-skip-browser-warning', 'true')
             self.end_headers()
             payload = {"status": "healthy"}
             try:

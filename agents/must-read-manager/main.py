@@ -54,6 +54,8 @@ ITEM_TYPE_LABELS = {
     "institution": "机构",
     "keyword": "关键词",
 }
+COLD_START_MUST_READ_NOTE = "说明：普通“冷启动”会保留这份必读清单；只有“重新冷启动”才会重置。"
+CLEAR_READING_LIST_HINT = '  "清空精读列表"'
 COMMAND_RE = re.compile(
     r"^\s*(?:请\s*)?(?:把\s*)?"
     r"(?P<action>加个|加上|添加|增加|加|去掉|去除|取消|移除|删除|删掉|add|remove|delete)"
@@ -285,11 +287,14 @@ def format_must_read_list(profile: Dict) -> str:
         lines.append("  （空，待添加）")
     lines.append("")
 
+    lines.append(COLD_START_MUST_READ_NOTE)
+    lines.append("")
     lines.append("=" * 60)
     lines.append("添加方式：")
     lines.append('  "加个必读作者：Mohammed AlQuraishi"')
     lines.append('  "添加必读机构：MIT"')
     lines.append('  "添加必读关键词：GUI Agent"')
+    lines.append(CLEAR_READING_LIST_HINT)
     lines.append("")
     lines.append("移除方式：")
     lines.append('  "移除必读作者：张三"')
@@ -356,6 +361,7 @@ def format_profile_update(profile: Dict) -> str:
     lines.append(f"作者：{', '.join(authors) or '（空，待添加）'}")
     lines.append(f"机构：{', '.join(institutions) or '（空，待添加）'}")
     lines.append(f"关键词：{', '.join(keywords) or '（空，待添加）'}")
+    lines.append(COLD_START_MUST_READ_NOTE)
     lines.append("")
 
     # 阅读历史
@@ -367,6 +373,7 @@ def format_profile_update(profile: Dict) -> str:
     lines.append("=" * 60)
     lines.append("你可以随时回复调整：")
     lines.append('  "加个必读作者：Mohammed AlQuraishi"')
+    lines.append(CLEAR_READING_LIST_HINT)
     lines.append('  "降低 GUI Agent 权重"')
     lines.append('  "我最近对 protein language model 更感兴趣"')
     lines.append("=" * 60)

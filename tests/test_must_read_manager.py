@@ -60,3 +60,11 @@ def test_remove_must_read_accepts_value_with_leading_particle(sample_profile):
 
     assert result["success"] is True
     assert profile["must_read"]["institutions"] == []
+
+
+def test_format_must_read_list_mentions_cold_start_and_reading_queue_hints(sample_profile):
+    formatted = must_read_manager.format_must_read_list(sample_profile)
+
+    assert "普通“冷启动”会保留这份必读清单" in formatted
+    assert "重新冷启动" in formatted
+    assert "清空精读列表" in formatted
