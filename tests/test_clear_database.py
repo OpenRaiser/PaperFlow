@@ -120,7 +120,7 @@ def test_build_seed_profile_limits_rolea_to_three_custom_directions():
 
 
 def test_full_reset_clears_dynamic_tables_and_reseeds_profiles(tmp_path):
-    db_path = tmp_path / "scitaste.db"
+    db_path = tmp_path / "paperflow.db"
     roles_path = tmp_path / "roles.json"
     backup_dir = tmp_path / "db_backups"
 
@@ -133,6 +133,17 @@ def test_full_reset_clears_dynamic_tables_and_reseeds_profiles(tmp_path):
                         "user_id": "user_rolea",
                         "description": "direction: data-native scientific discovery, bio-molecular data infrastructure, gui agent",
                         "feishu_chat_id": "oc_rolea",
+                        "seed_directions": [
+                            {"canonical_name": "data-native", "weight": 0.72},
+                            {"canonical_name": "bio-molecular", "weight": 0.62},
+                            {"canonical_name": "gui-agent", "weight": 0.56},
+                        ],
+                        "secondary_topics": ["lab automation"],
+                        "must_read_authors": ["Alice"],
+                        "must_read_institutions": ["OpenAI"],
+                        "must_read_keywords": ["gui agent"],
+                        "report_preferences": {"preferred_report_length": "detailed"},
+                        "drift_plan": {"shift_topics": ["multimodal reasoning"], "downweight_topics": ["gui agent"]},
                     },
                     "roled": {
                         "user_id": "user_roled",
@@ -183,7 +194,69 @@ def test_full_reset_clears_dynamic_tables_and_reseeds_profiles(tmp_path):
         "bio-molecular",
         "gui-agent",
     }
+    assert stored_profiles["user_rolea"]["secondary_topics"] == ["lab automation"]
+    assert stored_profiles["user_rolea"]["must_read"]["authors"] == ["Alice"]
+    assert stored_profiles["user_rolea"]["report_preferences"]["preferred_report_length"] == "detailed"
+    assert stored_profiles["user_rolea"]["drift_plan"]["shift_topics"] == ["multimodal reasoning"]
     assert set(stored_profiles["user_roled"]["core_directions"]) == {
         "reinforcement-learning",
         "embodied-ai",
+    }
+
+
+def test_benchmark_reset_preserves_papers_and_reseeds_profiles(tmp_path):
+    db_path = tmp_path / "paperflow.db"
+    roles_path = tmp_path / "roles.json"
+    backup_dir = tmp_path / "db_backups"
+
+    _create_test_db(db_path)
+    roles_path.write_text(
+        json.dumps(
+            {
+                "roles": {
+                    "rolea": {
+                        "user_id": "user_rolea",
+                        "description": "direction: data-native scientific discovery, bio-molecular data infrastructure, gui agent",
+                        "seed_directions": [
+                            {"canonical_name": "data-native", "weight": 0.72},
+                            {"canonical_name": "bio-molecular", "weight": 0.62},
+                            {"canonical_name": "gui-agent", "weight": 0.56},
+                        ],
+                    },
+                },
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    result = clear_database.benchmark_reset(
+        db_path=db_path,
+        roles_path=roles_path,
+        backup_dir=backup_dir,
+    )
+
+    assert Path(result["backup_path"]).exists()
+    assert result["after_counts"] == {
+        "profiles": 1,
+        "papers": 1,
+        "behavior_logs": 0,
+        "task_status": 0,
+    }
+
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    cursor.execute("SELECT arxiv_id, title FROM papers")
+    papers = cursor.fetchall()
+    cursor.execute("SELECT user_id, profile_json FROM profiles")
+    profiles = cursor.fetchall()
+    conn.close()
+
+    assert papers == [("2404.00001", "Old paper")]
+    assert [row[0] for row in profiles] == ["user_rolea"]
+    assert set(json.loads(profiles[0][1])["core_directions"]) == {
+        "data-native",
+        "bio-molecular",
+        "gui-agent",
     }

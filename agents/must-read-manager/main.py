@@ -37,8 +37,13 @@ update_profile = db_ops.update_profile
 log_behavior = db_ops.log_behavior
 
 # 飞书报告器
-feishu_reporter = importlib.import_module("skills.feishu-reporter.scripts.feishu_reporter")
+feishu_reporter = importlib.import_module("deployments.feishu.feishu-reporter.scripts.feishu_reporter")
 send_text = feishu_reporter.send_text
+
+# Direction registry used to keep broad research areas out of hard must-read rules.
+direction_lexicon = importlib.import_module("config.direction_lexicon")
+resolve_canonical_direction = direction_lexicon.resolve_canonical_direction
+normalize_direction_key = direction_lexicon.normalize_direction_key
 
 
 LIST_COMMAND_HINTS = ("查看必读", "显示必读", "必读清单", "show must")
@@ -56,6 +61,36 @@ ITEM_TYPE_LABELS = {
 }
 COLD_START_MUST_READ_NOTE = "说明：普通“冷启动”会保留这份必读清单；只有“重新冷启动”才会重置。"
 CLEAR_READING_LIST_HINT = '  "清空精读列表"'
+SOFT_DIRECTION_WEIGHT = 0.62
+BROAD_MUST_READ_KEYWORD_DIRECTIONS = {
+    "agent",
+    "ai-for-science",
+    "computer-vision",
+    "deep-learning",
+    "embodied-ai",
+    "language",
+    "machine-learning",
+    "multimodal-learning",
+    "multimodal-reasoning",
+    "nlp",
+    "optimization",
+    "reasoning",
+    "reinforcement-learning",
+    "retrieval",
+    "science-discovery",
+    "scientific-reasoning",
+    "vision",
+    "vision-language",
+    "vision-language-model",
+}
+BROAD_MUST_READ_KEYWORD_ALIASES = {
+    "ai": "machine-learning",
+    "artificial-intelligence": "machine-learning",
+    "large-language-model": "large-language-model",
+    "large-language-models": "large-language-model",
+    "llm": "large-language-model",
+    "llms": "large-language-model",
+}
 COMMAND_RE = re.compile(
     r"^\s*(?:请\s*)?(?:把\s*)?"
     r"(?P<action>加个|加上|添加|增加|加|去掉|去除|取消|移除|删除|删掉|add|remove|delete)"
@@ -86,6 +121,78 @@ def clean_must_read_value(value: str) -> str:
 def normalize_must_read_value(value: str) -> str:
     """Build a tolerant lookup key for must-read matching."""
     return clean_must_read_value(value).casefold()
+
+
+def _coerce_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _resolve_broad_must_read_keyword(value: str) -> Optional[str]:
+    """Return a canonical direction when a keyword is too broad for hard must-read."""
+    cleaned = clean_must_read_value(value)
+    normalized_key = normalize_direction_key(cleaned)
+    if normalized_key in BROAD_MUST_READ_KEYWORD_ALIASES:
+        return BROAD_MUST_READ_KEYWORD_ALIASES[normalized_key]
+
+    resolved = resolve_canonical_direction(cleaned, include_paper_terms=True)
+    if not resolved:
+        return None
+
+    canonical = str(resolved.get("canonical_name") or "").strip()
+    if canonical in BROAD_MUST_READ_KEYWORD_DIRECTIONS:
+        return canonical
+    return None
+
+
+def _keyword_resolves_to_direction(value: Any, canonical_direction: str) -> bool:
+    resolved = resolve_canonical_direction(clean_must_read_value(str(value or "")), include_paper_terms=True)
+    if resolved:
+        return resolved.get("canonical_name") == canonical_direction
+    return normalize_direction_key(value) == canonical_direction
+
+
+def _route_keyword_to_interest_direction(
+    profile: Dict[str, Any],
+    raw_value: str,
+    canonical_direction: str,
+) -> Dict[str, Any]:
+    """Promote a broad keyword to soft profile weights instead of hard must-read."""
+    must_read = profile.get("must_read", {"authors": [], "institutions": [], "keywords": []})
+    keywords = list(must_read.get("keywords", []) or [])
+    must_read["keywords"] = [
+        keyword for keyword in keywords
+        if not _keyword_resolves_to_direction(keyword, canonical_direction)
+    ]
+    profile["must_read"] = must_read
+
+    core_directions = profile.get("core_directions")
+    if not isinstance(core_directions, dict):
+        core_directions = {}
+    topic_weights = profile.get("topic_weights")
+    if not isinstance(topic_weights, dict):
+        topic_weights = {}
+
+    previous_core = _coerce_float(core_directions.get(canonical_direction), 0.0)
+    previous_topic = _coerce_float(topic_weights.get(canonical_direction), 0.0)
+    core_directions[canonical_direction] = max(previous_core, SOFT_DIRECTION_WEIGHT)
+    topic_weights[canonical_direction] = max(previous_topic, SOFT_DIRECTION_WEIGHT)
+    profile["core_directions"] = core_directions
+    profile["topic_weights"] = topic_weights
+    profile["updated_at"] = datetime.now().isoformat()
+
+    return {
+        "success": True,
+        "message": (
+            f"{raw_value} 是宽泛研究方向，已作为兴趣方向 {canonical_direction} 加入/增强，"
+            "不会进入硬必读关键词；如需硬必读，请使用更窄的短语、作者或机构。"
+        ),
+        "routed_to": "interest_direction",
+        "canonical_direction": canonical_direction,
+        "weight": max(previous_core, previous_topic, SOFT_DIRECTION_WEIGHT),
+    }
 
 
 def parse_command(text: str) -> Optional[Dict[str, Any]]:
@@ -188,6 +295,11 @@ def add_must_read(profile: Dict, item_type: str, value: str) -> Dict[str, Any]:
     item_label = ITEM_TYPE_LABELS.get(item_type, item_type)
 
     cleaned_value = clean_must_read_value(value)
+    if item_type == "keyword":
+        broad_direction = _resolve_broad_must_read_keyword(cleaned_value)
+        if broad_direction:
+            return _route_keyword_to_interest_direction(profile, cleaned_value, broad_direction)
+
     normalized_value = normalize_must_read_value(cleaned_value)
     existing_value = next(
         (item for item in current_list if normalize_must_read_value(str(item)) == normalized_value),

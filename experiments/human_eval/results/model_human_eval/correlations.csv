@@ -1,0 +1,4 @@
+﻿auto_metric,human_metric,pearson_r,spearman_rho,n_models
+ModelAutoScore,ModelHumanScore,0.963243,0.964835,14
+RecommendationScore,HumanRecommendationScore,0.952385,0.900883,14
+ReportAutoScore,HumanReportScore,0.624702,0.647579,14

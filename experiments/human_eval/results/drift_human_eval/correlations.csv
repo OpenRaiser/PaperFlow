@@ -1,0 +1,6 @@
+level,n,pearson_r,pearson_p,spearman_rho,spearman_p,kendall_tau,kendall_p
+sample,72,0.914851,2.79417e-29,0.890438,1.243e-25,0.744801,3.15148e-19
+drift_event_id+method_key,36,0.909025,1.76768e-14,0.872074,4.33011e-12,0.744945,3.33396e-10
+sample_type+method_key,6,0.839038,0.0367782,0.828571,0.0415627,0.733333,0.0555556
+method,3,0.886500,0.30626,0.500000,0.666667,0.333333,1
+

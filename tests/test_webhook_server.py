@@ -9,7 +9,7 @@ from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).parent.parent
-WEBHOOK_PATH = PROJECT_ROOT / "services" / "webhook-server" / "scripts" / "webhook_server.py"
+WEBHOOK_PATH = PROJECT_ROOT / "deployments" / "feishu" / "webhook-server" / "scripts" / "webhook_server.py"
 
 spec = importlib.util.spec_from_file_location("webhook_server_test", WEBHOOK_PATH)
 webhook_server = importlib.util.module_from_spec(spec)
@@ -515,7 +515,7 @@ def test_register_async_task_reclaims_stale_persistent_lock(monkeypatch, tmp_pat
     webhook_server.INFLIGHT_COORDINATOR_TASKS.clear()
     handler = webhook_server.FeishuEventHandler()
     monkeypatch.setattr(webhook_server, "ASYNC_TASK_LOCK_DIR", tmp_path / "webhook_task_locks")
-    monkeypatch.setenv("SCITASTE_ASYNC_TASK_LOCK_TTL_SECONDS", "30")
+    monkeypatch.setenv("PAPERFLOW_ASYNC_TASK_LOCK_TTL_SECONDS", "30")
 
     task_key = "user_rolea:daily_push"
     lock_dir = webhook_server.ASYNC_TASK_LOCK_DIR

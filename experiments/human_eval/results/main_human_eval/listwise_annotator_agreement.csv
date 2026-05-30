@@ -1,0 +1,7 @@
+metric,ann1_vs_ann2_pearson,ann1_vs_ann2_spearman,ann1_vs_ann3_pearson,ann1_vs_ann3_spearman,ann2_vs_ann3_pearson,ann2_vs_ann3_spearman,mean_pairwise_pearson,mean_pairwise_spearman,n
+profile_match,0.880,0.885,0.952,0.955,0.931,0.930,0.921,0.923,36
+ranking_quality,0.868,0.884,0.939,0.947,0.894,0.897,0.900,0.909,36
+decision_usefulness,0.824,0.824,0.910,0.922,0.878,0.868,0.870,0.872,36
+diversity_focus_balance,0.808,0.815,0.863,0.875,0.827,0.841,0.833,0.844,36
+overall_rank,0.893,0.911,0.884,0.898,0.889,0.894,0.889,0.901,36
+

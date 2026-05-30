@@ -1,0 +1,5 @@
+Rank,Method,AdaptationHumanScore,DriftAutoScore,NewTopicFit,AdaptationAppropriateness,OldNewBalance,DriftDecisionHelpfulness
+1,Full PaperFlow,68.7500,68.6812,3.3472,2.8611,4.2361,3.3056
+2,Fixed Profile,68.1944,65.3778,3.3056,2.9722,4.0417,3.3195
+3,w/o Drift,67.7778,65.5264,3.2500,2.9306,4.0417,3.3333
+

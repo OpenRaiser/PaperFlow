@@ -119,7 +119,7 @@ def get_supported_conferences() -> List[str]:
 
 def allow_mock_papers() -> bool:
     """Only allow synthetic conference papers when explicitly enabled."""
-    value = os.environ.get("SCITASTE_ALLOW_MOCK_PAPERS", "")
+    value = os.environ.get("PAPERFLOW_ALLOW_MOCK_PAPERS", "")
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
@@ -652,7 +652,7 @@ def search_papers(
 
     if not client:
         if allow_mock_papers():
-            print("Using mock data (OpenReview unavailable and SCITASTE_ALLOW_MOCK_PAPERS enabled)")
+            print("Using mock data (OpenReview unavailable and PAPERFLOW_ALLOW_MOCK_PAPERS enabled)")
             return _get_mock_papers(normalized_conference, year, limit)
         print("OpenReview unavailable or not configured; skipping conference fetch.")
         return []

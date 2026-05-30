@@ -36,7 +36,7 @@ try:
 except ImportError:
     pass
 
-SUPPRESS_HTTP_RETRY_WARNINGS = os.environ.get("SCITASTE_SUPPRESS_HTTP_RETRY_WARNINGS", "1").strip().lower() not in {"0", "false", "off", "no"}
+SUPPRESS_HTTP_RETRY_WARNINGS = os.environ.get("PAPERFLOW_SUPPRESS_HTTP_RETRY_WARNINGS", "1").strip().lower() not in {"0", "false", "off", "no"}
 if SUPPRESS_HTTP_RETRY_WARNINGS:
     logging.getLogger("urllib3.connectionpool").setLevel(logging.ERROR)
 
@@ -121,11 +121,11 @@ JOURNAL_ALIASES = {
 
 JOURNAL_REQUEST_TIMEOUT = float(os.environ.get("JOURNAL_REQUEST_TIMEOUT", "20"))
 JOURNAL_DETAIL_FETCH_ENABLED = os.environ.get("JOURNAL_DETAIL_FETCH_ENABLED", "1").strip().lower() not in {"0", "false", "off", "no"}
-HTTP_RETRY_TOTAL = int(os.environ.get("SCITASTE_HTTP_RETRIES", "2"))
-HTTP_RETRY_BACKOFF = float(os.environ.get("SCITASTE_HTTP_BACKOFF", "0.8"))
+HTTP_RETRY_TOTAL = int(os.environ.get("PAPERFLOW_HTTP_RETRIES", "2"))
+HTTP_RETRY_BACKOFF = float(os.environ.get("PAPERFLOW_HTTP_BACKOFF", "0.8"))
 DEFAULT_REQUEST_HEADERS = {
     "User-Agent": os.environ.get(
-        "SCITASTE_HTTP_USER_AGENT",
+        "PAPERFLOW_HTTP_USER_AGENT",
         (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "

@@ -14,9 +14,96 @@ from datetime import datetime
 if sys.platform == 'win32':
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "skills" / "storage-helper" / "scripts"))
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+sys.path.insert(0, str(PROJECT_ROOT / "skills" / "storage-helper" / "scripts"))
 
 from db_ops import get_profile, update_profile
+from config.direction_lexicon import normalize_direction_key, resolve_canonical_direction
+
+
+SOFT_DIRECTION_WEIGHT = 0.62
+BROAD_MUST_READ_KEYWORD_DIRECTIONS = {
+    "agent",
+    "ai-for-science",
+    "computer-vision",
+    "deep-learning",
+    "embodied-ai",
+    "language",
+    "machine-learning",
+    "multimodal-learning",
+    "multimodal-reasoning",
+    "nlp",
+    "optimization",
+    "reasoning",
+    "reinforcement-learning",
+    "retrieval",
+    "science-discovery",
+    "scientific-reasoning",
+    "vision",
+    "vision-language",
+    "vision-language-model",
+}
+BROAD_MUST_READ_KEYWORD_ALIASES = {
+    "ai": "machine-learning",
+    "artificial-intelligence": "machine-learning",
+    "large-language-model": "large-language-model",
+    "large-language-models": "large-language-model",
+    "llm": "large-language-model",
+    "llms": "large-language-model",
+}
+
+
+def _coerce_float(value, default=0.0):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _resolve_broad_must_read_keyword(value):
+    cleaned = str(value or "").strip()
+    if not cleaned:
+        return None
+    normalized_key = normalize_direction_key(cleaned)
+    if normalized_key in BROAD_MUST_READ_KEYWORD_ALIASES:
+        return BROAD_MUST_READ_KEYWORD_ALIASES[normalized_key]
+
+    resolved = resolve_canonical_direction(cleaned, include_paper_terms=True)
+    if not resolved:
+        return None
+    canonical = str(resolved.get("canonical_name") or "").strip()
+    if canonical in BROAD_MUST_READ_KEYWORD_DIRECTIONS:
+        return canonical
+    return None
+
+
+def _keyword_resolves_to_direction(value, canonical_direction):
+    resolved = resolve_canonical_direction(str(value or "").strip(), include_paper_terms=True)
+    if resolved:
+        return resolved.get("canonical_name") == canonical_direction
+    return normalize_direction_key(value) == canonical_direction
+
+
+def _route_keyword_to_interest_direction(profile, current_keywords, raw_value, canonical_direction):
+    current_keywords[:] = [
+        keyword for keyword in current_keywords
+        if not _keyword_resolves_to_direction(keyword, canonical_direction)
+    ]
+    core_directions = profile.get("core_directions")
+    if not isinstance(core_directions, dict):
+        core_directions = {}
+    topic_weights = profile.get("topic_weights")
+    if not isinstance(topic_weights, dict):
+        topic_weights = {}
+
+    previous_core = _coerce_float(core_directions.get(canonical_direction), 0.0)
+    previous_topic = _coerce_float(topic_weights.get(canonical_direction), 0.0)
+    core_directions[canonical_direction] = max(previous_core, SOFT_DIRECTION_WEIGHT)
+    topic_weights[canonical_direction] = max(previous_topic, SOFT_DIRECTION_WEIGHT)
+    profile["core_directions"] = core_directions
+    profile["topic_weights"] = topic_weights
+    return f"{raw_value} -> {canonical_direction}"
 
 
 def parse_input(user_input: str):
@@ -76,14 +163,22 @@ def add_must_read(profile, entity_type, entities):
     """Add entities to must-read list"""
     must_read = profile.get('must_read', {})
     current_list = must_read.get(entity_type, [])
-    added, already_exists = [], []
+    added, already_exists, routed_to_interest = [], [], []
     for entity in entities:
+        if entity_type == "keywords":
+            broad_direction = _resolve_broad_must_read_keyword(entity)
+            if broad_direction:
+                routed_to_interest.append(
+                    _route_keyword_to_interest_direction(profile, current_list, entity, broad_direction)
+                )
+                continue
         if entity in current_list:
             already_exists.append(entity)
         else:
             added.append(entity)
             current_list.append(entity)
 
+    must_read[entity_type] = current_list
     updated = profile.copy()
     updated['must_read'] = must_read
     updated['version'] = f"0.{int(profile.get('version', '0.1').split('.')[1]) + 1}"
@@ -92,8 +187,13 @@ def add_must_read(profile, entity_type, entities):
     type_labels = {'authors': '作者', 'institutions': '机构', 'keywords': '关键词'}
     label = type_labels.get(entity_type, entity_type)
 
-    if added:
+    if added or routed_to_interest:
         msg = f"[OK] 已添加 {label}：" + ", ".join(added)
+        if not added:
+            msg = "[OK] 已更新兴趣方向"
+        if routed_to_interest:
+            msg += "\n[提示] 以下宽泛关键词已转为软兴趣方向，不进入硬必读："
+            msg += "\n" + "\n".join(f"  - {item}" for item in routed_to_interest)
         if already_exists:
             msg += f"\n[提示] 已存在：" + ", ".join(already_exists)
         msg += f"\n\n当前必读{label}清单：\n" + "\n".join(f"  - {e}" for e in current_list)
@@ -101,7 +201,7 @@ def add_must_read(profile, entity_type, entities):
         msg = f"[提示] {', '.join(already_exists)} 已在必读{label}清单中"
     else:
         msg = "[错误] 未添加任何内容"
-    return (len(added) > 0, msg, updated if added else None)
+    return (bool(added or routed_to_interest), msg, updated if (added or routed_to_interest) else None)
 
 
 def remove_must_read(profile, entity_type, entities):

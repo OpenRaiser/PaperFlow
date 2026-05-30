@@ -45,7 +45,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 import importlib
 
 # 飞书报告器
-feishu_reporter = importlib.import_module("skills.feishu-reporter.scripts.feishu_reporter")
+feishu_reporter = importlib.import_module("deployments.feishu.feishu-reporter.scripts.feishu_reporter")
 create_doc = feishu_reporter.create_doc
 send_text = feishu_reporter.send_text
 get_drive_meta = getattr(feishu_reporter, "get_drive_meta", None)
@@ -79,17 +79,17 @@ READING_REPORT_CHUNK_CHARS = int(os.environ.get("READING_REPORT_CHUNK_CHARS", "1
 READING_REPORT_CHUNK_OVERLAP = int(os.environ.get("READING_REPORT_CHUNK_OVERLAP", "180"))
 READING_REPORT_EVIDENCE_TOP_K = int(os.environ.get("READING_REPORT_EVIDENCE_TOP_K", "3"))
 READING_REPORT_EVIDENCE_VERSION = (
-    os.environ.get("READING_REPORT_EVIDENCE_VERSION", "2026-04-19-v3").strip()
-    or "2026-04-19-v3"
+    os.environ.get("READING_REPORT_EVIDENCE_VERSION", "2026-04-27-v4").strip()
+    or "2026-04-27-v4"
 )
 READING_REPORT_EVIDENCE_CACHE_ENABLED = os.environ.get("READING_REPORT_EVIDENCE_CACHE_ENABLED", "1").strip().lower() not in {"0", "false", "off", "no"}
 READING_REPORT_OUTPUT_VERSION = os.environ.get("READING_REPORT_OUTPUT_VERSION", "2026-04-14-v1").strip() or "2026-04-14-v1"
 READING_REPORT_PROFILE_RETRIEVAL_WEIGHT = float(os.environ.get("READING_REPORT_PROFILE_RETRIEVAL_WEIGHT", "0.25"))
-HTTP_RETRY_TOTAL = int(os.environ.get("SCITASTE_HTTP_RETRIES", "2"))
-HTTP_RETRY_BACKOFF = float(os.environ.get("SCITASTE_HTTP_BACKOFF", "0.8"))
+HTTP_RETRY_TOTAL = int(os.environ.get("PAPERFLOW_HTTP_RETRIES", "2"))
+HTTP_RETRY_BACKOFF = float(os.environ.get("PAPERFLOW_HTTP_BACKOFF", "0.8"))
 DEFAULT_REQUEST_HEADERS = {
     "User-Agent": os.environ.get(
-        "SCITASTE_HTTP_USER_AGENT",
+        "PAPERFLOW_HTTP_USER_AGENT",
         (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -261,10 +261,7 @@ def _load_embedding_module():
 
 
 def _load_llm_parser():
-    try:
-        return importlib.import_module("agents.master-coordinator.scripts.llm_parser")
-    except Exception:
-        return importlib.import_module("agents.master_coordinator.main").llm_parser
+    return importlib.import_module("agents.master-coordinator.scripts.llm_parser")
 
 
 def _build_request_headers(*, referer: Optional[str] = None, accept_pdf: bool = False) -> Dict[str, str]:
@@ -372,6 +369,72 @@ def _clean_abstract_text(text: Any) -> str:
     return _clean_text(normalized)
 
 
+def _clean_pdf_evidence_text(text: Any) -> str:
+    """Remove common PDF extraction noise before retrieval/report synthesis."""
+    normalized = _clean_text(text)
+    if not normalized:
+        return ""
+
+    normalized = re.sub(r"(?<=\w)-\s+(?=\w)", "", normalized)
+    normalized = re.sub(r"arXiv:\s*\d{4}\.\d{4,5}v?\d*(?:\s*\[[^\]]+\])?", " ", normalized, flags=re.I)
+
+    clean_lines: List[str] = []
+    for raw_line in normalized.split("\n"):
+        line = re.sub(r"\s+", " ", raw_line).strip()
+        if not line:
+            continue
+        lower = line.lower()
+        if len(line) <= 2 and re.fullmatch(r"\d+", line):
+            continue
+        if lower.startswith(("fig.", "figure ", "table ", "algorithm ")):
+            continue
+        if "corresponding author" in lower or "this work was supported" in lower:
+            continue
+        if re.search(r"\b[\w.+-]+@[\w.-]+\.\w+\b", line):
+            continue
+        if re.search(r"\barxiv preprint arxiv:\d", lower):
+            continue
+        if re.search(r"\bin proceedings of\b|\bpages \d+\b|\bcvpr\b.*\bpages\b", lower):
+            continue
+        clean_lines.append(line)
+
+    cleaned = _clean_text(" ".join(clean_lines))
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def _is_noisy_pdf_evidence_text(text: Any, *, min_chars: int = 40) -> bool:
+    cleaned = _clean_text(text)
+    if len(cleaned) < min_chars:
+        return True
+    alpha_count = len(re.findall(r"[A-Za-z]", cleaned))
+    alpha_ratio = alpha_count / max(1, len(cleaned))
+    if alpha_ratio < 0.45:
+        return True
+
+    lower = cleaned.lower()
+    hard_noise_patterns = (
+        "corresponding author",
+        "this work was supported",
+        "all rights reserved",
+        "published as a conference paper",
+        "arxiv preprint arxiv:",
+        "references",
+    )
+    if any(pattern in lower for pattern in hard_noise_patterns):
+        return True
+
+    citation_like = len(re.findall(r"\[\d+\]|\bet al\.\b|\bpages?\s+\d+\b", lower))
+    figure_like = len(re.findall(r"\bfig(?:ure)?\.?\s*\d+|\btable\s+\d+", lower))
+    if citation_like + figure_like >= 4:
+        return True
+
+    symbol_count = len(re.findall(r"[=<>±∑√∞≈≠≤≥_{}^$\\]", cleaned))
+    if symbol_count > 12 and symbol_count / max(1, len(cleaned)) > 0.03:
+        return True
+
+    return False
+
+
 def _prefer_candidate_abstract(
     current_abstract: Any,
     candidate_abstract: Any,
@@ -401,7 +464,7 @@ def _truncate_text(text: Any, max_chars: int) -> str:
 
 
 def _split_sentences(text: Any) -> List[str]:
-    normalized = _clean_text(text)
+    normalized = _clean_pdf_evidence_text(text)
     if not normalized:
         return []
 
@@ -409,7 +472,7 @@ def _split_sentences(text: Any) -> List[str]:
     sentences: List[str] = []
     for part in parts:
         sentence = re.sub(r"\s+", " ", part).strip()
-        if len(sentence) >= 12:
+        if len(sentence) >= 12 and not _is_noisy_pdf_evidence_text(sentence, min_chars=12):
             sentences.append(sentence)
     return sentences
 
@@ -488,6 +551,77 @@ def _recommendation_score(label: str) -> int:
         "按需阅读": 2,
     }
     return mapping.get(normalized, 3)
+
+
+def _label_rank(label: str) -> int:
+    mapping = {
+        "按需阅读": 0,
+        "值得快速浏览": 1,
+        "推荐阅读": 2,
+        "强烈推荐": 3,
+    }
+    return mapping.get(_clean_text(label), 1)
+
+
+def _rank_label(rank: int) -> str:
+    labels = ["按需阅读", "值得快速浏览", "推荐阅读", "强烈推荐"]
+    return labels[max(0, min(int(rank), len(labels) - 1))]
+
+
+def calibrate_recommendation_label(paper: Dict[str, Any], proposed_label: Any, analysis_source: Any = None) -> str:
+    """Constrain reading-report recommendation labels to ranking/evaluation evidence."""
+    system_label = _clean_text(paper.get("system_label") or paper.get("relevance_level"))
+    oracle_label = _clean_text(paper.get("oracle_label"))
+    analysis_source_text = _clean_text(analysis_source).lower()
+
+    try:
+        system_score = float(paper.get("system_score", paper.get("relevance_score", 0.0)) or 0.0)
+    except (TypeError, ValueError):
+        system_score = 0.0
+    try:
+        oracle_score = float(paper.get("oracle_score", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        oracle_score = 0.0
+
+    if system_label == "must_read" or oracle_label == "strong_relevant" or oracle_score >= 0.72:
+        max_rank = 3
+        default_rank = 3
+    elif system_label == "high_relevant" or oracle_label == "relevant" or system_score >= 0.58 or oracle_score >= 0.48:
+        max_rank = 2
+        default_rank = 2
+    elif system_label == "maybe_interested" or oracle_label == "weak_relevant" or system_score >= 0.38 or oracle_score >= 0.25:
+        max_rank = 1
+        default_rank = 1
+    else:
+        max_rank = 0
+        default_rank = 0
+
+    is_hard_priority = system_label == "must_read" or oracle_label == "strong_relevant" or oracle_score >= 0.72
+    if not is_hard_priority and analysis_source_text not in {"pdf", "source_page"} and max_rank > 2:
+        max_rank = 2
+
+    proposed_rank = _label_rank(str(proposed_label or ""))
+    if not _clean_text(proposed_label):
+        proposed_rank = default_rank
+
+    return _rank_label(min(max(proposed_rank, default_rank), max_rank))
+
+
+def build_recommendation_calibration_metadata(
+    paper: Dict[str, Any],
+    proposed_label: Any,
+    final_label: Any,
+    analysis_source: Any = None,
+) -> Dict[str, Any]:
+    return {
+        "proposed_label": _clean_text(proposed_label),
+        "final_label": _clean_text(final_label),
+        "analysis_source": _clean_text(analysis_source),
+        "system_label": _clean_text(paper.get("system_label") or paper.get("relevance_level")),
+        "system_score": paper.get("system_score", paper.get("relevance_score")),
+        "oracle_label": _clean_text(paper.get("oracle_label")),
+        "oracle_score": paper.get("oracle_score"),
+    }
 
 
 def _format_markdown_link(label: str, url: str) -> str:
@@ -1636,7 +1770,7 @@ def _chunk_text_with_overlap(
     max_chars: int = READING_REPORT_CHUNK_CHARS,
     overlap: int = READING_REPORT_CHUNK_OVERLAP,
 ) -> List[Dict[str, Any]]:
-    normalized = _clean_text(text)
+    normalized = _clean_pdf_evidence_text(text)
     if not normalized:
         return []
 
@@ -1668,7 +1802,8 @@ def _chunk_text_with_overlap(
                 end = start + boundary + boundary_len
 
         chunk_text = normalized[start:end].strip()
-        if chunk_text:
+        chunk_text = _clean_pdf_evidence_text(chunk_text)
+        if chunk_text and not _is_noisy_pdf_evidence_text(chunk_text):
             chunks.append(
                 {
                     "section": _clean_text(section) or "full_text",
@@ -1746,13 +1881,13 @@ def _collect_evidence_sentences(
     matches = ((evidence or {}).get("matches") or {}).get(bucket) or []
     collected: List[str] = []
     for match in matches:
-        text = _clean_text(match.get("text"))
+        text = _clean_pdf_evidence_text(match.get("text"))
         if not text:
             continue
         picked = _pick_sentences(text, limit=limit, cues=cues)
         if picked:
             collected.extend(picked)
-        else:
+        elif not _is_noisy_pdf_evidence_text(text):
             collected.append(_truncate_text(text, 180))
         unique = _unique_preserve_order(collected)
         if len(unique) >= limit:
@@ -1772,7 +1907,7 @@ def _collect_evidence_sections(evidence: Dict[str, Any], bucket: str, *, limit: 
 
 def _format_evidence_anchor(match: Dict[str, Any]) -> str:
     section = _format_pdf_section_label(match.get("section", ""))
-    text = _truncate_text(match.get("text"), 180)
+    text = _truncate_text(_clean_pdf_evidence_text(match.get("text")), 180)
     score = match.get("score")
     score_text = f" | score={float(score):.3f}" if isinstance(score, (int, float)) else ""
     return f"{section}{score_text} | {text}"
@@ -2398,7 +2533,11 @@ def build_heuristic_report_payload(
         "estimated_reading_minutes": _estimate_reading_minutes(parsed_pdf, abstract),
         "analysis_source": "pdf" if parsed_source_kind == "pdf" else ("source_page" if parsed_source_kind == "source_page" else "abstract"),
         "analysis_note": analysis_note,
-        "recommendation_label": _recommendation_label(paper),
+        "recommendation_label": calibrate_recommendation_label(
+            paper,
+            _recommendation_label(paper),
+            "pdf" if parsed_source_kind == "pdf" else ("source_page" if parsed_source_kind == "source_page" else "abstract"),
+        ),
         "retrieved_evidence": retrieved_evidence,
         "field_evidence_map": field_evidence_map,
         "report_evidence_anchors": report_evidence_anchors,
@@ -2536,6 +2675,11 @@ def generate_reading_report(
     arxiv_id = _clean_text(paper.get("arxiv_id"))
     doi = _clean_text(paper.get("doi"))
     recommendation_label = payload.get("recommendation_label") or _recommendation_label(paper)
+    recommendation_label = calibrate_recommendation_label(
+        paper,
+        recommendation_label,
+        payload.get("analysis_source"),
+    )
     recommendation_score = _recommendation_score(recommendation_label)
     recommendation_stars = "★" * recommendation_score + "☆" * (5 - recommendation_score)
     analysis_source = _clean_text(payload.get("analysis_source"))
@@ -2977,6 +3121,18 @@ def create_reading_report(
                 heuristic_payload=heuristic_payload,
             )
             report_payload = _merge_report_payload(heuristic_payload, llm_payload)
+            proposed_label = report_payload.get("recommendation_label")
+            report_payload["recommendation_label"] = calibrate_recommendation_label(
+                enriched_paper,
+                proposed_label,
+                report_payload.get("analysis_source"),
+            )
+            report_payload["recommendation_calibration"] = build_recommendation_calibration_metadata(
+                enriched_paper,
+                proposed_label,
+                report_payload.get("recommendation_label"),
+                report_payload.get("analysis_source"),
+            )
             report_content = generate_reading_report(
                 enriched_paper,
                 profile,

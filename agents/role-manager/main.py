@@ -42,7 +42,7 @@ profile_updater = importlib.import_module("skills.profile-updater.scripts.update
 build_default_drift_state = profile_updater.build_default_drift_state
 
 # 飞书报告器
-feishu_reporter = importlib.import_module("skills.feishu-reporter.scripts.feishu_reporter")
+feishu_reporter = importlib.import_module("deployments.feishu.feishu-reporter.scripts.feishu_reporter")
 send_text = feishu_reporter.send_text
 send_post = feishu_reporter.send_post
 

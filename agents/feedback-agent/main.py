@@ -46,7 +46,7 @@ canonicalize_direction_terms = direction_lexicon.canonicalize_direction_terms
 format_direction_label = direction_lexicon.format_direction_label
 
 # 飞书报告器
-feishu_reporter = importlib.import_module("skills.feishu-reporter.scripts.feishu_reporter")
+feishu_reporter = importlib.import_module("deployments.feishu.feishu-reporter.scripts.feishu_reporter")
 send_text = feishu_reporter.send_text
 
 

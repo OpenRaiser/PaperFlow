@@ -34,7 +34,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 import importlib
 
 # 飞书报告器
-feishu_reporter = importlib.import_module("skills.feishu-reporter.scripts.feishu_reporter")
+feishu_reporter = importlib.import_module("deployments.feishu.feishu-reporter.scripts.feishu_reporter")
 send_text = feishu_reporter.send_text
 send_post = feishu_reporter.send_post
 send_text_to_chat = feishu_reporter.send_text_to_chat
@@ -61,8 +61,8 @@ def translate_direction(direction: str) -> str:
     return direction
 
 
-OPENALEX_TIMEOUT = float(os.environ.get("SCITASTE_WEEKLY_OPENALEX_TIMEOUT", "12"))
-OPENALEX_HEADERS = {"User-Agent": "SciTaste/0.1 WeeklyReport"}
+OPENALEX_TIMEOUT = float(os.environ.get("PAPERFLOW_WEEKLY_OPENALEX_TIMEOUT", "12"))
+OPENALEX_HEADERS = {"User-Agent": "PaperFlow/0.1 WeeklyReport"}
 
 
 def _normalize_title_key(value: Any) -> str:

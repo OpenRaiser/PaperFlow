@@ -120,8 +120,6 @@ def _should_prefer_dashscope_credentials(provider_hint: Optional[str] = None) ->
 
 def _get_openai_client(timeout_override: Optional[float] = None) -> Optional[OpenAI]:
     """获取 OpenAI 客户端（如果可用）"""
-    global LLM_FALLBACK_DISABLED
-
     if LLM_FALLBACK_DISABLED:
         return None
 
@@ -204,8 +202,6 @@ def _resolve_hf_provider(primary_env_name: str, fallback_env_name: str = "HF_INF
 
 
 def _get_hf_llm_client() -> Optional[Any]:
-    global HF_LLM_DISABLED
-
     if HF_LLM_DISABLED or InferenceClient is None:
         return None
 
@@ -461,7 +457,7 @@ def _normalize_direction_key(value: Any) -> str:
 
 def _get_direction_parser_timeout() -> float:
     raw_timeout = (
-        _get_first_env_value("LLM_PARSER_DIRECTION_TIMEOUT", "SCITASTE_DIRECTION_LLM_TIMEOUT")
+        _get_first_env_value("LLM_PARSER_DIRECTION_TIMEOUT", "PAPERFLOW_DIRECTION_LLM_TIMEOUT")
         or "18"
     )
     try:
@@ -1180,25 +1176,50 @@ def _generate_json_with_openai(
         {"role": "user", "content": user_text},
     ]
 
+    def _create_completion(token_budget: int, *, use_response_format: bool):
+        kwargs = {
+            "model": model,
+            "messages": messages,
+            "temperature": 0,
+            "max_tokens": token_budget,
+        }
+        if use_response_format:
+            kwargs["response_format"] = {"type": "json_object"}
+        return client.chat.completions.create(**kwargs)
+
+    def _parse_response(response: Any) -> Optional[Dict[str, Any]]:
+        try:
+            content = response.choices[0].message.content
+        except Exception:
+            return None
+        return _extract_json_object(content)
+
     try:
-        response = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            response_format={"type": "json_object"},
-            temperature=0,
-            max_tokens=max_tokens,
-        )
-        return _extract_json_object(response.choices[0].message.content)
+        response = _create_completion(max_tokens, use_response_format=True)
+        parsed = _parse_response(response)
+        if parsed is not None:
+            return parsed
+
+        finish_reason = str(getattr(response.choices[0], "finish_reason", "") or "").lower()
+        if finish_reason == "length" or max_tokens < 1024:
+            retry_tokens = min(max(max_tokens * 4, 1024), 4096)
+            response = _create_completion(retry_tokens, use_response_format=True)
+            parsed = _parse_response(response)
+            if parsed is not None:
+                return parsed
+
+        response = _create_completion(max(max_tokens, 1024), use_response_format=False)
+        return _parse_response(response)
     except Exception as e:
         if any(token in str(e).lower() for token in ["response_format", "json_object", "unsupported", "not support"]):
             try:
-                response = client.chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    temperature=0,
-                    max_tokens=max_tokens,
-                )
-                return _extract_json_object(response.choices[0].message.content)
+                response = _create_completion(max(max_tokens, 1024), use_response_format=False)
+                parsed = _parse_response(response)
+                if parsed is not None:
+                    return parsed
+                retry_tokens = min(max(max_tokens * 4, 2048), 4096)
+                response = _create_completion(retry_tokens, use_response_format=False)
+                return _parse_response(response)
             except Exception as retry_exc:
                 e = retry_exc
         if any(token in str(e).lower() for token in ["401", "unauthorized", "invalid api key", "incorrect api key"]):
@@ -1619,13 +1640,16 @@ def synthesize_reading_report_with_llm(
         "再结合 heuristic_draft 做润色和补全；当二者冲突时，优先采用 retrieved_evidence。"
         "如果提供了 field_evidence_map，请让每个输出字段优先参考它对应的证据锚点，"
         "不要把 results 证据写到 research_background，也不要把 background 证据误写成方法贡献。"
+        "如果 PDF 文本明显包含页眉、图注、作者脚注、参考文献、表格残片或公式噪声，请主动忽略，"
+        "并改用更干净的摘要、Introduction、Method、Results 或 Conclusion 信息归纳。"
         "如果 user_profile.report_preferences 显示 prefer_more_evidence=true 或 preferred_style=evidence_first，"
         "请优先写出更具体的证据锚点和方法/结果依据，不要只给空泛总结。"
         "不要编造具体实验数值；如果信息不足，请保持克制并明确指出需要回原文核对。"
         "可以改写证据，不要大段逐字复制。"
-        "输出 JSON，字段包括："
+        "只输出 JSON 对象，不要 Markdown，不要解释，不要代码块。字段包括："
         "one_sentence_summary, research_background, core_method, key_results, "
         "main_contributions, limitations, relevance_points, reading_focus, recommendation_label, analysis_note。"
+        "main_contributions, limitations, relevance_points, reading_focus 必须是字符串数组；其他字段是字符串。"
         "analysis_note 用一句话说明本次生成是否参考了 PDF 检索证据。"
         "其中 recommendation_label 只能是“强烈推荐”“推荐阅读”“值得快速浏览”“按需阅读”之一。"
     )
@@ -1633,7 +1657,7 @@ def synthesize_reading_report_with_llm(
     result = _generate_json_with_configured_llm(
         system_prompt=system_prompt,
         user_text=user_text,
-        max_tokens=900,
+        max_tokens=int(os.environ.get("READING_REPORT_LLM_MAX_TOKENS", "4096")),
         timeout_override=_get_reading_report_timeout(),
     )
     if not isinstance(result, dict):

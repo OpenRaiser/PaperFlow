@@ -68,7 +68,7 @@ normalize_direction_key = direction_lexicon.normalize_direction_key
 resolve_canonical_direction = direction_lexicon.resolve_canonical_direction
 
 # 飞书报告器
-feishu_reporter = importlib.import_module("skills.feishu-reporter.scripts.feishu_reporter")
+feishu_reporter = importlib.import_module("deployments.feishu.feishu-reporter.scripts.feishu_reporter")
 send_text = feishu_reporter.send_text
 
 
@@ -648,11 +648,44 @@ def normalize_profile_update_topics(topic_texts: List[str], user_id: str) -> Dic
     seen_canonical: set[str] = set()
     seen_temporary: set[tuple[str, str]] = set()
     seen_pending: set[str] = set()
+    profile = get_profile(user_id) or {}
 
     for topic_text in topic_texts:
         cleaned = clean_profile_topic_text(topic_text)
         if not cleaned:
             continue
+
+        profile_key = find_profile_topic_key(profile, cleaned)
+        if profile_key and profile_key not in seen_canonical:
+            seen_canonical.add(profile_key)
+            canonical_directions.append(
+                {
+                    "name": profile_key,
+                    "name_cn": format_direction_label(profile_key),
+                    "confidence": 1.0,
+                    "source_text": cleaned,
+                    "is_known": True,
+                }
+            )
+            continue
+
+        resolved = resolve_canonical_direction(cleaned, include_paper_terms=True)
+        if resolved:
+            direction_name = str(resolved.get("canonical_name") or "").strip()
+            if direction_name and direction_name not in seen_canonical:
+                entry = resolved.get("entry") or {}
+                seen_canonical.add(direction_name)
+                canonical_directions.append(
+                    {
+                        "name": direction_name,
+                        "name_cn": str(entry.get("name_cn") or entry.get("name") or direction_name),
+                        "confidence": 1.0,
+                        "source_text": cleaned,
+                        "is_known": True,
+                    }
+                )
+            continue
+
         normalized = llm_parser.normalize_research_directions(
             cleaned,
             auto_persist_known_aliases=True,
@@ -725,7 +758,7 @@ def merge_unique_message_sections(*sections: Any) -> str:
 
 BOT_AUTHORED_PREFIXES = (
     "📋 你的学术画像",
-    "SciTaste 学术画像确认",
+    "PaperFlow 学术画像确认",
     "📰 今日论文",
     "📊 今日反馈已记录",
     "收到，",
@@ -1451,7 +1484,13 @@ def parse_profile_update_request(text: str, profile: Optional[Dict[str, Any]] = 
 class MasterCoordinator:
     """主协调器"""
 
-    def __init__(self, user_id: Optional[str] = None, feishu_user_id: Optional[str] = None, chat_id: Optional[str] = None):
+    def __init__(
+        self,
+        user_id: Optional[str] = None,
+        feishu_user_id: Optional[str] = None,
+        chat_id: Optional[str] = None,
+        send_to_feishu: bool = True,
+    ):
         """
         初始化协调器
 
@@ -1459,6 +1498,7 @@ class MasterCoordinator:
             user_id: 用户 ID（可选，如果为空则从 roles.json 获取）
             feishu_user_id: 飞书用户 ID（用于 open_id 发送）
             chat_id: 聊天 ID（用于 chat_id 发送，优先级更高）
+            send_to_feishu: 是否允许发送飞书消息；命令行 dry-run/--no-feishu 会关闭
         """
         # 优先使用传入的 user_id，如果没有则从 roles.json 获取
         if user_id:
@@ -1466,12 +1506,13 @@ class MasterCoordinator:
         else:
             roles_user_id = get_current_user_id()
             self.user_id = roles_user_id if roles_user_id != "user_default" else "user_unknown"
-        self.feishu_user_id = feishu_user_id or os.environ.get("FEISHU_USER_ID", "")
+        self.send_to_feishu = send_to_feishu
+        self.feishu_user_id = (feishu_user_id or os.environ.get("FEISHU_USER_ID", "")) if send_to_feishu else ""
         self.profile = get_profile(self.user_id)
         self.role_meta = get_role_meta_for_user(self.user_id) or {}
         self.role_name = self.role_meta.get("role_name")
         # 优先使用传入 chat_id，否则回退到角色绑定的 chat_id，避免误发到默认个人账号
-        self.chat_id = chat_id or resolve_role_chat_id(self.user_id, self.profile)
+        self.chat_id = (chat_id or resolve_role_chat_id(self.user_id, self.profile)) if send_to_feishu else None
 
     def detect_intent(self, text: str) -> Dict[str, Any]:
         """
@@ -1581,6 +1622,12 @@ class MasterCoordinator:
             updated_profile = dict(profile)
             core_directions = dict(updated_profile.get("core_directions", {}) or {})
             topic_weights = dict(updated_profile.get("topic_weights", {}) or {})
+            drift_state = dict(updated_profile.get("drift_state", {}) or {})
+            manual_suppressed_topics = [
+                str(topic).strip()
+                for topic in (drift_state.get("manual_suppressed_topics", []) or [])
+                if str(topic).strip()
+            ]
 
             canonical_name = str(confirmed.get("canonical_name") or normalize_direction_key(topic))
             current_weight = max(
@@ -1643,7 +1690,7 @@ class MasterCoordinator:
                 scholar_url=scholar_url,
                 homepage_url=homepage_url,
                 reset_existing=reset_existing,
-                send_to_feishu=True,
+                send_to_feishu=self.send_to_feishu,
                 feishu_user_id=self.feishu_user_id,
                 chat_id=self.chat_id
             )
@@ -1656,10 +1703,10 @@ class MasterCoordinator:
         print("Intent: Daily Push")
 
         try:
-            daily_push_agent = importlib.import_module("agents.daily-push-agent.main")
+            daily_push_agent = importlib.import_module("deployments.feishu.daily-push-agent.main")
             result = daily_push_agent.daily_push(
                 user_id=self.user_id,
-                send_to_feishu=True,
+                send_to_feishu=self.send_to_feishu,
                 feishu_chat_id=self.chat_id
             )
             if isinstance(result, dict):
@@ -1698,7 +1745,8 @@ class MasterCoordinator:
                 reply=reply,
                 papers=papers,
                 feishu_user_id=self.feishu_user_id,
-                chat_id=self.chat_id
+                chat_id=self.chat_id,
+                send_to_feishu=self.send_to_feishu,
             )
             return result
         except Exception as e:
@@ -1722,7 +1770,7 @@ class MasterCoordinator:
                     user_id=self.user_id,
                     paper_ids=[],
                     papers=[{"pdf_url": direct_pdf_url, "title": resolved_title, "url": direct_pdf_url}],
-                    send_to_feishu=True,
+                    send_to_feishu=self.send_to_feishu,
                     feishu_user_id=self.feishu_user_id,
                     chat_id=self.chat_id,
                     request_metadata={
@@ -1776,7 +1824,7 @@ class MasterCoordinator:
                 user_id=self.user_id,
                 paper_ids=paper_ids,
                 papers=papers,
-                send_to_feishu=True,
+                send_to_feishu=self.send_to_feishu,
                 feishu_user_id=self.feishu_user_id,
                 chat_id=self.chat_id,
                 request_metadata={
@@ -1827,7 +1875,7 @@ class MasterCoordinator:
             profile_report_agent = importlib.import_module("agents.profile-report-agent.main")
             result = profile_report_agent.send_weekly_report(
                 user_id=self.user_id,
-                send_to_feishu=True,
+                send_to_feishu=self.send_to_feishu,
                 feishu_chat_id=self.chat_id,
                 role_name=self.role_name,
             )
@@ -1844,7 +1892,7 @@ class MasterCoordinator:
             result = must_read_manager.process_must_read_command(
                 user_id=self.user_id,
                 command_text=command,
-                send_to_feishu=True,
+                send_to_feishu=self.send_to_feishu,
                 feishu_user_id=self.feishu_user_id,
                 chat_id=self.chat_id
             )
@@ -2169,6 +2217,12 @@ class MasterCoordinator:
             updated_profile = dict(profile)
             core_directions = dict(updated_profile.get("core_directions", {}) or {})
             topic_weights = dict(updated_profile.get("topic_weights", {}) or {})
+            drift_state = dict(updated_profile.get("drift_state", {}) or {})
+            manual_suppressed_topics = [
+                str(topic).strip()
+                for topic in (drift_state.get("manual_suppressed_topics", []) or [])
+                if str(topic).strip()
+            ]
 
             resolved_key = find_profile_topic_key(updated_profile, topic_text)
             resolved_topics: List[str] = []
@@ -2202,6 +2256,8 @@ class MasterCoordinator:
                         removed_any = True
                     if removed_any:
                         changed_labels.append(format_direction_label(removal_key))
+                        if removal_key not in manual_suppressed_topics:
+                            manual_suppressed_topics.append(removal_key)
 
                 if changed_labels:
                     summary = f"已从当前画像中移除：{', '.join(changed_labels)}。"
@@ -2263,6 +2319,8 @@ class MasterCoordinator:
                             if resolved_topic in core_directions:
                                 core_directions[resolved_topic] = new_weight
                             changed_labels.append(format_direction_label(resolved_topic))
+                            if new_weight <= 0.40 and resolved_topic not in manual_suppressed_topics:
+                                manual_suppressed_topics.append(resolved_topic)
                         summary = (
                             f"已下调你对“{topic_text}”的兴趣信号。\n"
                             f"同步更新方向：{', '.join(changed_labels)}"
@@ -2306,6 +2364,38 @@ class MasterCoordinator:
             if changed_labels:
                 updated_profile["core_directions"] = core_directions
                 updated_profile["topic_weights"] = topic_weights
+                if manual_suppressed_topics:
+                    drift_state["manual_suppressed_topics"] = manual_suppressed_topics
+
+                suppressed_set = {
+                    str(topic).strip()
+                    for topic in manual_suppressed_topics
+                    if str(topic).strip()
+                }
+                current_anchor = str(drift_state.get("anchor_topic") or "").strip()
+                current_hidden = str(drift_state.get("hidden_anchor") or "").strip()
+                if current_anchor in suppressed_set or current_hidden in suppressed_set:
+                    drift_state["status"] = "stable"
+                    drift_state["score"] = 0.0
+                    drift_state["drift_enabled"] = False
+                    drift_state["hidden_anchor"] = None
+                    drift_state["hidden_anchor_source"] = None
+                    drift_state["intent_score"] = 0.0
+                    drift_state["anchor_topic"] = None
+                    drift_state["anchor_topics"] = []
+                    drift_state["anchor_source"] = None
+                    drift_state["anchor_confidence"] = 0.0
+                    drift_state["anchor_progress"] = 0.0
+                    drift_state["anchor_set_date"] = None
+                    drift_state["commitment_days_remaining"] = 0
+                    drift_state["signal_window"] = []
+                    drift_state["top_shift_topics"] = []
+                    drift_state["trigger_source"] = None
+                    drift_state["trigger_checkfile"] = None
+                    drift_state["trigger_date"] = None
+                    drift_state["suppressed_topics"] = []
+
+                updated_profile["drift_state"] = drift_state
                 updated_profile["interest_vector"] = (
                     importlib.import_module("agents.coldstart-agent.main").generate_interest_vector(core_directions)
                     if core_directions
@@ -2425,7 +2515,8 @@ def main():
 
     coordinator = MasterCoordinator(
         user_id=args.user_id,
-        feishu_user_id=args.feishu_user_id if not args.no_feishu else None
+        feishu_user_id=args.feishu_user_id,
+        send_to_feishu=not args.no_feishu,
     )
 
     result = coordinator.process(args.message)

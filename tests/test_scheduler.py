@@ -5,9 +5,9 @@ from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).parent.parent
-SCHEDULER_PATH = PROJECT_ROOT / "services" / "webhook-server" / "scripts" / "scheduler.py"
+SCHEDULER_PATH = PROJECT_ROOT / "deployments" / "feishu" / "webhook-server" / "scripts" / "scheduler.py"
 
-spec = importlib.util.spec_from_file_location("scitaste_scheduler_test", SCHEDULER_PATH)
+spec = importlib.util.spec_from_file_location("paperflow_scheduler_test", SCHEDULER_PATH)
 scheduler = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(scheduler)
 
@@ -28,18 +28,18 @@ def test_run_due_jobs_triggers_daily_push_once_per_role(tmp_path, monkeypatch):
     )
     state_path = tmp_path / "scheduler_state.json"
 
-    monkeypatch.setenv("SCITASTE_SCHEDULER_ENABLED", "true")
-    monkeypatch.setenv("SCITASTE_TIMEZONE", "Asia/Shanghai")
-    monkeypatch.setenv("SCITASTE_DAILY_PUSH_TIME", "09:00")
-    monkeypatch.setenv("SCITASTE_WEEKLY_REPORT_TIME", "10:00")
-    monkeypatch.setenv("SCITASTE_WEEKLY_REPORT_WEEKDAY", "0")
-    monkeypatch.setenv("SCITASTE_SCHEDULER_GRACE_MINUTES", "10")
-    monkeypatch.setenv("SCITASTE_SCHEDULER_DAILY_COMPENSATION_HOURS", "0")
-    monkeypatch.setenv("SCITASTE_SCHEDULER_WEEKLY_COMPENSATION_HOURS", "0")
-    monkeypatch.setenv("SCITASTE_SCHEDULER_DAILY_COMPENSATION_HOURS", "0")
-    monkeypatch.setenv("SCITASTE_SCHEDULER_WEEKLY_COMPENSATION_HOURS", "0")
-    monkeypatch.setenv("SCITASTE_SCHEDULER_DAILY_COMPENSATION_HOURS", "0")
-    monkeypatch.setenv("SCITASTE_SCHEDULER_WEEKLY_COMPENSATION_HOURS", "0")
+    monkeypatch.setenv("PAPERFLOW_SCHEDULER_ENABLED", "true")
+    monkeypatch.setenv("PAPERFLOW_TIMEZONE", "Asia/Shanghai")
+    monkeypatch.setenv("PAPERFLOW_DAILY_PUSH_TIME", "09:00")
+    monkeypatch.setenv("PAPERFLOW_WEEKLY_REPORT_TIME", "10:00")
+    monkeypatch.setenv("PAPERFLOW_WEEKLY_REPORT_WEEKDAY", "0")
+    monkeypatch.setenv("PAPERFLOW_SCHEDULER_GRACE_MINUTES", "10")
+    monkeypatch.setenv("PAPERFLOW_SCHEDULER_DAILY_COMPENSATION_HOURS", "0")
+    monkeypatch.setenv("PAPERFLOW_SCHEDULER_WEEKLY_COMPENSATION_HOURS", "0")
+    monkeypatch.setenv("PAPERFLOW_SCHEDULER_DAILY_COMPENSATION_HOURS", "0")
+    monkeypatch.setenv("PAPERFLOW_SCHEDULER_WEEKLY_COMPENSATION_HOURS", "0")
+    monkeypatch.setenv("PAPERFLOW_SCHEDULER_DAILY_COMPENSATION_HOURS", "0")
+    monkeypatch.setenv("PAPERFLOW_SCHEDULER_WEEKLY_COMPENSATION_HOURS", "0")
 
     daily_runs = []
     monkeypatch.setattr(
@@ -87,14 +87,14 @@ def test_run_due_jobs_triggers_weekly_report_on_monday_only(tmp_path, monkeypatc
         state_path,
     )
 
-    monkeypatch.setenv("SCITASTE_SCHEDULER_ENABLED", "true")
-    monkeypatch.setenv("SCITASTE_TIMEZONE", "Asia/Shanghai")
-    monkeypatch.setenv("SCITASTE_DAILY_PUSH_TIME", "09:00")
-    monkeypatch.setenv("SCITASTE_WEEKLY_REPORT_TIME", "10:00")
-    monkeypatch.setenv("SCITASTE_WEEKLY_REPORT_WEEKDAY", "0")
-    monkeypatch.setenv("SCITASTE_SCHEDULER_GRACE_MINUTES", "10")
-    monkeypatch.setenv("SCITASTE_SCHEDULER_DAILY_COMPENSATION_HOURS", "0")
-    monkeypatch.setenv("SCITASTE_SCHEDULER_WEEKLY_COMPENSATION_HOURS", "0")
+    monkeypatch.setenv("PAPERFLOW_SCHEDULER_ENABLED", "true")
+    monkeypatch.setenv("PAPERFLOW_TIMEZONE", "Asia/Shanghai")
+    monkeypatch.setenv("PAPERFLOW_DAILY_PUSH_TIME", "09:00")
+    monkeypatch.setenv("PAPERFLOW_WEEKLY_REPORT_TIME", "10:00")
+    monkeypatch.setenv("PAPERFLOW_WEEKLY_REPORT_WEEKDAY", "0")
+    monkeypatch.setenv("PAPERFLOW_SCHEDULER_GRACE_MINUTES", "10")
+    monkeypatch.setenv("PAPERFLOW_SCHEDULER_DAILY_COMPENSATION_HOURS", "0")
+    monkeypatch.setenv("PAPERFLOW_SCHEDULER_WEEKLY_COMPENSATION_HOURS", "0")
 
     weekly_runs = []
     monkeypatch.setattr(scheduler, "_trigger_daily_push", lambda *args, **kwargs: None)
@@ -132,12 +132,12 @@ def test_run_due_jobs_does_not_backfill_late_restart(tmp_path, monkeypatch):
     )
     state_path = tmp_path / "scheduler_state.json"
 
-    monkeypatch.setenv("SCITASTE_SCHEDULER_ENABLED", "true")
-    monkeypatch.setenv("SCITASTE_TIMEZONE", "Asia/Shanghai")
-    monkeypatch.setenv("SCITASTE_DAILY_PUSH_TIME", "09:00")
-    monkeypatch.setenv("SCITASTE_WEEKLY_REPORT_TIME", "10:00")
-    monkeypatch.setenv("SCITASTE_WEEKLY_REPORT_WEEKDAY", "2")
-    monkeypatch.setenv("SCITASTE_SCHEDULER_GRACE_MINUTES", "10")
+    monkeypatch.setenv("PAPERFLOW_SCHEDULER_ENABLED", "true")
+    monkeypatch.setenv("PAPERFLOW_TIMEZONE", "Asia/Shanghai")
+    monkeypatch.setenv("PAPERFLOW_DAILY_PUSH_TIME", "09:00")
+    monkeypatch.setenv("PAPERFLOW_WEEKLY_REPORT_TIME", "10:00")
+    monkeypatch.setenv("PAPERFLOW_WEEKLY_REPORT_WEEKDAY", "2")
+    monkeypatch.setenv("PAPERFLOW_SCHEDULER_GRACE_MINUTES", "10")
 
     daily_runs = []
     weekly_runs = []
@@ -179,9 +179,9 @@ def test_run_due_jobs_skips_roles_without_chat_id(tmp_path, monkeypatch):
     )
     state_path = tmp_path / "scheduler_state.json"
 
-    monkeypatch.setenv("SCITASTE_SCHEDULER_ENABLED", "true")
-    monkeypatch.setenv("SCITASTE_DAILY_PUSH_TIME", "09:00")
-    monkeypatch.setenv("SCITASTE_SCHEDULER_GRACE_MINUTES", "10")
+    monkeypatch.setenv("PAPERFLOW_SCHEDULER_ENABLED", "true")
+    monkeypatch.setenv("PAPERFLOW_DAILY_PUSH_TIME", "09:00")
+    monkeypatch.setenv("PAPERFLOW_SCHEDULER_GRACE_MINUTES", "10")
 
     called = []
     monkeypatch.setattr(
@@ -212,13 +212,13 @@ def test_run_due_jobs_compensates_recent_missed_daily_push(tmp_path, monkeypatch
     )
     state_path = tmp_path / "scheduler_state.json"
 
-    monkeypatch.setenv("SCITASTE_SCHEDULER_ENABLED", "true")
-    monkeypatch.setenv("SCITASTE_DAILY_PUSH_TIME", "09:00")
-    monkeypatch.setenv("SCITASTE_WEEKLY_REPORT_TIME", "10:00")
-    monkeypatch.setenv("SCITASTE_WEEKLY_REPORT_WEEKDAY", "2")
-    monkeypatch.setenv("SCITASTE_SCHEDULER_GRACE_MINUTES", "10")
-    monkeypatch.setenv("SCITASTE_SCHEDULER_DAILY_COMPENSATION_HOURS", "6")
-    monkeypatch.setenv("SCITASTE_SCHEDULER_WEEKLY_COMPENSATION_HOURS", "0")
+    monkeypatch.setenv("PAPERFLOW_SCHEDULER_ENABLED", "true")
+    monkeypatch.setenv("PAPERFLOW_DAILY_PUSH_TIME", "09:00")
+    monkeypatch.setenv("PAPERFLOW_WEEKLY_REPORT_TIME", "10:00")
+    monkeypatch.setenv("PAPERFLOW_WEEKLY_REPORT_WEEKDAY", "2")
+    monkeypatch.setenv("PAPERFLOW_SCHEDULER_GRACE_MINUTES", "10")
+    monkeypatch.setenv("PAPERFLOW_SCHEDULER_DAILY_COMPENSATION_HOURS", "6")
+    monkeypatch.setenv("PAPERFLOW_SCHEDULER_WEEKLY_COMPENSATION_HOURS", "0")
 
     calls = []
     monkeypatch.setattr(
@@ -249,13 +249,13 @@ def test_run_due_jobs_schedules_retry_after_failure_and_retries_later(tmp_path, 
     )
     state_path = tmp_path / "scheduler_state.json"
 
-    monkeypatch.setenv("SCITASTE_SCHEDULER_ENABLED", "true")
-    monkeypatch.setenv("SCITASTE_DAILY_PUSH_TIME", "09:00")
-    monkeypatch.setenv("SCITASTE_SCHEDULER_GRACE_MINUTES", "10")
-    monkeypatch.setenv("SCITASTE_SCHEDULER_MAX_RETRIES", "2")
-    monkeypatch.setenv("SCITASTE_SCHEDULER_RETRY_BACKOFF_MINUTES", "15")
-    monkeypatch.setenv("SCITASTE_SCHEDULER_DAILY_COMPENSATION_HOURS", "0")
-    monkeypatch.setenv("SCITASTE_SCHEDULER_WEEKLY_COMPENSATION_HOURS", "0")
+    monkeypatch.setenv("PAPERFLOW_SCHEDULER_ENABLED", "true")
+    monkeypatch.setenv("PAPERFLOW_DAILY_PUSH_TIME", "09:00")
+    monkeypatch.setenv("PAPERFLOW_SCHEDULER_GRACE_MINUTES", "10")
+    monkeypatch.setenv("PAPERFLOW_SCHEDULER_MAX_RETRIES", "2")
+    monkeypatch.setenv("PAPERFLOW_SCHEDULER_RETRY_BACKOFF_MINUTES", "15")
+    monkeypatch.setenv("PAPERFLOW_SCHEDULER_DAILY_COMPENSATION_HOURS", "0")
+    monkeypatch.setenv("PAPERFLOW_SCHEDULER_WEEKLY_COMPENSATION_HOURS", "0")
 
     calls = {"count": 0}
 
@@ -316,7 +316,7 @@ def test_scheduler_status_snapshot_exposes_runtime_and_retry_state(tmp_path, mon
         state_path,
     )
 
-    monkeypatch.setenv("SCITASTE_SCHEDULER_ENABLED", "true")
+    monkeypatch.setenv("PAPERFLOW_SCHEDULER_ENABLED", "true")
 
     snapshot = scheduler.get_scheduler_status_snapshot(state_path)
 

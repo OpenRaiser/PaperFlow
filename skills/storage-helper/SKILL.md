@@ -124,7 +124,7 @@ CREATE TABLE task_status (
 ```python
 #!/usr/bin/env python3
 """
-SciTaste Database Operations
+PaperFlow Database Operations
 """
 
 import sqlite3
@@ -132,7 +132,7 @@ import json
 from datetime import datetime, timedelta
 from pathlib import Path
 
-DB_PATH = Path(__file__).parent.parent / "data" / "scitaste.db"
+DB_PATH = Path(__file__).parent.parent / "data" / "paperflow.db"
 
 def get_connection():
     conn = sqlite3.connect(DB_PATH)

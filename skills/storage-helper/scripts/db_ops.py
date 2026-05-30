@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SciTaste Database Operations
+PaperFlow Database Operations
 
 Provides CRUD operations for:
 - User profiles
@@ -15,7 +15,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 
-DB_PATH = Path(__file__).parent.parent.parent.parent / "data" / "scitaste.db"
+DB_PATH = Path(__file__).parent.parent.parent.parent / "data" / "paperflow.db"
 
 
 def get_connection() -> sqlite3.Connection:

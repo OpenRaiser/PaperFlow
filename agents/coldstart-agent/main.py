@@ -46,7 +46,7 @@ build_default_drift_state = profile_updater.build_default_drift_state
 pdf_parser = importlib.import_module("skills.pdf-parser.scripts.parse_pdf")
 parse_paper_for_coldstart = pdf_parser.parse_paper_for_coldstart
 
-feishu_reporter = importlib.import_module("skills.feishu-reporter.scripts.feishu_reporter")
+feishu_reporter = importlib.import_module("deployments.feishu.feishu-reporter.scripts.feishu_reporter")
 
 
 DIRECTION_KEYWORDS = {
@@ -85,7 +85,7 @@ METHODOLOGY_KEYWORDS = {
     "application": ["application", "applied", "real-world", "case study"],
 }
 
-BASELINE_PDF_ENV_VAR = "SCITASTE_BASELINE_PDF"
+BASELINE_PDF_ENV_VAR = "PAPERFLOW_BASELINE_PDF"
 PDF_DIRECTION_WEIGHT_CAP = 0.70
 PDF_INCREMENT_BLEND = 0.25
 PDF_NEW_DIRECTION_CAP = 0.55
@@ -626,7 +626,7 @@ def _build_scholar_profile_url(
     query = dict(parse_qsl(parsed.query, keep_blank_values=True))
     query["hl"] = hl or query.get("hl") or "en"
     query["cstart"] = str(max(0, int(cstart)))
-    resolved_page_size = pagesize or _get_env_int("SCITASTE_SCHOLAR_PAGE_SIZE", 100)
+    resolved_page_size = pagesize or _get_env_int("PAPERFLOW_SCHOLAR_PAGE_SIZE", 100)
     query["pagesize"] = str(max(20, int(resolved_page_size)))
 
     return urlunsplit(
@@ -886,7 +886,7 @@ def _parse_google_scholar_profile_html(html_text: str) -> Dict[str, Any]:
         "affiliation": affiliation,
         "homepage_url": _extract_external_homepage_url(html_text),
         "interests": interests,
-        "publications": publications[: max(1, _get_env_int("SCITASTE_SCHOLAR_PUBLICATION_LIMIT", SCHOLAR_PUBLICATION_LIMIT))],
+        "publications": publications[: max(1, _get_env_int("PAPERFLOW_SCHOLAR_PUBLICATION_LIMIT", SCHOLAR_PUBLICATION_LIMIT))],
         "all_publications": publications,
         "stats": _parse_scholar_stats(html_text),
         "top_coauthors": list(network_signals.get("top_coauthors") or []),
@@ -1160,7 +1160,7 @@ def parse_research_homepage(homepage_url: str, use_llm: bool = True) -> Dict[str
     response = requests.get(
         candidate_url,
         headers=SCHOLAR_HEADERS,
-        timeout=max(5, _get_env_int("SCITASTE_HOMEPAGE_TIMEOUT", HOMEPAGE_TIMEOUT_SECONDS)),
+        timeout=max(5, _get_env_int("PAPERFLOW_HOMEPAGE_TIMEOUT", HOMEPAGE_TIMEOUT_SECONDS)),
     )
     response.raise_for_status()
 
@@ -1262,10 +1262,10 @@ def _merge_scholar_page_data(base: Dict[str, Any], incoming: Dict[str, Any], pub
 
 def _fetch_google_scholar_profile_pages(scholar_url: str) -> Dict[str, Any]:
     """Fetch one or more Scholar profile pages with lightweight fallbacks."""
-    timeout_seconds = max(5, _get_env_int("SCITASTE_SCHOLAR_TIMEOUT", SCHOLAR_TIMEOUT_SECONDS))
-    publication_limit = max(1, _get_env_int("SCITASTE_SCHOLAR_PUBLICATION_LIMIT", SCHOLAR_PUBLICATION_LIMIT))
-    page_size = max(20, _get_env_int("SCITASTE_SCHOLAR_PAGE_SIZE", 100))
-    max_pages = max(1, _get_env_int("SCITASTE_SCHOLAR_MAX_PAGES", SCHOLAR_MAX_PAGES))
+    timeout_seconds = max(5, _get_env_int("PAPERFLOW_SCHOLAR_TIMEOUT", SCHOLAR_TIMEOUT_SECONDS))
+    publication_limit = max(1, _get_env_int("PAPERFLOW_SCHOLAR_PUBLICATION_LIMIT", SCHOLAR_PUBLICATION_LIMIT))
+    page_size = max(20, _get_env_int("PAPERFLOW_SCHOLAR_PAGE_SIZE", 100))
+    max_pages = max(1, _get_env_int("PAPERFLOW_SCHOLAR_MAX_PAGES", SCHOLAR_MAX_PAGES))
 
     session = requests.Session()
     errors: List[str] = []

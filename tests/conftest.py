@@ -1,5 +1,5 @@
 """
-Pytest configuration and fixtures for SciTaste tests
+Pytest configuration and fixtures for PaperFlow tests
 """
 
 import pytest
@@ -12,7 +12,7 @@ from datetime import datetime
 @pytest.fixture
 def test_db_path(tmp_path):
     """Create a temporary database for testing"""
-    db_path = tmp_path / "test_scitaste.db"
+    db_path = tmp_path / "test_paperflow.db"
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
 

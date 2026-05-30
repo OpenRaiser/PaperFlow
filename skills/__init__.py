@@ -1,1 +1,1 @@
-# SciTaste Skills Package
+# PaperFlow Skills Package

@@ -1,0 +1,3 @@
+n_pairs,n_comparisons,top1_match_rate,same_sign_rate,n,pearson_r,pearson_p,spearman_rho,spearman_p,kendall_tau
+24,72,0.500000,0.305556,72,0.812794,4.34744e-18,0.537264,1.13954e-06,0.418244
+

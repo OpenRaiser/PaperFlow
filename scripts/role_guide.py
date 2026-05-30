@@ -28,7 +28,7 @@
    python agents/role-manager/main.py --command "绑定 roleA chat_xxx"
 
 4. 测试推送
-   python agents/daily-push-agent/main.py --user-id user_rolea --send-feishu
+   python deployments/feishu/daily-push-agent/main.py --user-id user_rolea --send-feishu
 
 ============================================================
 当前角色列表
@@ -70,5 +70,5 @@ python agents/role-manager/main.py --command "切换到 roleA"
 python agents/role-manager/main.py --command "查看角色列表"
 
 # 给指定角色推送
-python agents/daily-push-agent/main.py --user-id user_rolea --send-feishu
+python deployments/feishu/daily-push-agent/main.py --user-id user_rolea --send-feishu
 """)

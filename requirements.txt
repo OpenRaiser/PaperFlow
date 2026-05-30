@@ -1,4 +1,4 @@
-# SciTaste Dependencies
+# PaperFlow Dependencies
 # Install with: pip install -r requirements.txt
 
 # HTTP requests
@@ -35,6 +35,9 @@ anthropic>=0.18.0
 # YAML configuration
 pyyaml>=6.0.1
 protobuf>=4.25.0
+
+# IANA timezone database (Windows ships without tz data; needed for ZoneInfo)
+tzdata>=2024.1
 
 # SQLite is built-in, no external dependency needed
 

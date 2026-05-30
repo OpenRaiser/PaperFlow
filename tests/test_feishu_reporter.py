@@ -7,7 +7,7 @@ import pytest
 
 @pytest.fixture
 def feishu_reporter():
-    return importlib.import_module("skills.feishu-reporter.scripts.feishu_reporter")
+    return importlib.import_module("deployments.feishu.feishu-reporter.scripts.feishu_reporter")
 
 
 def test_send_post_uses_raw_im_api(monkeypatch, feishu_reporter):

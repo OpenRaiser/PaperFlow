@@ -13,7 +13,7 @@ import urllib.parse
 
 ARXIV_API_URL = "https://export.arxiv.org/api/query"
 DEFAULT_REQUEST_TIMEOUT = float(os.environ.get("ARXIV_REQUEST_TIMEOUT", "12"))
-DEFAULT_REQUEST_HEADERS = {"User-Agent": "SciTaste/0.1 ArxivFetcher"}
+DEFAULT_REQUEST_HEADERS = {"User-Agent": "PaperFlow/0.1 ArxivFetcher"}
 
 # arXiv 类别映射
 CATEGORIES = {

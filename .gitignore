@@ -43,6 +43,7 @@ ENV/
 .vscode/
 .idea/
 .claude/
+.omx/
 *.swp
 *.swo
 *~
@@ -71,10 +72,26 @@ webhook.log
 data/*
 !data/.gitkeep
 
+# Generated results. Keep only selected public summaries.
+results/*
+!results/model_comparison/
+!results/model_comparison/**
+
+# Generated experiment artifacts
+ablation_packages/
+llm_model_experiment_packages/
+scripts/human_eval/packages/
+release/
+outputs/
+
 # Local models
 models/*
 !models/.gitkeep
 !models/README.md
+
+# Local paper/build artifacts
+tmp_pdf_pages/
+_appendix2_*
 
 # SQLite sidecar files
 *.db-shm
@@ -83,5 +100,12 @@ models/*
 # Documentation builds
 docs/_build/
 
+# Local-only docs (anything ending in .local.md is private to the developer
+# and will not be committed)
+*.local.md
+
 # Assistant / local tool metadata
 CLAUDE.md
+
+# Per-rater raw human-eval rows (only aggregates are public)
+experiments/human_eval/results/*/scored_rows.csv

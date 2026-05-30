@@ -1,0 +1,4 @@
+family,status,folder,best_method,best_score_name,best_score,auto_metric,human_metric,pearson_r,spearman_r,n,notes
+main_human_eval,final manual,scripts/human_eval/results/main_human_eval,Full PaperFlow Pipeline,ListwiseHumanScore,65.555556,RecommendationScore,ListwiseHumanScore,0.862586,0.863089,36,"Main experiment human evaluation."
+drift_human_eval,final manual,scripts/human_eval/results/drift_human_eval,Full PaperFlow,AdaptationHumanScore,68.7500,DriftAutoScore,AdaptationHumanScore,0.914851,0.890438,72,"Drift experiment human evaluation."
+model_human_eval,final manual,scripts/human_eval/results/model_human_eval,grok-4.3,ModelHumanScore,94.0741,ModelAutoScore,ModelHumanScore,0.963243,0.964835,14,"Model-comparison human evaluation."

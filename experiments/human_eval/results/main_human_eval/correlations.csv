@@ -1,0 +1,9 @@
+Auto metric,Human metric,n,Pearson r,Spearman r
+RecommendationScore,ListwiseHumanScore,36,0.862586,0.863089
+RecommendationScore,ListwiseHumanScoreWithBalance,36,0.843110,0.822928
+gNDCG@20,ranking_quality,36,0.872294,0.877398
+Useful@20,decision_usefulness,36,0.700073,0.841291
+Useful@5,profile_match,36,0.860810,0.883937
+MRR@20,ranking_quality,36,0.725133,0.754339
+Lift@20,ListwiseHumanScore,36,0.386829,0.408794
+

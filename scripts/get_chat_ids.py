@@ -3,7 +3,7 @@
 获取飞书对话框 chat_id 的辅助脚本
 
 使用方法：
-1. 在飞书上打开 SciTaste Bot 对话框
+1. 在飞书上打开 PaperFlow Bot 对话框
 2. 发送任意消息
 3. 查看此脚本输出的 chat_id
 """
@@ -126,7 +126,7 @@ def main():
     print("1. 保持此脚本运行")
     print("2. 在飞书开放平台将事件订阅 URL 临时改为：http://localhost:9999")
     print("   或者使用 ngrok：ngrok http 9999，然后将 ngrok URL 配置到飞书")
-    print("3. 在飞书上给 SciTaste Bot 发送任意消息")
+    print("3. 在飞书上给 PaperFlow Bot 发送任意消息")
     print("4. 此脚本会打印出 chat_id")
     print("5. 将 chat_id 复制到 data/roles.json 中对应角色的 feishu_chat_id 字段")
     print()

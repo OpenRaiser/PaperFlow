@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Profile updater utilities for SciTaste.
+Profile updater utilities for PaperFlow.
 
 This module now supports:
 - cosine similarity and safe vector resizing
@@ -13,7 +13,9 @@ This module now supports:
 import copy
 import hashlib
 import os
+import re
 from datetime import datetime, timedelta
+from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -25,11 +27,14 @@ expand_direction_terms = direction_lexicon.expand_direction_terms
 get_direction_entry = direction_lexicon.get_direction_entry
 get_lexicon_keywords = direction_lexicon.get_lexicon_keywords
 resolve_canonical_direction = direction_lexicon.resolve_canonical_direction
+drift_engine = __import__("scripts.drift_engine", fromlist=["dummy"])
 
 
 DRIFT_BLEND_WEIGHTS = {
     "stable": {"explicit": 0.40, "long": 0.45, "short": 0.15},
+    "observing": {"explicit": 0.38, "long": 0.37, "short": 0.25},
     "shifting": {"explicit": 0.35, "long": 0.25, "short": 0.40},
+    "committed_shift": {"explicit": 0.30, "long": 0.22, "short": 0.48},
     "recovered": {"explicit": 0.35, "long": 0.35, "short": 0.30},
 }
 
@@ -56,32 +61,35 @@ def _configured_embedding_dimensions() -> int:
 
 def _drift_config() -> Dict[str, float]:
     return {
-        "long_window_size": _get_env_int("SCITASTE_DRIFT_LONG_WINDOW_SIZE", 30),
-        "long_window_days": _get_env_int("SCITASTE_DRIFT_LONG_WINDOW_DAYS", 60),
-        "short_window_size": _get_env_int("SCITASTE_DRIFT_SHORT_WINDOW_SIZE", 8),
-        "short_window_days": _get_env_int("SCITASTE_DRIFT_SHORT_WINDOW_DAYS", 14),
-        "drift_threshold": _get_env_float("SCITASTE_DRIFT_THRESHOLD", 0.35),
-        "recover_threshold": _get_env_float("SCITASTE_DRIFT_RECOVER_THRESHOLD", 0.20),
-        "alpha_base": _get_env_float("SCITASTE_DRIFT_ALPHA_BASE", 0.08),
-        "alpha_max": _get_env_float("SCITASTE_DRIFT_ALPHA_MAX", 0.35),
-        "topic_decay": _get_env_float("SCITASTE_TOPIC_DECAY", 0.01),
-        "author_decay": _get_env_float("SCITASTE_AUTHOR_DECAY", 0.005),
-        "institution_decay": _get_env_float("SCITASTE_INSTITUTION_DECAY", 0.005),
-        "selected_topic_delta": _get_env_float("SCITASTE_TOPIC_POSITIVE_DELTA", 0.02),
-        "skipped_topic_delta": _get_env_float("SCITASTE_TOPIC_NEGATIVE_DELTA", 0.01),
-        "author_positive_delta": _get_env_float("SCITASTE_AUTHOR_HEAT_POSITIVE_DELTA", 0.05),
-        "institution_positive_delta": _get_env_float("SCITASTE_INSTITUTION_HEAT_POSITIVE_DELTA", 0.05),
-        "reading_signal_window_days": _get_env_int("SCITASTE_READING_SIGNAL_WINDOW_DAYS", 21),
-        "reading_signal_activation_count": _get_env_int("SCITASTE_READING_SIGNAL_ACTIVATION_COUNT", 2),
-        "reading_signal_topic_seed_weak": _get_env_float("SCITASTE_READING_SIGNAL_TOPIC_SEED_WEAK", 0.18),
-        "reading_signal_topic_seed_strong": _get_env_float("SCITASTE_READING_SIGNAL_TOPIC_SEED_STRONG", 0.38),
-        "reading_signal_topic_delta_weak": _get_env_float("SCITASTE_READING_SIGNAL_TOPIC_DELTA_WEAK", 0.03),
-        "reading_signal_topic_delta_strong": _get_env_float("SCITASTE_READING_SIGNAL_TOPIC_DELTA_STRONG", 0.08),
-        "reading_signal_core_seed_strong": _get_env_float("SCITASTE_READING_SIGNAL_CORE_SEED_STRONG", 0.45),
-        "reading_signal_core_delta_strong": _get_env_float("SCITASTE_READING_SIGNAL_CORE_DELTA_STRONG", 0.08),
-        "reading_signal_short_term_base": _get_env_float("SCITASTE_READING_SIGNAL_SHORT_TERM_BASE", 0.35),
-        "reading_signal_short_term_step": _get_env_float("SCITASTE_READING_SIGNAL_SHORT_TERM_STEP", 0.18),
-        "reading_signal_short_term_strong_bonus": _get_env_float("SCITASTE_READING_SIGNAL_SHORT_TERM_STRONG_BONUS", 0.22),
+        "long_window_size": _get_env_int("PAPERFLOW_DRIFT_LONG_WINDOW_SIZE", 30),
+        "long_window_days": _get_env_int("PAPERFLOW_DRIFT_LONG_WINDOW_DAYS", 60),
+        "short_window_size": _get_env_int("PAPERFLOW_DRIFT_SHORT_WINDOW_SIZE", 8),
+        "short_window_days": _get_env_int("PAPERFLOW_DRIFT_SHORT_WINDOW_DAYS", 14),
+        "drift_threshold": _get_env_float("PAPERFLOW_DRIFT_THRESHOLD", 0.35),
+        "recover_threshold": _get_env_float("PAPERFLOW_DRIFT_RECOVER_THRESHOLD", 0.20),
+        "alpha_base": _get_env_float("PAPERFLOW_DRIFT_ALPHA_BASE", 0.08),
+        "alpha_max": _get_env_float("PAPERFLOW_DRIFT_ALPHA_MAX", 0.35),
+        "topic_decay": _get_env_float("PAPERFLOW_TOPIC_DECAY", 0.01),
+        "author_decay": _get_env_float("PAPERFLOW_AUTHOR_DECAY", 0.005),
+        "institution_decay": _get_env_float("PAPERFLOW_INSTITUTION_DECAY", 0.005),
+        "selected_topic_delta": _get_env_float("PAPERFLOW_TOPIC_POSITIVE_DELTA", 0.02),
+        "skipped_topic_delta": _get_env_float("PAPERFLOW_TOPIC_NEGATIVE_DELTA", 0.01),
+        "author_positive_delta": _get_env_float("PAPERFLOW_AUTHOR_HEAT_POSITIVE_DELTA", 0.05),
+        "institution_positive_delta": _get_env_float("PAPERFLOW_INSTITUTION_HEAT_POSITIVE_DELTA", 0.05),
+        "reading_signal_window_days": _get_env_int("PAPERFLOW_READING_SIGNAL_WINDOW_DAYS", 21),
+        "reading_signal_activation_count": _get_env_int("PAPERFLOW_READING_SIGNAL_ACTIVATION_COUNT", 2),
+        "reading_signal_topic_seed_weak": _get_env_float("PAPERFLOW_READING_SIGNAL_TOPIC_SEED_WEAK", 0.18),
+        "reading_signal_topic_seed_strong": _get_env_float("PAPERFLOW_READING_SIGNAL_TOPIC_SEED_STRONG", 0.38),
+        "reading_signal_topic_delta_weak": _get_env_float("PAPERFLOW_READING_SIGNAL_TOPIC_DELTA_WEAK", 0.03),
+        "reading_signal_topic_delta_strong": _get_env_float("PAPERFLOW_READING_SIGNAL_TOPIC_DELTA_STRONG", 0.08),
+        "reading_signal_core_seed_strong": _get_env_float("PAPERFLOW_READING_SIGNAL_CORE_SEED_STRONG", 0.45),
+        "reading_signal_core_delta_strong": _get_env_float("PAPERFLOW_READING_SIGNAL_CORE_DELTA_STRONG", 0.08),
+        "reading_signal_short_term_base": _get_env_float("PAPERFLOW_READING_SIGNAL_SHORT_TERM_BASE", 0.35),
+        "reading_signal_short_term_step": _get_env_float("PAPERFLOW_READING_SIGNAL_SHORT_TERM_STEP", 0.18),
+        "reading_signal_short_term_strong_bonus": _get_env_float("PAPERFLOW_READING_SIGNAL_SHORT_TERM_STRONG_BONUS", 0.22),
+        "anchor_user_probability": _get_env_float("PAPERFLOW_ANCHOR_DRIFT_PROBABILITY", 0.5),
+        "real_decay_observing_days": _get_env_int("PAPERFLOW_REAL_DECAY_OBSERVING_DAYS", 7),
+        "real_decay_strong_days": _get_env_int("PAPERFLOW_REAL_DECAY_STRONG_DAYS", 15),
     }
 
 
@@ -122,6 +130,22 @@ def build_default_drift_state(now_iso: Optional[str] = None) -> Dict[str, Any]:
         "short_term_topics": {},
         "adaptive_alpha": _drift_config()["alpha_base"],
         "top_shift_topics": [],
+        "drift_enabled": None,
+        "hidden_anchor": None,
+        "hidden_anchor_source": None,
+        "intent_score": 0.0,
+        "anchor_topic": None,
+        "anchor_topics": [],
+        "anchor_source": None,
+        "anchor_confidence": 0.0,
+        "anchor_progress": 0.0,
+        "anchor_set_date": None,
+        "commitment_days_remaining": 0,
+        "signal_window": [],
+        "episode_index": 0,
+        "completed_drift_cycles": 0,
+        "max_drift_cycles": None,
+        "manual_suppressed_topics": [],
         "explanation": "近期兴趣稳定，系统继续以长期画像为主。",
     }
 
@@ -192,6 +216,22 @@ def ensure_profile_schema(profile: Optional[Dict[str, Any]], now: Optional[datet
         normalized["drift_state"].get("top_shift_topics", []),
         keep_unknown=True,
     )
+    normalized["drift_state"]["hidden_anchor"] = next(
+        iter(canonicalize_direction_terms([normalized["drift_state"].get("hidden_anchor")], keep_unknown=True)),
+        None,
+    )
+    normalized["drift_state"]["anchor_topic"] = next(
+        iter(canonicalize_direction_terms([normalized["drift_state"].get("anchor_topic")], keep_unknown=True)),
+        None,
+    )
+    normalized["drift_state"]["anchor_topics"] = canonicalize_direction_terms(
+        normalized["drift_state"].get("anchor_topics", []),
+        keep_unknown=True,
+    )
+    normalized["drift_state"]["manual_suppressed_topics"] = canonicalize_direction_terms(
+        normalized["drift_state"].get("manual_suppressed_topics", []),
+        keep_unknown=True,
+    )
 
     reading_signal_state = normalized.get("reading_signal_state")
     default_reading_signal_state = build_default_reading_signal_state()
@@ -245,6 +285,95 @@ def ensure_profile_schema(profile: Optional[Dict[str, Any]], now: Optional[datet
 
 def get_drift_blend_weights(status: str) -> Dict[str, float]:
     return copy.deepcopy(DRIFT_BLEND_WEIGHTS.get(status, DRIFT_BLEND_WEIGHTS["stable"]))
+
+
+def _profile_has_anchor_plan(profile: Dict[str, Any]) -> bool:
+    shift_topics = canonicalize_direction_terms(
+        list((profile.get("drift_plan", {}) or {}).get("shift_topics", []) or []),
+        keep_unknown=True,
+    )
+    return bool(shift_topics)
+
+
+def _paper_matches_anchor_topic(paper: Dict[str, Any], topic: Optional[str]) -> bool:
+    topic_text = str(topic or "").strip()
+    if not topic_text:
+        return False
+    paper_topics = _normalize_keywords(paper)
+    if topic_text in paper_topics:
+        return True
+    match_terms = set(drift_engine._direction_match_terms(topic_text))
+    title = str(paper.get("title") or "").lower()
+    abstract = str(paper.get("abstract") or "").lower()
+    text = f"{title} {abstract}"
+    return any(term in text for term in match_terms)
+
+
+def get_anchor_behavior(profile: Dict[str, Any]) -> Dict[str, Any]:
+    drift_state = ensure_profile_schema({"drift_state": (profile or {}).get("drift_state", {})})["drift_state"]
+    strategy_mode = str(drift_state.get("strategy_mode") or drift_engine.STRATEGY_REAL_USER)
+    target_topic = None
+    score_bonus = 0.0
+    category_bonus = 0.0
+    suppression_penalty = 0.0
+    suppressed_topics = canonicalize_direction_terms(drift_state.get("suppressed_topics", []), keep_unknown=True)
+    manual_suppressed_topics = canonicalize_direction_terms(drift_state.get("manual_suppressed_topics", []), keep_unknown=True)
+    suppressed_topics = canonicalize_direction_terms(suppressed_topics + manual_suppressed_topics, keep_unknown=True)
+    if not suppressed_topics and (drift_state.get("drift_enabled") or drift_state.get("anchor_topic")):
+        suppressed_topics = canonicalize_direction_terms(
+            list(((profile or {}).get("drift_plan", {}) or {}).get("downweight_topics", []) or []),
+            keep_unknown=True,
+        )
+
+    if drift_state.get("anchor_topic"):
+        target_topic = str(drift_state.get("anchor_topic") or "").strip()
+        progress = float(drift_state.get("anchor_progress", 0.0) or 0.0)
+        if int(drift_state.get("commitment_days_remaining", 0) or 0) > 0:
+            if strategy_mode == drift_engine.STRATEGY_REAL_USER:
+                score_bonus = 0.08 + min(0.04, progress * 0.04)
+                category_bonus = 0.04
+                suppression_penalty = 0.10
+            else:
+                score_bonus = 0.16 + min(0.08, progress * 0.08)
+                category_bonus = 0.10
+                suppression_penalty = 0.28
+        else:
+            if strategy_mode == drift_engine.STRATEGY_REAL_USER:
+                score_bonus = 0.05 + min(0.03, progress * 0.03)
+                category_bonus = 0.02
+                suppression_penalty = 0.06
+            else:
+                score_bonus = 0.10 + min(0.05, progress * 0.05)
+                category_bonus = 0.06
+                suppression_penalty = 0.18
+    elif drift_state.get("drift_enabled") and drift_state.get("hidden_anchor"):
+        target_topic = str(drift_state.get("hidden_anchor") or "").strip()
+        if drift_state.get("status") == "observing":
+            if strategy_mode == drift_engine.STRATEGY_REAL_USER:
+                score_bonus = 0.03
+                category_bonus = 0.01
+                suppression_penalty = 0.0
+            else:
+                score_bonus = 0.08
+                category_bonus = 0.04
+                suppression_penalty = 0.12
+        else:
+            if strategy_mode == drift_engine.STRATEGY_REAL_USER:
+                score_bonus = 0.02
+                category_bonus = 0.01
+                suppression_penalty = 0.0
+            else:
+                score_bonus = 0.05
+                category_bonus = 0.02
+                suppression_penalty = 0.08
+
+    return {
+        "target_topic": target_topic or None,
+        "score_bonus": round(score_bonus, 4),
+        "category_bonus": round(category_bonus, 4),
+        "suppressed_topics": suppressed_topics,
+        "suppression_penalty": round(max(suppression_penalty, 0.22 if manual_suppressed_topics else suppression_penalty), 4),
+    }
 
 
 def _infer_vector_dimension(*vectors: List[float]) -> int:
@@ -341,6 +470,49 @@ def _normalize_string_list(values: Any) -> List[str]:
     return [str(values).strip()]
 
 
+def _normalize_match_text(values: Any) -> str:
+    if isinstance(values, (list, tuple, set)):
+        parts: List[str] = []
+        for value in values:
+            parts.extend(_normalize_string_list(value))
+    else:
+        parts = _normalize_string_list(values)
+    text = " ".join(parts).lower().replace("&", " and ")
+    return re.sub(r"[^a-z0-9]+", " ", text).strip()
+
+
+def _contains_match_term(text: str, term: Any) -> bool:
+    normalized_term = _normalize_match_text(term)
+    if not normalized_term or not text:
+        return False
+    return f" {normalized_term} " in f" {text} "
+
+
+@lru_cache(maxsize=1024)
+def _must_read_keyword_terms(keyword: str) -> Tuple[str, ...]:
+    candidate_terms: List[Any] = [keyword]
+    resolved_keyword = resolve_canonical_direction(keyword, include_paper_terms=True)
+    canonical_keyword = resolved_keyword["canonical_name"] if resolved_keyword else None
+    expanded = expand_direction_terms([keyword])
+    expanded_entry = expanded.get(canonical_keyword) if canonical_keyword else None
+    if expanded_entry:
+        candidate_terms.extend(
+            [
+                expanded_entry.get("canonical_name"),
+                expanded_entry.get("name"),
+                expanded_entry.get("name_cn"),
+            ]
+        )
+    normalized_terms = []
+    seen = set()
+    for term in candidate_terms:
+        normalized = _normalize_match_text(term)
+        if normalized and normalized not in seen:
+            normalized_terms.append(normalized)
+            seen.add(normalized)
+    return tuple(normalized_terms)
+
+
 def _normalize_topic_values(paper: Dict[str, Any]) -> List[str]:
     topic_candidates = _normalize_string_list(paper.get("topics"))
     if not topic_candidates:
@@ -353,6 +525,78 @@ def _normalize_keywords(paper: Dict[str, Any]) -> List[str]:
     for key in ("keywords", "topics", "categories"):
         merged_values.extend(_normalize_string_list(paper.get(key)))
     return canonicalize_direction_terms(merged_values, keep_unknown=True)
+
+
+def _latest_topic_activity_days(
+    reading_history: List[Dict[str, Any]],
+    now: datetime,
+) -> Dict[str, int]:
+    latest_seen: Dict[str, datetime] = {}
+    for entry in reading_history or []:
+        if str(entry.get("action") or "").strip().lower() != "selected":
+            continue
+        entry_time = _safe_iso_datetime(entry.get("selected_at"), fallback=now)
+        entry_topics = canonicalize_direction_terms(entry.get("topics", []), keep_unknown=True)
+        for topic in entry_topics:
+            existing = latest_seen.get(topic)
+            if existing is None or entry_time > existing:
+                latest_seen[topic] = entry_time
+
+    return {
+        topic: max(0, int((now - seen_at).total_seconds() // 86400))
+        for topic, seen_at in latest_seen.items()
+    }
+
+
+def _apply_real_user_inactivity_decay(profile: Dict[str, Any], *, now: datetime) -> Dict[str, Any]:
+    updated = copy.deepcopy(profile)
+    drift_state = updated.get("drift_state", {}) or {}
+    strategy_mode = str(drift_state.get("strategy_mode") or drift_engine.STRATEGY_REAL_USER)
+    if strategy_mode != drift_engine.STRATEGY_REAL_USER:
+        return updated
+
+    config = _drift_config()
+    observing_days = int(config["real_decay_observing_days"])
+    strong_days = int(config["real_decay_strong_days"])
+    reading_history = list(updated.get("reading_history", []) or [])
+    activity_days = _latest_topic_activity_days(reading_history, now)
+
+    protected_topics = set()
+    if drift_state.get("hidden_anchor"):
+        protected_topics.add(str(drift_state.get("hidden_anchor")).strip())
+    if drift_state.get("anchor_topic"):
+        protected_topics.add(str(drift_state.get("anchor_topic")).strip())
+
+    core_directions = canonicalize_weight_mapping(updated.get("core_directions", {}))
+    topic_weights = canonicalize_weight_mapping(updated.get("topic_weights", {}))
+    must_read = copy.deepcopy(updated.get("must_read", {}) or {})
+    must_keywords = canonicalize_direction_terms(must_read.get("keywords", []), keep_unknown=True)
+
+    for topic in list(core_directions.keys()):
+        if topic in protected_topics:
+            continue
+        inactive_days = activity_days.get(topic, strong_days + 1)
+        if inactive_days >= strong_days:
+            core_directions[topic] = round(max(0.10, float(core_directions.get(topic, 0.0)) - 0.20), 4)
+            topic_weights[topic] = round(max(0.10, float(topic_weights.get(topic, 0.0)) - 0.20), 4)
+        elif inactive_days >= observing_days:
+            core_directions[topic] = round(max(0.10, float(core_directions.get(topic, 0.0)) - 0.08), 4)
+            topic_weights[topic] = round(max(0.10, float(topic_weights.get(topic, 0.0)) - 0.08), 4)
+
+    trimmed_keywords = []
+    for keyword in must_keywords:
+        if keyword in protected_topics:
+            trimmed_keywords.append(keyword)
+            continue
+        inactive_days = activity_days.get(keyword, strong_days + 1)
+        if inactive_days < strong_days:
+            trimmed_keywords.append(keyword)
+
+    updated["core_directions"] = canonicalize_weight_mapping(core_directions)
+    updated["topic_weights"] = canonicalize_weight_mapping(topic_weights)
+    must_read["keywords"] = trimmed_keywords
+    updated["must_read"] = must_read
+    return updated
 
 
 def infer_reading_signal_topics(
@@ -649,6 +893,10 @@ def _top_shift_topics(short_topics: Dict[str, float], long_topics: Dict[str, flo
 
 
 def _describe_drift_state(status: str, shift_topics: List[str]) -> str:
+    if status == "observing":
+        if shift_topics:
+            return f"系统已观察到你在{', '.join(shift_topics)}上出现连续新信号，正在等待更多证据来确认是否形成稳定迁移。"
+        return "系统已观察到连续的新兴趣信号，正在等待更多证据来确认是否形成稳定迁移。"
     if status == "shifting":
         if shift_topics:
             return (
@@ -882,6 +1130,15 @@ def calculate_paper_score(
                 institution_score = max(institution_score, float(heat))
 
     quality_score = float(paper.get("quality_score", 0.5))
+    anchor_behavior = get_anchor_behavior(profile)
+    anchor_bonus = 0.0
+    if anchor_behavior["target_topic"] and _paper_matches_anchor_topic(paper, anchor_behavior["target_topic"]):
+        anchor_bonus = float(anchor_behavior["score_bonus"])
+    suppression_penalty = 0.0
+    if anchor_behavior["suppressed_topics"]:
+        suppressed_hit = any(_paper_matches_anchor_topic(paper, topic) for topic in anchor_behavior["suppressed_topics"])
+        if suppressed_hit and not (anchor_behavior["target_topic"] and _paper_matches_anchor_topic(paper, anchor_behavior["target_topic"])):
+            suppression_penalty = float(anchor_behavior["suppression_penalty"])
 
     bonus = weights_config.get("bonus_must_read", 0.15) if is_must_read(paper, profile) else 0.0
 
@@ -891,6 +1148,8 @@ def calculate_paper_score(
         + weights_config.get("w3_author_institution", 0.20) * max(author_score, institution_score)
         + weights_config.get("w4_quality_signal", 0.20) * quality_score
         + bonus
+        + anchor_bonus
+        - suppression_penalty
     )
     return min(1.0, score)
 
@@ -910,26 +1169,53 @@ def get_must_read_matches(paper: Dict, profile: Dict) -> Dict[str, List[str]]:
     paper_authors = _normalize_string_list(paper.get("authors"))
     for author in paper_authors:
         for must_author in must_authors:
-            if str(must_author).lower() in author.lower() and must_author not in matches["authors"]:
+            if _contains_match_term(_normalize_match_text(author), must_author) and must_author not in matches["authors"]:
                 matches["authors"].append(must_author)
 
     must_institutions = must_read.get("institutions", [])
-    paper_institution = str(paper.get("institution", "") or "")
+    paper_institution_values: List[Any] = []
+    paper_institution_values.extend(_normalize_string_list(paper.get("institution")))
+    paper_institution_values.extend(_normalize_string_list(paper.get("institutions")))
+    paper_institution_values.extend(_normalize_string_list(paper.get("affiliations")))
+    paper_institution = _normalize_match_text(paper_institution_values)
     for institution in must_institutions:
-        if str(institution).lower() in paper_institution.lower() and institution not in matches["institutions"]:
+        if _contains_match_term(paper_institution, institution) and institution not in matches["institutions"]:
             matches["institutions"].append(institution)
 
     must_keywords = must_read.get("keywords", [])
-    paper_topics = set(_normalize_topic_values(paper))
-    paper_keywords_lower = [keyword.lower() for keyword in _normalize_keywords(paper)]
+    paper_text = _normalize_match_text(
+        [
+            paper.get("title"),
+            paper.get("abstract"),
+            paper.get("venue"),
+            paper.get("keywords"),
+            paper.get("topics"),
+            paper.get("categories"),
+        ]
+    )
+    paper_topics: Optional[set] = None
+    paper_keywords_lower: Optional[List[str]] = None
     for keyword in must_keywords:
-        resolved_keyword = resolve_canonical_direction(keyword, include_paper_terms=True)
-        canonical_keyword = resolved_keyword["canonical_name"] if resolved_keyword else None
-        if canonical_keyword and canonical_keyword in paper_topics and keyword not in matches["keywords"]:
-            matches["keywords"].append(keyword)
+        for term in _must_read_keyword_terms(str(keyword)):
+            if f" {term} " in f" {paper_text} ":
+                if keyword not in matches["keywords"]:
+                    matches["keywords"].append(keyword)
+                break
+        if keyword in matches["keywords"]:
             continue
-        if str(keyword).lower() in paper_keywords_lower and keyword not in matches["keywords"]:
-            matches["keywords"].append(keyword)
+
+        if paper.get("topics") or paper.get("keywords"):
+            if paper_topics is None:
+                paper_topics = set(_normalize_topic_values(paper))
+            if paper_keywords_lower is None:
+                paper_keywords_lower = [value.lower() for value in _normalize_keywords(paper)]
+            resolved_keyword = resolve_canonical_direction(keyword, include_paper_terms=True)
+            canonical_keyword = resolved_keyword["canonical_name"] if resolved_keyword else None
+            if canonical_keyword and canonical_keyword in paper_topics and keyword not in matches["keywords"]:
+                matches["keywords"].append(keyword)
+                continue
+            if str(keyword).lower() in paper_keywords_lower and keyword not in matches["keywords"]:
+                matches["keywords"].append(keyword)
 
     return matches
 
@@ -970,6 +1256,7 @@ def update_profile_with_feedback(
     historical_selected_papers: Optional[List[Dict]] = None,
     current_time: Optional[datetime] = None,
     feedback_strength_multiplier: float = 1.0,
+    apply_anchor_drift: bool = True,
 ) -> Dict:
     """
     Unified drift-aware profile update entry.
@@ -1152,21 +1439,75 @@ def update_profile_with_feedback(
             }
         )
     updated["reading_history"] = reading_history[-200:]
+    updated = _apply_real_user_inactivity_decay(updated, now=now)
+
+    anchor_state = copy.deepcopy(previous_drift_state)
+    if apply_anchor_drift and _profile_has_anchor_plan(updated):
+        anchor_result_profile = copy.deepcopy(updated)
+        anchor_result_profile["drift_state"] = copy.deepcopy(previous_drift_state)
+        engine = drift_engine.DriftEngine(drift_engine.load_default_checkfiles())
+        anchor_result_profile, _anchor_event = engine.advance_profile_drift(
+            anchor_result_profile,
+            selected_papers=selected_papers,
+            date=now_iso,
+            drift_probability=float(config["anchor_user_probability"]),
+            strategy_mode=drift_engine.STRATEGY_REAL_USER,
+        )
+        anchor_state = ensure_profile_schema(
+            {
+                "drift_state": anchor_result_profile.get("drift_state", {}),
+                "drift_plan": updated.get("drift_plan", {}),
+            },
+            now=now,
+        )["drift_state"]
+        updated["core_directions"] = canonicalize_weight_mapping(anchor_result_profile.get("core_directions", updated.get("core_directions", {})))
+        updated["topic_weights"] = canonicalize_weight_mapping(anchor_result_profile.get("topic_weights", updated.get("topic_weights", {})))
+        anchor_must_read = anchor_result_profile.get("must_read", updated.get("must_read", {}))
+        updated["must_read"] = anchor_must_read if isinstance(anchor_must_read, dict) else updated.get("must_read", {})
 
     shift_topics = _top_shift_topics(short_term_topics, long_term_topics)
-    explanation = _describe_drift_state(drift_status, shift_topics)
+    merged_shift_topics = canonicalize_direction_terms(
+        list(shift_topics) + list(anchor_state.get("top_shift_topics", []) or []),
+        keep_unknown=True,
+    )[:3]
+    final_status = drift_status
+    final_score = round(float(drift_score), 4)
+    final_detected_at = detected_at if drift_status in {"shifting", "recovered"} else previous_drift_state.get("detected_at")
+    if _profile_has_anchor_plan(updated):
+        final_status = str(anchor_state.get("status") or drift_status)
+        final_score = round(float(anchor_state.get("score", drift_score) or drift_score), 4)
+        final_detected_at = (
+            anchor_state.get("anchor_set_date")
+            if final_status in {"observing", "shifting", "recovered"} and anchor_state.get("anchor_set_date")
+            else final_detected_at
+        )
+
+    explanation = _describe_drift_state(final_status, merged_shift_topics)
 
     updated["drift_state"] = {
-        "status": drift_status,
-        "score": round(float(drift_score), 4),
-        "detected_at": detected_at if drift_status in {"shifting", "recovered"} else previous_drift_state.get("detected_at"),
+        "status": final_status,
+        "score": final_score,
+        "detected_at": final_detected_at,
         "last_updated_at": now_iso,
         "long_term_vector": _resize_vector(long_term_vector, target_dim),
         "short_term_vector": _resize_vector(short_term_vector, target_dim),
         "long_term_topics": _round_mapping(long_term_topics),
         "short_term_topics": _round_mapping(short_term_topics),
         "adaptive_alpha": adaptive_alpha,
-        "top_shift_topics": shift_topics,
+        "top_shift_topics": merged_shift_topics,
+        "drift_enabled": anchor_state.get("drift_enabled"),
+        "hidden_anchor": anchor_state.get("hidden_anchor"),
+        "hidden_anchor_source": anchor_state.get("hidden_anchor_source"),
+        "intent_score": round(float(anchor_state.get("intent_score", 0.0) or 0.0), 4),
+        "anchor_topic": anchor_state.get("anchor_topic"),
+        "anchor_topics": canonicalize_direction_terms(anchor_state.get("anchor_topics", []), keep_unknown=True),
+        "anchor_source": anchor_state.get("anchor_source"),
+        "anchor_confidence": round(float(anchor_state.get("anchor_confidence", 0.0) or 0.0), 4),
+        "anchor_progress": round(float(anchor_state.get("anchor_progress", 0.0) or 0.0), 4),
+        "anchor_set_date": anchor_state.get("anchor_set_date"),
+        "commitment_days_remaining": int(anchor_state.get("commitment_days_remaining", 0) or 0),
+        "signal_window": copy.deepcopy(anchor_state.get("signal_window", []) or []),
+        "episode_index": int(anchor_state.get("episode_index", 0) or 0),
         "explanation": explanation,
     }
 

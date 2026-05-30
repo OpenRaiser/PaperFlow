@@ -34,7 +34,7 @@ def main() -> int:
     db_ops.init_db()
 
     print(f"[OK] Runtime directories ready: {PROJECT_ROOT}")
-    print(f"[OK] Database ready: {PROJECT_ROOT / 'data' / 'scitaste.db'}")
+    print(f"[OK] Database ready: {PROJECT_ROOT / 'data' / 'paperflow.db'}")
     return 0
 
 

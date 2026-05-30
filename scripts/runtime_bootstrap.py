@@ -83,7 +83,7 @@ def _database_has_required_tables(db_path: Path) -> bool:
 
 
 def ensure_database(root_dir: Path = PROJECT_ROOT) -> Path:
-    db_path = root_dir / "data" / "scitaste.db"
+    db_path = root_dir / "data" / "paperflow.db"
     if _database_has_required_tables(db_path):
         return db_path
 
@@ -111,7 +111,7 @@ def ensure_role_profiles(root_dir: Path = PROJECT_ROOT) -> Dict[str, Any]:
 
     db_ops = importlib.import_module("skills.storage-helper.scripts.db_ops")
     coldstart_agent = importlib.import_module("agents.coldstart-agent.main")
-    db_path = root_dir / "data" / "scitaste.db"
+    db_path = root_dir / "data" / "paperflow.db"
     original_db_path = getattr(db_ops, "DB_PATH", None)
 
     created: list[str] = []

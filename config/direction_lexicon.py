@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Shared canonical direction registry for SciTaste.
+Shared canonical direction registry for PaperFlow.
 
 This module centralizes:
 - canonical direction metadata
@@ -30,8 +30,8 @@ def _resolve_runtime_path(env_name: str, relative_path: str) -> Path:
     return PROJECT_ROOT / relative_path
 
 
-LEXICON_PATH = _resolve_runtime_path("SCITASTE_DIRECTION_LEXICON_PATH", "config/direction_lexicon.json")
-PENDING_PATH = _resolve_runtime_path("SCITASTE_DIRECTION_PENDING_PATH", "data/direction_pending.json")
+LEXICON_PATH = _resolve_runtime_path("PAPERFLOW_DIRECTION_LEXICON_PATH", "config/direction_lexicon.json")
+PENDING_PATH = _resolve_runtime_path("PAPERFLOW_DIRECTION_PENDING_PATH", "data/direction_pending.json")
 
 
 def _now_iso() -> str:

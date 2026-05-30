@@ -1,1 +1,1 @@
-"""Utility scripts package for SciTaste."""
+"""Utility scripts package for PaperFlow."""

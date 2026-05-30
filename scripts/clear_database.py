@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Reset the local SciTaste database while preserving role-level cold-start profiles."""
+"""Reset the local PaperFlow database while preserving role-level cold-start profiles."""
 
 from __future__ import annotations
 
 import argparse
+import copy
 import importlib
 import json
 import shutil
@@ -17,7 +18,7 @@ from typing import Any, Dict, Iterable, Optional
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-DB_PATH = PROJECT_ROOT / "data" / "scitaste.db"
+DB_PATH = PROJECT_ROOT / "data" / "paperflow.db"
 ROLES_FILE = PROJECT_ROOT / "data" / "roles.json"
 BACKUP_DIR = PROJECT_ROOT / "data" / "db_backups"
 
@@ -50,7 +51,7 @@ def backup_database(db_path: Path = DB_PATH, backup_dir: Path = BACKUP_DIR) -> P
 
     backup_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup_path = backup_dir / f"scitaste_{timestamp}.db"
+    backup_path = backup_dir / f"paperflow_{timestamp}.db"
     shutil.copy2(db_path, backup_path)
     return backup_path
 
@@ -117,6 +118,23 @@ def _select_seed_directions(role_name: str, parsed: Dict[str, Any]) -> Dict[str,
     }
 
 
+def _extract_seed_directions_from_role(role_data: Dict[str, Any]) -> Dict[str, float]:
+    """Prefer the explicit seed_directions authored in roles.json."""
+    selected: Dict[str, float] = {}
+    for item in role_data.get("seed_directions", []) or []:
+        if not isinstance(item, dict):
+            continue
+        direction_key = str(item.get("canonical_name") or item.get("bootstrap_phrase") or "").strip()
+        if not direction_key:
+            continue
+        try:
+            weight = round(float(item.get("weight", 0.5) or 0.5), 4)
+        except (TypeError, ValueError):
+            weight = 0.5
+        selected[direction_key] = weight
+    return selected
+
+
 def build_seed_profile(role_name: str, role_data: Dict[str, Any]) -> Dict[str, Any]:
     """Build a fresh cold-start profile from role metadata."""
     coldstart_agent = importlib.import_module("agents.coldstart-agent.main")
@@ -130,19 +148,29 @@ def build_seed_profile(role_name: str, role_data: Dict[str, Any]) -> Dict[str, A
 
     profile = coldstart_agent.build_empty_profile(user_id)
     parsed = coldstart_agent.parse_natural_language(bootstrap_text) if bootstrap_text else {}
-    selected_directions = _select_seed_directions(role_name, parsed)
+    selected_directions = _extract_seed_directions_from_role(role_data) or _select_seed_directions(role_name, parsed)
 
     profile["core_directions"] = selected_directions
     profile["topic_weights"] = {
         direction_key: round(
-            float((parsed.get("topic_weights") or {}).get(direction_key, weight)),
+            float(((parsed.get("topic_weights") or {}).get(direction_key, weight))),
             4,
         )
         for direction_key, weight in selected_directions.items()
     }
-    profile["methodology_preferences"] = parsed.get("methodology_preferences") or {}
+    profile["methodology_preferences"] = role_data.get("methodology_preferences") or parsed.get("methodology_preferences") or {}
     profile["taste_profile"] = parsed.get("taste_profile") or {}
+    profile["must_read"] = {
+        "authors": list(role_data.get("must_read_authors", []) or []),
+        "institutions": list(role_data.get("must_read_institutions", []) or []),
+        "keywords": list(role_data.get("must_read_keywords", []) or []),
+    }
     profile["interest_vector"] = coldstart_agent.generate_interest_vector(selected_directions)
+    profile["description"] = role_data.get("description") or bootstrap_text
+    profile["bootstrap_summary"] = role_data.get("bootstrap_summary") or bootstrap_text
+    profile["secondary_topics"] = list(role_data.get("secondary_topics", []) or [])
+    profile["report_preferences"] = copy.deepcopy(role_data.get("report_preferences") or {})
+    profile["drift_plan"] = copy.deepcopy(role_data.get("drift_plan") or {})
     profile["feishu_chat_id"] = role_data.get("feishu_chat_id")
 
     return profile
@@ -227,14 +255,43 @@ def full_reset(
     }
 
 
+def benchmark_reset(
+    db_path: Path = DB_PATH,
+    roles_path: Path = ROLES_FILE,
+    backup_dir: Path = BACKUP_DIR,
+    roles: Optional[Iterable[str]] = None,
+) -> Dict[str, Any]:
+    """Clear benchmark state while preserving the fixed paper collection."""
+    backup_path = backup_database(db_path=db_path, backup_dir=backup_dir)
+    roles_meta = load_roles_meta(roles_path=roles_path)
+
+    conn = get_connection(db_path=db_path)
+    try:
+        before_counts = get_table_counts(conn)
+        clear_tables(conn, ("behavior_logs", "task_status"))
+        seeded_profiles = reset_user_profiles(conn, roles_meta, roles=roles)
+        reset_sqlite_sequences(conn, ("profiles", "behavior_logs", "task_status"))
+        conn.commit()
+        after_counts = get_table_counts(conn)
+    finally:
+        conn.close()
+
+    return {
+        "backup_path": str(backup_path),
+        "before_counts": before_counts,
+        "after_counts": after_counts,
+        "seeded_profiles": seeded_profiles,
+    }
+
+
 def parse_args() -> argparse.Namespace:
     """Parse CLI arguments."""
     parser = argparse.ArgumentParser(
-        description="Reset the SciTaste database while preserving role-specific cold-start profiles.",
+        description="Reset the PaperFlow database while preserving role-specific cold-start profiles.",
     )
     parser.add_argument(
         "--action",
-        choices=("full_reset", "reset_profiles", "clear_logs", "clear_papers", "clear_tasks"),
+        choices=("full_reset", "benchmark_reset", "reset_profiles", "clear_logs", "clear_papers", "clear_tasks"),
         default="full_reset",
         help="Cleanup action to perform.",
     )
@@ -264,6 +321,17 @@ def main() -> int:
         print("Seeded profiles:")
         for role_name, directions in result["seeded_profiles"].items():
             print(f"  - {role_name}: {json.dumps(directions, ensure_ascii=False)}")
+        return 0
+
+    if args.action == "benchmark_reset":
+        result = benchmark_reset(roles=args.roles)
+        print(f"Backup: {result['backup_path']}")
+        print(f"Before: {json.dumps(result['before_counts'], ensure_ascii=False)}")
+        print(f"After: {json.dumps(result['after_counts'], ensure_ascii=False)}")
+        print("Seeded profiles:")
+        for role_name, directions in result["seeded_profiles"].items():
+            print(f"  - {role_name}: {json.dumps(directions, ensure_ascii=False)}")
+        print("Papers table was preserved.")
         return 0
 
     backup_path = backup_database()

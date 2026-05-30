@@ -331,6 +331,7 @@ def test_synthesize_reading_report_with_llm_uses_reading_timeout_override(monkey
 
     def fake_generate(system_prompt, user_text, max_tokens=500, timeout_override=None, **kwargs):
         captured["timeout_override"] = timeout_override
+        captured["max_tokens"] = max_tokens
         return {
             "one_sentence_summary": "summary",
             "research_background": "background",
@@ -354,6 +355,7 @@ def test_synthesize_reading_report_with_llm_uses_reading_timeout_override(monkey
 
     assert result["recommendation_label"] == "推荐阅读"
     assert captured["timeout_override"] == 180.0
+    assert captured["max_tokens"] >= 4096
 
 
 def test_synthesize_reading_report_with_llm_includes_retrieved_evidence_in_prompt(monkeypatch):

@@ -5,8 +5,11 @@ Tests for journal RSS date handling.
 import importlib
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -23,6 +26,17 @@ class FakeEntry(dict):
             return self[item]
         except KeyError as exc:
             raise AttributeError(item) from exc
+
+
+class FixedDateTime(datetime):
+    @classmethod
+    def now(cls, tz=None):
+        return cls(2026, 4, 15, tzinfo=tz)
+
+
+@pytest.fixture(autouse=True)
+def fixed_fetch_window(monkeypatch):
+    monkeypatch.setattr(journal_fetcher, "datetime", FixedDateTime)
 
 
 def test_extract_entry_datetime_prefers_updated_when_published_missing():

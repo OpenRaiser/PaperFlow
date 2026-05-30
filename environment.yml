@@ -1,4 +1,4 @@
-name: scitaste
+name: paperflow
 channels:
   - conda-forge
   - defaults
