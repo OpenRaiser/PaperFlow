@@ -121,6 +121,7 @@ def daily(
 def read(
     paper_ids: list[int] = typer.Argument(..., help="Paper IDs from a previous PaperFlow push."),
     user_id: Optional[str] = typer.Option(None, "--user-id", "-u", help="Personalize the report for this user."),
+    push_id: Optional[str] = typer.Option(None, "--push-id", help="Read papers from a specific push ID."),
     folder_id: Optional[str] = typer.Option(None, "--folder-id", help="Optional Feishu/Lark folder ID."),
     no_feishu: bool = typer.Option(False, "--no-feishu", help="Do not send a Feishu/Lark notification."),
     feishu_user_id: Optional[str] = typer.Option(None, "--feishu-user-id", help="Optional Feishu/Lark user open_id."),
@@ -133,6 +134,8 @@ def read(
     args: list[str] = ["--paper-ids", *[str(paper_id) for paper_id in paper_ids]]
     if user_id:
         args.extend(["--user-id", user_id])
+    if push_id:
+        args.extend(["--push-id", push_id])
     if folder_id:
         args.extend(["--folder-id", folder_id])
     if no_feishu:

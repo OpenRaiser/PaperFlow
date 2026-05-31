@@ -56,6 +56,8 @@ db_ops = importlib.import_module("skills.storage-helper.scripts.db_ops")
 get_profile = db_ops.get_profile
 update_profile = db_ops.update_profile
 log_behavior = db_ops.log_behavior
+get_latest_push = getattr(db_ops, "get_latest_push", lambda user_id: None)
+get_push_papers = getattr(db_ops, "get_push_papers", lambda push_id: None)
 get_existing_reading_reports_for_papers = getattr(
     db_ops,
     "get_existing_reading_reports_for_papers",
@@ -900,7 +902,7 @@ def format_created_docs_summary(created_docs: List[Dict[str, Any]]) -> str:
     """Format the reading-report completion message with direct document links."""
     lines = [
         "=" * 60,
-        f"Reading reports created ({len(created_docs)})",
+        f"Reading reports ready ({len(created_docs)})",
         "=" * 60,
         "",
     ]
@@ -3223,6 +3225,10 @@ def create_reading_report(
     created_docs = [doc for doc in prepared_docs if doc]
     _annotate_tracking_links(created_docs, user_id)
 
+    if created_docs:
+        print()
+        print(format_created_docs_summary(created_docs))
+
     if send_to_feishu and created_docs and target_id:
         summary_text = format_created_docs_summary(created_docs)
         try:
@@ -3252,19 +3258,22 @@ if __name__ == "__main__":
     parser.add_argument("--folder-id", type=str, help="飞书文件夹 ID")
     parser.add_argument("--no-feishu", action="store_true", help="不发送飞书通知")
     parser.add_argument("--feishu-user-id", type=str, help="飞书用户 ID")
+    parser.add_argument("--push-id", type=str, help="指定要读取的 push_id；默认使用该用户最新一次推送")
 
     args = parser.parse_args()
 
-    # 测试数据
-    test_papers = [
-        {"id": 1, "arxiv_id": "2401.001", "title": "Test Paper 1", "authors": ["Author A"], "abstract": "This is a test abstract."},
-        {"id": 2, "arxiv_id": "2401.002", "title": "Test Paper 2", "authors": ["Author B"], "abstract": "Another test abstract."},
-    ]
+    push_info = get_push_papers(args.push_id) if args.push_id else get_latest_push(args.user_id)
+    if not push_info or not push_info.get("papers"):
+        source = f"push_id={args.push_id}" if args.push_id else f"user={args.user_id}"
+        print(f"No pushed papers found for {source}. Run `paperflow daily` first.")
+        raise SystemExit(1)
+
+    print(f"Using push: {push_info.get('push_id', args.push_id or 'latest')}")
 
     create_reading_report(
         user_id=args.user_id,
         paper_ids=args.paper_ids,
-        papers=test_papers,
+        papers=push_info["papers"],
         folder_id=args.folder_id,
         send_to_feishu=not args.no_feishu,
         feishu_user_id=args.feishu_user_id
