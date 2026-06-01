@@ -230,8 +230,10 @@ python agents/role-manager/main.py --command "绑定 role1 oc_xxxxxxxx"
 # 建一个新角色
 python agents/role-manager/main.py --command "创建角色 alice，研究方向：扩散模型 视频生成"
 
-# 跑一次 cold start 给它写初始画像
-python agents/coldstart-agent/main.py --user-id user_alice
+# 跑一次 profile cold start 给它写初始画像
+paperflow profile \
+  --user-id user_alice \
+  --natural-language "扩散模型 视频生成"
 
 # 把它绑到飞书群
 python agents/role-manager/main.py --command "绑定 alice oc_xxxxxxxx"

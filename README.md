@@ -84,25 +84,49 @@ the system adapt tomorrow?**
 
 ## Quick Start
 
+PaperFlow's daily flow has five steps. Steps 1-3 only run once; steps 4-5
+become your daily routine.
+
 ```bash
+# 1. Install
 git clone https://github.com/OpenRaiser/PaperFlow.git
 cd PaperFlow
+pip install -e ".[all]"          # full install (or `pip install -e .` for the minimal CLI)
 
-# Minimal install. Enough for the offline demo and CLI skeleton.
-pip install -e .
+# 2. Configure providers (OpenAI / Anthropic / Ollama / Dashscope ... see below)
+cp .env.example .env
+# edit .env to set PAPERFLOW_LLM_PROVIDER + the matching API key
 
-# Recommended full install for fetching, PDF parsing, and local embeddings.
-pip install -e ".[all]"
+# 3. Initialize runtime + create your user profile (REQUIRED)
+paperflow init
+paperflow doctor
+paperflow profile \
+  --user-id user_alice \
+  --natural-language "I work on LLM agents for scientific discovery, \
+literature mining, and automated paper reading."
+
+# 4. Daily push (run every morning, or as often as you like)
+paperflow daily --user-id user_alice
+
+# 5. Read selected papers (paper IDs come from the latest daily push)
+paperflow read 1 3 7 --user-id user_alice
 ```
 
-Run an offline smoke test:
+> **Step 3 is mandatory.** `paperflow daily / read / feedback` all read the
+> profile created by `paperflow profile`. Skipping it means there's no
+> personalization signal to score against, so `paperflow read` has no push
+> to read from. See [Initialize a User Profile](#initialize-a-user-profile)
+> below for the four bootstrap methods (text / PDF / Google Scholar / homepage).
+
+### Offline smoke test (no API keys)
 
 ```bash
 paperflow demo
 ```
 
 The demo uses deterministic mock/hash providers, so it does not need API keys
-or network access.
+or network access. Use it to confirm the install before configuring real
+providers.
 
 ## Configure Providers
 
@@ -138,6 +162,46 @@ paperflow doctor
 
 Runtime data is stored under `data/` and is ignored by Git.
 
+## Initialize a User Profile
+
+PaperFlow keeps **one profile per `user_id`**, and every other command
+(`daily`, `read`, `feedback`) reads from that profile. **You must create at
+least one profile before the first daily run** — otherwise `paperflow daily`
+has nothing to score against and `paperflow read` has no push to read from.
+
+You can bootstrap a profile from any of these four sources, or combine them:
+
+```bash
+# (a) Self-description in natural language (fastest)
+paperflow profile \
+  --user-id user_alice \
+  --natural-language "I work on LLM agents for scientific discovery, \
+literature mining, and automated paper reading."
+
+# (b) One or more papers you have written or care about
+paperflow profile --user-id user_alice --pdf /path/to/my-paper.pdf
+
+# (c) A Google Scholar profile (PaperFlow scrapes the public page)
+paperflow profile \
+  --user-id user_alice \
+  --scholar-url "https://scholar.google.com/citations?user=..."
+
+# (d) A personal lab or homepage
+paperflow profile \
+  --user-id user_alice \
+  --homepage-url "https://example.edu/~alice"
+```
+
+Repeated `paperflow profile` calls **merge** new signals into the existing
+profile by default. Use `--reset-existing` only when you want to rebuild it
+from scratch.
+
+Inspect the resulting profile any time with:
+
+```bash
+python scripts/show_profile.py user_alice
+```
+
 ## CLI Usage
 
 ```bash
@@ -149,6 +213,7 @@ paperflow --help
 | `paperflow init` | Create local runtime directories and SQLite tables |
 | `paperflow doctor` | Check dependencies, credentials, and runtime paths |
 | `paperflow demo` | Run an offline provider demo |
+| `paperflow profile` | Create or update a user profile from text, PDFs, Scholar, or homepage data |
 | `paperflow daily` | Generate a daily personalized paper push |
 | `paperflow read` | Generate a personalized reading report |
 | `paperflow feedback` | Record feedback for a previous push |
@@ -168,6 +233,13 @@ Generate reading reports from paper IDs shown in a previous push:
 
 ```bash
 paperflow read 1 3 7 --user-id user_role1 --no-feishu
+```
+
+By default, `paperflow read` uses that user's latest push in
+`data/paperflow.db`. To read from a specific previous push:
+
+```bash
+paperflow read 1 3 7 --user-id user_role1 --push-id push_20260401_090000 --no-feishu
 ```
 
 Record feedback:

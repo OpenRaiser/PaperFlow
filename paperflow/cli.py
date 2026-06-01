@@ -1,8 +1,9 @@
 """PaperFlow command-line interface.
 
-Wraps the seven user-facing entry points described in the README:
+Wraps the user-facing entry points described in the README:
 
     paperflow init       Initialize local runtime + database
+    paperflow profile    Create or update a user profile
     paperflow daily      Run a single daily push pipeline pass
     paperflow read       Generate a reading report for a paper
     paperflow feedback   Record feedback on a recommendation
@@ -89,6 +90,53 @@ def doctor() -> None:
     if script.exists():
         raise typer.Exit(code=_run_python(script))
     typer.echo("[warn] scripts/doctor.py not found; provider configuration shown above only.")
+
+
+@app.command()
+def profile(
+    user_id: str = typer.Option(..., "--user-id", "-u", help="Create or update this PaperFlow user ID."),
+    natural_language: Optional[str] = typer.Option(
+        None,
+        "--natural-language",
+        "-d",
+        help="Free-form research-interest description.",
+    ),
+    pdf: Optional[list[Path]] = typer.Option(
+        None,
+        "--pdf",
+        help="PDF used to bootstrap the profile. Repeat this option for multiple PDFs.",
+    ),
+    scholar_url: Optional[str] = typer.Option(None, "--scholar-url", help="Google Scholar profile URL."),
+    homepage_url: Optional[str] = typer.Option(None, "--homepage-url", help="Research homepage URL."),
+    reset_existing: bool = typer.Option(False, "--reset-existing", help="Rebuild instead of merging into an existing profile."),
+    send_feishu: bool = typer.Option(False, "--send-feishu", help="Send the profile summary through Feishu/Lark."),
+    feishu_user_id: Optional[str] = typer.Option(None, "--feishu-user-id", help="Optional Feishu/Lark user open_id."),
+    chat_id: Optional[str] = typer.Option(None, "--chat-id", help="Optional Feishu/Lark chat ID."),
+) -> None:
+    """Create or update a user profile from text, PDFs, Scholar, or homepage data."""
+    script = PROJECT_ROOT / "agents" / "coldstart-agent" / "main.py"
+    if not script.exists():
+        typer.echo(f"[error] cold-start agent not found: {script}", err=True)
+        raise typer.Exit(code=1)
+    args: list[str] = ["--user-id", user_id]
+    if natural_language:
+        args.extend(["--natural-language", natural_language])
+    if pdf:
+        args.append("--pdf")
+        args.extend(str(path) for path in pdf)
+    if scholar_url:
+        args.extend(["--scholar-url", scholar_url])
+    if homepage_url:
+        args.extend(["--homepage-url", homepage_url])
+    if reset_existing:
+        args.append("--reset-existing")
+    if send_feishu:
+        args.append("--send-feishu")
+    if feishu_user_id:
+        args.extend(["--feishu-user-id", feishu_user_id])
+    if chat_id:
+        args.extend(["--chat-id", chat_id])
+    raise typer.Exit(code=_run_python(script, *args))
 
 
 @app.command()

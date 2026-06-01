@@ -220,6 +220,8 @@ def test_generate_reading_report_contains_real_sections_without_placeholders():
         ),
         "venue": "arXiv",
         "publish_date": "2026-04-13",
+        "arxiv_id": "2604.00001",
+        "categories": ["cs.CL", "cs.AI"],
         "score": 0.82,
     }
     profile = {
@@ -231,12 +233,20 @@ def test_generate_reading_report_contains_real_sections_without_placeholders():
     report = reading_agent.generate_reading_report(paper, profile, report_payload=payload)
 
     assert "<!--" not in report
-    assert "## 创新点" in report
-    assert "## 与我的研究的关系" in report
+    assert "### Q1 这篇论文试图解决什么问题？" in report
+    assert "### Q4 主要贡献或创新点是什么？" in report
+    assert "### Q6 这篇论文和我的研究有什么关系？" in report
     assert "## 代码与资源" in report
     assert "## 推荐指数" in report
     assert "adaptive scientific agent framework" in report.lower()
+    assert "- PDF: https://arxiv.org/pdf/2604.00001.pdf" in report
+    assert "cs.CL, cs.AI" in report
+    assert "主题/分类" in report
+    assert "生成模型：heuristic / PaperFlow template" in report
+    assert "模型 heuristic/PaperFlow template" in report
     assert "推荐级别" in report
+    assert "🏷 关键词：" in report
+    assert "scientific" in report.lower() or "agent" in report.lower()
 
 
 def test_pdf_evidence_cleaner_filters_common_extraction_noise():
@@ -361,9 +371,9 @@ def test_generate_reading_report_keeps_full_template_and_links_on_fallback():
     )
     report = reading_agent.generate_reading_report(paper, profile, report_payload=report_payload)
 
-    assert "## 核心方法" in report
-    assert "## 主要结果" in report
-    assert "## 创新点" in report
+    assert "### Q2 它提出了什么方法？" in report
+    assert "### Q3 主要结果是什么？" in report
+    assert "### Q4 主要贡献或创新点是什么？" in report
     assert "## 代码与资源" in report
     assert "## 推荐指数" in report
     assert "https://arxiv.org/abs/2604.12345" in report
@@ -371,6 +381,22 @@ def test_generate_reading_report_keeps_full_template_and_links_on_fallback():
     assert "https://example.com/paper" in report
     assert "源站拒绝了 PDF 访问" in report
     assert "生成式精读补充本次未返回" in report
+
+
+def test_generate_reading_report_displays_llm_model_metadata():
+    paper = {
+        "title": "LLM Metadata Report",
+        "authors": ["Alice"],
+        "abstract": "We propose a model-aware report.",
+    }
+    profile = {"core_directions": {"agent": 0.9}, "methodology_preferences": {}}
+    payload = reading_agent.build_heuristic_report_payload(paper, profile)
+    payload["generation_provider"] = "dashscope"
+    payload["generation_model"] = "qwen-plus"
+
+    report = reading_agent.generate_reading_report(paper, profile, report_payload=payload)
+
+    assert "生成模型：dashscope / qwen-plus" in report
 
 
 def test_create_reading_report_resolves_position_refs_when_db_ids_differ(monkeypatch):

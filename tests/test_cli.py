@@ -46,7 +46,7 @@ def test_cli_version_flag_long() -> None:
 def test_cli_help_lists_all_commands() -> None:
     result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0
-    for command in ("init", "doctor", "daily", "read", "feedback", "demo", "eval"):
+    for command in ("init", "doctor", "profile", "daily", "read", "feedback", "demo", "eval"):
         assert command in result.stdout
 
 
@@ -75,6 +75,64 @@ def test_cli_read_help_lists_arguments() -> None:
     assert result.exit_code == 0
     assert "PAPER_IDS" in result.stdout.upper()
     assert "--user-id" in result.stdout
+    assert "--push-id" in result.stdout
+
+
+@pytest.mark.unit
+def test_cli_profile_help_lists_bootstrap_sources() -> None:
+    result = runner.invoke(app, ["profile", "--help"])
+    assert result.exit_code == 0
+    for opt in ("--user-id", "--natural-language", "--pdf", "--scholar-url", "--homepage-url"):
+        assert opt in result.stdout
+
+
+@pytest.mark.unit
+def test_cli_profile_delegates_to_coldstart_agent(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run_python(script: Path, *args: str) -> int:
+        captured["script"] = script
+        captured["args"] = list(args)
+        return 0
+
+    monkeypatch.setattr("paperflow.cli._run_python", fake_run_python)
+
+    result = runner.invoke(
+        app,
+        [
+            "profile",
+            "--user-id",
+            "user_mario",
+            "--natural-language",
+            "scientific agents",
+            "--pdf",
+            "paper-a.pdf",
+            "--pdf",
+            "paper-b.pdf",
+            "--scholar-url",
+            "https://scholar.google.com/citations?user=test",
+            "--homepage-url",
+            "https://example.edu/~mario",
+            "--reset-existing",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert str(captured["script"]).endswith(str(Path("agents") / "coldstart-agent" / "main.py"))
+    assert captured["args"] == [
+        "--user-id",
+        "user_mario",
+        "--natural-language",
+        "scientific agents",
+        "--pdf",
+        "paper-a.pdf",
+        "paper-b.pdf",
+        "--scholar-url",
+        "https://scholar.google.com/citations?user=test",
+        "--homepage-url",
+        "https://example.edu/~mario",
+        "--reset-existing",
+    ]
 
 
 @pytest.mark.unit

@@ -296,6 +296,72 @@ def format_number_ranges(numbers: Set[int]) -> str:
     return ", ".join(formatted)
 
 
+def get_existing_selected_numbers(user_id: str, push_id: str, papers: List[Dict]) -> Set[int]:
+    """Return paper numbers already selected for this user/push.
+
+    Feedback can arrive incrementally in chat, for example "1 2 3" followed by
+    "4". The second message should amend the same selection state instead of
+    treating 1-3 as newly skipped.
+    """
+    paper_id_to_number: Dict[int, int] = {}
+    for index, paper in enumerate(papers or [], start=1):
+        paper_id = paper.get("id")
+        if paper_id is None:
+            continue
+        try:
+            paper_id_to_number[int(paper_id)] = index
+        except (TypeError, ValueError):
+            continue
+
+    selected_numbers: Set[int] = set()
+    conn = db_ops.get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT paper_id, metadata
+        FROM behavior_logs
+        WHERE user_id = ?
+          AND push_id = ?
+          AND action = 'selected'
+          AND action_type = 'selected'
+        ORDER BY id ASC
+        """,
+        (user_id, push_id),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+
+    max_paper_num = len(papers or [])
+    for row in rows:
+        metadata: Dict[str, Any] = {}
+        raw_metadata = row["metadata"] if "metadata" in row.keys() else None
+        if raw_metadata:
+            try:
+                parsed = json.loads(raw_metadata)
+                if isinstance(parsed, dict):
+                    metadata = parsed
+            except (TypeError, json.JSONDecodeError):
+                metadata = {}
+
+        paper_number = metadata.get("paper_number")
+        try:
+            normalized_number = int(paper_number)
+        except (TypeError, ValueError):
+            normalized_number = None
+
+        if normalized_number is None:
+            paper_id = row["paper_id"] if "paper_id" in row.keys() else None
+            try:
+                normalized_number = paper_id_to_number.get(int(paper_id))
+            except (TypeError, ValueError):
+                normalized_number = None
+
+        if normalized_number is not None and 1 <= normalized_number <= max_paper_num:
+            selected_numbers.add(normalized_number)
+
+    return selected_numbers
+
+
 def build_learning_signals(selected: Set[int], skipped: Set[int], papers: List[Dict]) -> List[str]:
     """Generate lightweight feedback insights aligned with the PDF interaction."""
     selected_categories = {}
@@ -343,6 +409,9 @@ def format_selection_summary(
     total_papers: int,
     papers: List[Dict],
     *,
+    newly_selected: Optional[Set[int]] = None,
+    previously_selected: Optional[Set[int]] = None,
+    skipped_label: str = "暂未选择",
     profile_updated: bool = True,
     reliability_note: str = "",
 ) -> str:
@@ -360,15 +429,28 @@ def format_selection_summary(
     skipped = set(range(1, total_papers + 1)) - selected
     selection_rate = len(selected) / total_papers if total_papers > 0 else 0
     learning_signals = build_learning_signals(selected, skipped, papers)
+    newly_selected = set(newly_selected or selected)
+    previously_selected = set(previously_selected or set())
 
     lines = []
     if selected:
-        lines.append(f"收到，{len(selected)} 篇已进入偏好学习流程。")
+        if previously_selected:
+            if newly_selected:
+                lines.append(f"收到，本次新增 {len(newly_selected)} 篇，累计 {len(selected)} 篇已进入偏好学习流程。")
+            else:
+                lines.append(f"收到，这些论文此前已记录过；当前累计 {len(selected)} 篇在偏好学习流程中。")
+        else:
+            lines.append(f"收到，{len(selected)} 篇已进入偏好学习流程。")
     else:
         lines.append("收到，今天先都不看。")
     lines.append("📊 今日反馈已记录：")
-    lines.append(f"选择：{format_number_ranges(selected)}（{len(selected)} 篇）")
-    lines.append(f"跳过：{format_number_ranges(skipped)}（{len(skipped)} 篇）")
+    if previously_selected:
+        lines.append(f"累计选择：{format_number_ranges(selected)}（{len(selected)} 篇）")
+        lines.append(f"本次新增：{format_number_ranges(newly_selected)}（{len(newly_selected)} 篇）")
+        lines.append(f"此前已选：{format_number_ranges(previously_selected)}（{len(previously_selected)} 篇）")
+    else:
+        lines.append(f"选择：{format_number_ranges(selected)}（{len(selected)} 篇）")
+    lines.append(f"{skipped_label}：{format_number_ranges(skipped)}（{len(skipped)} 篇）")
     lines.append(f"选择率：{selection_rate:.1%}")
 
     if learning_signals:
@@ -493,18 +575,26 @@ def process_feedback(
     use_chat_id = chat_id is not None
 
     # 1. 解析用户回复
-    selected = parse_user_reply(reply, papers)
+    parsed_selected = parse_user_reply(reply, papers)
     reply_lower = reply.lower().strip()
     is_none_command = reply_lower == "none"
 
-    if not selected and not is_none_command:
+    if not parsed_selected and not is_none_command:
         # 没有有效选择，发送提示
         message = "未识别到有效的论文编号。请回复数字，如：1 2 4 6、1-5 8 10，或直接回复 none。"
         if target_id and send_to_feishu:
             send_text(target_id, message, use_chat_id=use_chat_id)
         return {"status": "error", "message": message}
 
+    previously_selected = get_existing_selected_numbers(user_id, push_id, papers)
+    selected = set() if is_none_command else previously_selected | parsed_selected
+    newly_selected = set() if is_none_command else parsed_selected - previously_selected
+
     print(f"Selected paper numbers: {sorted(selected)}")
+    if previously_selected:
+        print(f"Previously selected in this push: {sorted(previously_selected)}")
+    if newly_selected != parsed_selected:
+        print(f"Newly selected in this reply: {sorted(newly_selected)}")
     current_timestamp = datetime.now()
     feedback_strength_multiplier, feedback_latency_seconds = estimate_feedback_strength_multiplier(push_id, current_timestamp)
     history_before_update = get_recent_selected_papers(
@@ -515,7 +605,7 @@ def process_feedback(
     )
 
     # 2. 记录行为日志
-    for paper_num in selected:
+    for paper_num in newly_selected:
         idx = paper_num - 1
         if 0 <= idx < len(papers):
             paper = papers[idx]
@@ -535,28 +625,46 @@ def process_feedback(
                 }
             )
 
-    # 记录未选择的论文（跳过的）
     all_numbers = set(range(1, len(papers) + 1))
     skipped = all_numbers - selected
-    for paper_num in skipped:
-        idx = paper_num - 1
-        if 0 <= idx < len(papers):
-            paper = papers[idx]
-            paper_id = paper.get("id")
+    if previously_selected and (newly_selected or parsed_selected):
+        log_behavior(
+            user_id=user_id,
+            push_id=push_id,
+            paper_id=None,
+            action="selection_amended",
+            action_type="selection_state",
+            category="incremental",
+            metadata={
+                "previously_selected": sorted(previously_selected),
+                "newly_selected": sorted(newly_selected),
+                "cumulative_selected": sorted(selected),
+                "reply": reply,
+            },
+        )
 
-            log_behavior(
-                user_id=user_id,
-                push_id=push_id,
-                paper_id=paper_id,
-                action="skipped",
-                action_type="skipped",
-                category=paper.get("category", "unknown"),
-                metadata={
-                    "paper_number": paper_num,
-                    "arxiv_id": paper.get("arxiv_id"),
-                    "push_context": "daily_push",
-                }
-            )
+    should_log_skipped = is_none_command or not previously_selected
+    if should_log_skipped:
+        for paper_num in skipped:
+            idx = paper_num - 1
+            if 0 <= idx < len(papers):
+                paper = papers[idx]
+                paper_id = paper.get("id")
+
+                log_behavior(
+                    user_id=user_id,
+                    push_id=push_id,
+                    paper_id=paper_id,
+                    action="skipped",
+                    action_type="skipped",
+                    category=paper.get("category", "unknown"),
+                    metadata={
+                        "paper_number": paper_num,
+                        "arxiv_id": paper.get("arxiv_id"),
+                        "push_context": "daily_push",
+                        "selection_state": "explicit_none" if is_none_command else "initial_unselected",
+                    }
+                )
 
     skip_profile_learning = reply_lower == "all lock"
     reliability_note = ""
@@ -564,15 +672,20 @@ def process_feedback(
     if skip_profile_learning:
         reliability_note = "本次使用了 all lock 快捷模式，我会把它视为忙碌日结果，只保留阅读队列，不把这次反馈计入偏好学习。"
     else:
-        updated_profile = update_profile_based_on_selection(
-            user_id,
-            list(selected),
-            papers,
-            skipped_paper_ids=list(skipped),
-            historical_selected_papers=history_before_update,
-            current_timestamp=current_timestamp,
-            feedback_strength_multiplier=feedback_strength_multiplier,
-        )
+        selected_for_learning = set(selected) if not previously_selected else set(newly_selected)
+        skipped_for_learning = set(skipped) if (is_none_command or not previously_selected) else set()
+        if selected_for_learning or skipped_for_learning or is_none_command:
+            updated_profile = update_profile_based_on_selection(
+                user_id,
+                list(selected_for_learning),
+                papers,
+                skipped_paper_ids=list(skipped_for_learning),
+                historical_selected_papers=history_before_update,
+                current_timestamp=current_timestamp,
+                feedback_strength_multiplier=feedback_strength_multiplier,
+            )
+        else:
+            updated_profile = get_profile(user_id) or {}
         drift_state = (updated_profile or {}).get("drift_state", {}) or {}
         log_behavior(
             user_id=user_id,
@@ -589,6 +702,9 @@ def process_feedback(
                 "interest_vector_descriptor": _build_interest_vector_descriptor(updated_profile or {}),
                 "selected_count": len(selected),
                 "skipped_count": len(skipped),
+                "newly_selected_count": len(newly_selected),
+                "previously_selected_count": len(previously_selected),
+                "skipped_for_learning_count": len(skipped_for_learning if not skip_profile_learning else []),
                 "feedback_latency_seconds": round(float(feedback_latency_seconds), 2) if feedback_latency_seconds is not None else None,
                 "feedback_strength_multiplier": round(float(feedback_strength_multiplier), 4),
                 "explanation": drift_state.get("explanation", ""),
@@ -605,6 +721,9 @@ def process_feedback(
         selected,
         len(papers),
         papers,
+        newly_selected=newly_selected,
+        previously_selected=set() if is_none_command else previously_selected,
+        skipped_label="跳过" if is_none_command else "暂未选择",
         profile_updated=not skip_profile_learning,
         reliability_note=reliability_note,
     )
@@ -617,11 +736,12 @@ def process_feedback(
     reading_report_error: Optional[str] = None
     should_create_reports = auto_create_reports if auto_create_reports is not None else send_to_feishu
 
-    if should_create_reports and selected:
+    report_selection = newly_selected if previously_selected else selected
+    if should_create_reports and report_selection:
         try:
             created_docs = create_reading_reports_for_selection(
                 user_id=user_id,
-                selected=selected,
+                selected=report_selection,
                 papers=papers,
                 target_id=target_id,
                 use_chat_id=use_chat_id,
@@ -641,6 +761,8 @@ def process_feedback(
     return {
         "status": "success",
         "selected_count": len(selected),
+        "newly_selected_count": len(newly_selected),
+        "previously_selected_count": len(previously_selected),
         "skipped_count": len(skipped),
         "selection_rate": len(selected) / len(papers) if papers else 0,
         "reading_reports_created": len(created_docs),

@@ -286,6 +286,7 @@ def test_synthesize_reading_report_with_llm_uses_local_provider(monkeypatch):
 
     assert result["recommendation_label"] == "推荐阅读"
     assert result["main_contributions"][0] == "提出两阶段流程"
+    assert result["generation_provider"] == "local"
     assert "Scientific Planner" in captured["user_text"]
     assert "科研论文精读助手" in captured["system_prompt"]
 
@@ -322,6 +323,8 @@ def test_synthesize_reading_report_with_llm_uses_hf_api_provider(monkeypatch):
 
     assert result["recommendation_label"] == "推荐阅读"
     assert result["reading_focus"][0] == "优先阅读方法设计和反馈实验"
+    assert result["generation_provider"].startswith("huggingface:")
+    assert result["generation_model"]
 
 
 def test_synthesize_reading_report_with_llm_uses_reading_timeout_override(monkeypatch):
@@ -356,6 +359,8 @@ def test_synthesize_reading_report_with_llm_uses_reading_timeout_override(monkey
     assert result["recommendation_label"] == "推荐阅读"
     assert captured["timeout_override"] == 180.0
     assert captured["max_tokens"] >= 4096
+    assert result["generation_provider"]
+    assert result["generation_model"]
 
 
 def test_synthesize_reading_report_with_llm_includes_retrieved_evidence_in_prompt(monkeypatch):

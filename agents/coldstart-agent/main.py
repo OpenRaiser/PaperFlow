@@ -1879,16 +1879,19 @@ if __name__ == "__main__":
     parser.add_argument("--pdf", nargs="+", help="PDF file paths")
     parser.add_argument("--scholar-url", type=str, help="Google Scholar URL")
     parser.add_argument("--homepage-url", type=str, help="Research homepage URL")
+    parser.add_argument("--reset-existing", action="store_true", help="Reset existing profile before cold start")
     parser.add_argument("--send-feishu", action="store_true", help="Send to Feishu")
     parser.add_argument("--feishu-user-id", type=str, help="Feishu user ID")
+    parser.add_argument("--chat-id", type=str, help="Feishu/Lark chat ID")
 
     args = parser.parse_args()
 
     role = args.role.lower()
-    user_id = f"user_{role}" if role.startswith("role") else args.user_id
+    explicit_user_id = any(arg == "--user-id" or arg.startswith("--user-id=") for arg in sys.argv)
+    user_id = f"user_{role}" if role.startswith("role") and not explicit_user_id else args.user_id
     baseline_pdf_path = resolve_baseline_pdf_path(user_id)
 
-    if role == "rolea" and not args.natural_language and not baseline_pdf_path:
+    if role == "rolea" and not explicit_user_id and not args.natural_language and not baseline_pdf_path:
         natural_language = (
             "我关注 data-native scientific discovery，"
             "具体做生物分子数据基础设施和方法论图谱，"
@@ -1903,6 +1906,8 @@ if __name__ == "__main__":
         pdf_paths=args.pdf,
         scholar_url=args.scholar_url,
         homepage_url=args.homepage_url,
+        reset_existing=args.reset_existing,
         send_to_feishu=args.send_feishu,
         feishu_user_id=args.feishu_user_id,
+        chat_id=args.chat_id,
     )

@@ -82,22 +82,69 @@ models/
 
 All runtime artifacts under `data/` and `models/` are ignored by Git.
 
-## 6. First daily run
+## 6. Create your first user profile (REQUIRED)
+
+PaperFlow keeps **one profile per `user_id`**, and every other command
+(`daily`, `read`, `feedback`) reads from it. **You must create a profile
+before the first `paperflow daily` call** — otherwise there's no
+personalization signal to score against, and `paperflow read` has no push to
+read from.
+
+A quick cold start can use a self-description:
 
 ```bash
-paperflow daily --user-id alice --days 1 --output daily_push.txt --dry-run
+paperflow profile \
+  --user-id user_alice \
+  --natural-language "I study LLM agents for scientific discovery, literature mining, and automated paper reading."
+```
+
+You can enrich the same user with local PDFs, a Google Scholar page, or a
+research homepage:
+
+```bash
+paperflow profile --user-id user_alice --pdf /path/to/my-paper.pdf
+paperflow profile --user-id user_alice --scholar-url "https://scholar.google.com/citations?user=..."
+paperflow profile --user-id user_alice --homepage-url "https://example.edu/~alice"
+```
+
+Use `--reset-existing` only when you want to rebuild the profile instead of
+merging new signals into it.
+
+Inspect what was bootstrapped:
+
+```bash
+python scripts/show_profile.py user_alice
+```
+
+## 7. First daily run
+
+```bash
+paperflow daily --user-id user_alice --days 1 --output daily_push.txt --dry-run
 ```
 
 `--dry-run` computes recommendations without sending any push, so you can see
 the Top-20 stream and verify scoring before wiring up a notification channel.
 
-## 7. (Optional) Feishu/Lark deployment
+## 8. Read selected papers from that push
+
+The daily push lists candidate paper IDs. Pass them straight to `paperflow
+read` to get personalized reading reports:
+
+```bash
+paperflow read 1 3 7 --user-id user_alice --no-feishu
+```
+
+By default `paperflow read` pulls papers from the **latest push** for that
+user. Use `--push-id <push_id>` to read from a specific historical push
+instead.
+
+## 9. (Optional) Feishu/Lark deployment
 
 If you want PaperFlow to push daily cards to a Feishu/Lark group, set up the
 webhook server in [feishu-webhook-setup.md](feishu-webhook-setup.md). For most
 users, the CLI is enough.
 
-## 8. (Optional) Run the benchmark
+## 10. (Optional) Run the benchmark
 
 ```bash
 python experiments/benchmark/fetch_benchmark.py \

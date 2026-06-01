@@ -85,7 +85,7 @@ READING_REPORT_EVIDENCE_VERSION = (
     or "2026-04-27-v4"
 )
 READING_REPORT_EVIDENCE_CACHE_ENABLED = os.environ.get("READING_REPORT_EVIDENCE_CACHE_ENABLED", "1").strip().lower() not in {"0", "false", "off", "no"}
-READING_REPORT_OUTPUT_VERSION = os.environ.get("READING_REPORT_OUTPUT_VERSION", "2026-04-14-v1").strip() or "2026-04-14-v1"
+READING_REPORT_OUTPUT_VERSION = os.environ.get("READING_REPORT_OUTPUT_VERSION", "2026-05-31-v4").strip() or "2026-05-31-v4"
 READING_REPORT_PROFILE_RETRIEVAL_WEIGHT = float(os.environ.get("READING_REPORT_PROFILE_RETRIEVAL_WEIGHT", "0.25"))
 HTTP_RETRY_TOTAL = int(os.environ.get("PAPERFLOW_HTTP_RETRIES", "2"))
 HTTP_RETRY_BACKOFF = float(os.environ.get("PAPERFLOW_HTTP_BACKOFF", "0.8"))
@@ -626,7 +626,7 @@ def build_recommendation_calibration_metadata(
     }
 
 
-def _format_markdown_link(label: str, url: str) -> str:
+def _format_plain_url(url: str) -> str:
     clean_url = _clean_text(url)
     if clean_url.startswith("http://") or clean_url.startswith("https://"):
         return clean_url
@@ -689,20 +689,101 @@ def _build_resource_items(paper: Dict[str, Any]) -> List[Tuple[str, str]]:
     pdf_url = _get_direct_pdf_url(paper)
 
     items: List[Tuple[str, str]] = []
-    items.append(("代码", _format_markdown_link("代码链接", code_url) if code_url else "暂未发现公开链接"))
-    items.append(("数据", _format_markdown_link("数据链接", dataset_url) if dataset_url else "暂未发现公开链接"))
-    items.append(("项目主页", _format_markdown_link("项目主页", project_url) if project_url else "暂未发现公开链接"))
-    items.append(("原文 PDF", _format_markdown_link("PDF", pdf_url) if pdf_url else "暂未发现公开链接"))
+    items.append(("代码", _format_plain_url(code_url) if code_url else "暂未发现公开链接"))
+    items.append(("数据", _format_plain_url(dataset_url) if dataset_url else "暂未发现公开链接"))
+    items.append(("项目主页", _format_plain_url(project_url) if project_url else "暂未发现公开链接"))
+    items.append(("原文 PDF", _format_plain_url(pdf_url) if pdf_url else "暂未发现公开链接"))
 
     arxiv_id = _clean_text(paper.get("arxiv_id"))
     if arxiv_id:
-        items.append(("arXiv", _format_markdown_link(arxiv_id, f"https://arxiv.org/abs/{arxiv_id}")))
+        items.append(("arXiv", _format_plain_url(f"https://arxiv.org/abs/{arxiv_id}")))
 
     doi = _clean_text(paper.get("doi"))
     if doi:
-        items.append(("DOI", _format_markdown_link(doi, f"https://doi.org/{doi}")))
+        items.append(("DOI", _format_plain_url(f"https://doi.org/{doi}")))
 
     return items
+
+
+def _format_subjects(paper: Dict[str, Any]) -> str:
+    for key in ("subjects", "categories", "category", "primary_category", "tags", "topics"):
+        value = paper.get(key)
+        if value in (None, "", [], {}):
+            continue
+        if isinstance(value, dict):
+            values = [str(item).strip() for item in value.values() if str(item).strip()]
+        elif isinstance(value, (list, tuple, set)):
+            values = [str(item).strip() for item in value if str(item).strip()]
+        else:
+            values = [str(value).strip()]
+        if values:
+            return ", ".join(_unique_preserve_order(values))
+    return "未知"
+
+
+def _collect_report_action_pairs(paper: Dict[str, Any]) -> List[Tuple[str, str]]:
+    candidates: List[Tuple[str, str]] = []
+    pdf_url = _get_direct_pdf_url(paper)
+    if pdf_url:
+        candidates.append(("PDF", pdf_url))
+
+    arxiv_id = _clean_text(paper.get("arxiv_id"))
+    paper_url = _get_first_url(
+        paper,
+        "paper_url",
+        "openreview_url",
+        "cvf_url",
+        "ecva_url",
+        "dblp_url",
+        "doi_url",
+        "url",
+    )
+    if not paper_url and arxiv_id:
+        paper_url = f"https://arxiv.org/abs/{arxiv_id}"
+    if paper_url:
+        candidates.append(("原文", paper_url))
+
+    code_url = _get_first_url(paper, "code_url", "github_url", "repo_url", "repository_url")
+    if code_url:
+        candidates.append(("代码", code_url))
+
+    project_url = _get_first_url(paper, "project_url")
+    if project_url:
+        candidates.append(("项目", project_url))
+
+    seen: set[str] = set()
+    pairs: List[Tuple[str, str]] = []
+    for label, url in candidates:
+        clean_url = _clean_text(url)
+        if not clean_url or clean_url in seen:
+            continue
+        seen.add(clean_url)
+        pairs.append((label, clean_url))
+    return pairs
+
+
+def _build_report_action_links(paper: Dict[str, Any]) -> str:
+    """Bullet list of action URLs (Feishu-safe, one URL per line)."""
+    return "\n".join(f"- {label}: {url}" for label, url in _collect_report_action_pairs(paper))
+
+
+def _append_qa_block(lines: List[str], label: str, question: str, body: Any) -> None:
+    """Append a single-layer Q/A block in papers.cool style."""
+    lines.append(f"### {label} {question}")
+    lines.append("")
+    if isinstance(body, (list, tuple)):
+        any_item = False
+        for item in body:
+            text = _clean_text(item)
+            if text:
+                lines.append(f"- {text}")
+                any_item = True
+        if not any_item:
+            lines.append("当前信息不足，建议回到原文核对。")
+    else:
+        text = _clean_text(body)
+        lines.append(text or "当前信息不足，建议回到原文核对。")
+    lines.append("")
 
 
 def _build_recommendation_reason(payload: Dict[str, Any]) -> str:
@@ -2380,6 +2461,78 @@ def _infer_section_from_abstract(abstract: str, section_type: str) -> str:
         return " ".join(sentences[mid:mid+2]) if len(sentences) > 2 else sentences[mid] if sentences else ""
 
 
+def _extract_heuristic_keywords(
+    paper: Dict[str, Any],
+    abstract: str,
+    parsed_pdf: Optional[Dict[str, Any]] = None,
+) -> List[str]:
+    """Heuristic keyword extraction (fallback when LLM doesn't return keywords).
+
+    Picks 5-8 short noun phrases from title + abstract by frequency,
+    excluding stopwords. Each phrase is 1-3 lowercase words.
+    """
+    title = _clean_text(paper.get("title")) or ""
+    abstract_text = _clean_text(abstract) or ""
+    pdf_text = ""
+    if parsed_pdf:
+        pdf_text = _clean_text(parsed_pdf.get("abstract") or parsed_pdf.get("body_text") or "")
+    corpus = " ".join(filter(None, [title, abstract_text, pdf_text[:2000]])).lower()
+    if not corpus:
+        return []
+
+    stop = {
+        "the", "a", "an", "and", "or", "of", "to", "in", "on", "for", "with",
+        "by", "is", "are", "was", "were", "be", "been", "being", "this", "that",
+        "these", "those", "we", "our", "ours", "i", "me", "my", "they", "them",
+        "their", "it", "its", "as", "at", "from", "into", "than", "but",
+        "can", "could", "may", "might", "must", "should", "would", "will",
+        "have", "has", "had", "do", "does", "did", "not", "no", "yes", "if",
+        "while", "such", "more", "most", "less", "least", "very", "much",
+        "however", "thus", "hence", "also", "only", "even", "still", "yet",
+        "show", "shows", "showed", "shown", "use", "used", "using", "uses",
+        "propose", "proposed", "proposes", "proposing", "present", "presents",
+        "presented", "presenting", "introduce", "introduces", "introduced",
+        "achieve", "achieves", "achieved", "based", "method", "methods",
+        "approach", "approaches", "model", "models", "result", "results",
+        "paper", "papers", "study", "studies", "studied", "work", "works",
+        "experiment", "experiments", "task", "tasks", "data", "dataset",
+        "datasets", "table", "tables", "figure", "figures", "section",
+        "sections", "appendix", "et", "al", "etc", "ie", "eg",
+    }
+    tokens = re.findall(r"[a-z][a-z0-9\-]+", corpus)
+    tokens = [t for t in tokens if t not in stop and len(t) > 2]
+
+    bigrams = [f"{tokens[i]} {tokens[i + 1]}" for i in range(len(tokens) - 1)]
+    bigrams = [b for b in bigrams if not any(w in stop for w in b.split())]
+
+    counts: Dict[str, int] = {}
+    for token in tokens:
+        counts[token] = counts.get(token, 0) + 1
+    bigram_counts: Dict[str, int] = {}
+    for bigram in bigrams:
+        bigram_counts[bigram] = bigram_counts.get(bigram, 0) + 1
+
+    picked: List[str] = []
+    for bigram, count in sorted(bigram_counts.items(), key=lambda kv: (-kv[1], kv[0])):
+        if count < 2:
+            break
+        picked.append(bigram)
+        if len(picked) >= 5:
+            break
+
+    bigram_words = {word for phrase in picked for word in phrase.split()}
+    for token, count in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])):
+        if count < 3 or token in bigram_words:
+            continue
+        if token in {p.split()[0] for p in picked} | {p.split()[-1] for p in picked}:
+            continue
+        picked.append(token)
+        if len(picked) >= 8:
+            break
+
+    return picked[:8]
+
+
 def build_heuristic_report_payload(
     paper: Dict[str, Any],
     user_profile: Dict[str, Any],
@@ -2521,6 +2674,7 @@ def build_heuristic_report_payload(
         )[:4]
     field_evidence_map = _build_field_evidence_map(retrieved_evidence)
     report_evidence_anchors = _build_report_evidence_anchors(retrieved_evidence)
+    keywords = _extract_heuristic_keywords(paper, abstract, parsed_pdf)
 
     return {
         "abstract": abstract,
@@ -2532,9 +2686,12 @@ def build_heuristic_report_payload(
         "limitations": limitations[:3],
         "relevance_points": relevance_points,
         "reading_focus": _unique_preserve_order(reading_focus)[:4],
+        "keywords": keywords,
         "estimated_reading_minutes": _estimate_reading_minutes(parsed_pdf, abstract),
         "analysis_source": "pdf" if parsed_source_kind == "pdf" else ("source_page" if parsed_source_kind == "source_page" else "abstract"),
         "analysis_note": analysis_note,
+        "generation_provider": "heuristic",
+        "generation_model": "PaperFlow template",
         "recommendation_label": calibrate_recommendation_label(
             paper,
             _recommendation_label(paper),
@@ -2614,9 +2771,18 @@ def _merge_report_payload(base: Dict[str, Any], llm_payload: Optional[Dict[str, 
         if values:
             merged[key] = values
 
+    keyword_values = _normalize_string_list(llm_payload.get("keywords"), limit=8)
+    if keyword_values:
+        merged["keywords"] = keyword_values
+
     recommendation_label = _clean_text(llm_payload.get("recommendation_label"))
     if recommendation_label:
         merged["recommendation_label"] = recommendation_label
+
+    for key in ("generation_provider", "generation_model"):
+        value = _clean_text(llm_payload.get(key))
+        if value:
+            merged[key] = value
 
     return merged
 
@@ -2692,6 +2858,10 @@ def generate_reading_report(
     )
     analysis_note = _clean_text(payload.get("analysis_note"))
     resource_items = _build_resource_items(paper)
+    action_links = _build_report_action_links(paper)
+    subjects = _format_subjects(paper)
+    generation_provider = _clean_text(payload.get("generation_provider")) or "heuristic"
+    generation_model = _clean_text(payload.get("generation_model")) or "PaperFlow template"
     recommendation_reason = _build_recommendation_reason(payload)
     report_evidence_anchors = payload.get("report_evidence_anchors") or {}
     field_evidence_map = payload.get("field_evidence_map") or {}
@@ -2699,73 +2869,80 @@ def generate_reading_report(
     lines = []
     lines.append(f"# {title}")
     lines.append("")
-    lines.append("## 基本信息")
+    if action_links:
+        lines.append(action_links)
+        lines.append("")
+
+    lines.append(f"> {recommendation_stars} {recommendation_label} · 约 {int(payload.get('estimated_reading_minutes') or 8)} 分钟 · 模型 {generation_provider}/{generation_model} · 证据 {analysis_source_label}")
     lines.append("")
-    lines.append(f"- 作者：{_format_authors(paper.get('authors'))}")
-    lines.append(f"- 机构：{_clean_text(paper.get('institution')) or '未提供'}")
-    lines.append(f"- 来源：{_clean_text(paper.get('venue') or paper.get('journal') or paper.get('source')) or '未知'}")
-    lines.append(f"- 日期：{_clean_text(paper.get('publish_date')) or '未知'}")
-    lines.append(f"- 推荐级别：**{recommendation_label}**")
-    lines.append(f"- 预计阅读时间：约 {int(payload.get('estimated_reading_minutes') or 8)} 分钟")
-    lines.append(f"- 解析来源：{analysis_source_label}")
-    if arxiv_id:
-        lines.append(f"- arXiv ID：`{arxiv_id}`")
-    if doi:
-        lines.append(f"- DOI：`{doi}`")
-    lines.append("")
+
+    keywords = payload.get("keywords") or []
+    if isinstance(keywords, (list, tuple)):
+        clean_keywords = [str(k).strip() for k in keywords if str(k).strip()]
+    else:
+        clean_keywords = []
+    if clean_keywords:
+        lines.append(f"🏷 关键词：{' · '.join(clean_keywords[:8])}")
+        lines.append("")
 
     lines.append("## 一句话总结")
     lines.append("")
     lines.append(payload.get("one_sentence_summary") or "当前没有足够信息生成一句话总结。")
     lines.append("")
 
-    lines.append("## 摘要速览")
+    lines.append("## 摘要")
     lines.append("")
     for paragraph in _clean_text(abstract).split("\n"):
         if paragraph.strip():
             lines.append(f"> {paragraph.strip()}")
     lines.append("")
 
-    lines.append("## 研究背景")
-    lines.append("")
-    lines.append(payload.get("research_background") or "建议先回到原文摘要和引言确认研究问题。")
-    lines.append("")
-
-    lines.append("## 核心方法")
-    lines.append("")
-    lines.append(payload.get("core_method") or "当前未成功提炼方法细节，请重点阅读 Method / Approach 部分。")
-    lines.append("")
-
-    lines.append("## 主要结果")
-    lines.append("")
-    lines.append(payload.get("key_results") or "当前没有提炼出明确结果，请重点核对实验表格和主要指标。")
-    lines.append("")
-
-    lines.append("## 创新点")
-    lines.append("")
-    for index, item in enumerate(payload.get("main_contributions") or [], start=1):
-        lines.append(f"{index}. {item}")
-    lines.append("")
-
-    lines.append("## 局限性")
-    lines.append("")
-    for item in payload.get("limitations") or []:
-        lines.append(f"- {item}")
-    lines.append("")
-
-    lines.append("## 与我的研究的关系")
-    lines.append("")
-    for item in payload.get("relevance_points") or []:
-        lines.append(f"- {item}")
-    lines.append("")
-
-    lines.append("## 建议怎么读")
-    lines.append("")
+    _append_qa_block(
+        lines,
+        "Q1",
+        "这篇论文试图解决什么问题？",
+        payload.get("research_background") or "建议先回到原文摘要和引言确认研究问题。",
+    )
+    _append_qa_block(
+        lines,
+        "Q2",
+        "它提出了什么方法？",
+        payload.get("core_method") or "当前未成功提炼方法细节，请重点阅读 Method / Approach 部分。",
+    )
+    _append_qa_block(
+        lines,
+        "Q3",
+        "主要结果是什么？",
+        payload.get("key_results") or "当前没有提炼出明确结果，请重点核对实验表格和主要指标。",
+    )
+    _append_qa_block(
+        lines,
+        "Q4",
+        "主要贡献或创新点是什么？",
+        payload.get("main_contributions") or [],
+    )
+    _append_qa_block(
+        lines,
+        "Q5",
+        "局限性和注意事项是什么？",
+        payload.get("limitations") or [],
+    )
+    _append_qa_block(
+        lines,
+        "Q6",
+        "这篇论文和我的研究有什么关系？",
+        payload.get("relevance_points") or [],
+    )
+    reading_plan = []
     if analysis_note:
-        lines.append(f"- {analysis_note}")
-    for item in payload.get("reading_focus") or []:
-        lines.append(f"- {item}")
-    lines.append("")
+        reading_plan.append(analysis_note)
+    reading_plan.extend(payload.get("reading_focus") or [])
+    _append_qa_block(
+        lines,
+        "Q7",
+        "我应该怎么读？",
+        reading_plan,
+    )
 
     if report_evidence_anchors:
         bucket_labels = {
@@ -2787,6 +2964,29 @@ def generate_reading_report(
                 lines.append(f"  {item}")
         lines.append("")
 
+    lines.append("## 推荐指数")
+    lines.append("")
+    lines.append(f"{recommendation_stars}（{recommendation_score}/5）")
+    lines.append(f"- 推荐理由：{recommendation_reason}")
+    lines.append("")
+
+    lines.append("## 基本信息")
+    lines.append("")
+    lines.append(f"- 作者：{_format_authors(paper.get('authors'))}")
+    lines.append(f"- 机构：{_clean_text(paper.get('institution')) or '未提供'}")
+    lines.append(f"- 来源：{_clean_text(paper.get('venue') or paper.get('journal') or paper.get('source')) or '未知'}")
+    lines.append(f"- 主题/分类：{subjects}")
+    lines.append(f"- 日期：{_clean_text(paper.get('publish_date')) or '未知'}")
+    lines.append(f"- 推荐级别：**{recommendation_label}**")
+    lines.append(f"- 预计阅读时间：约 {int(payload.get('estimated_reading_minutes') or 8)} 分钟")
+    lines.append(f"- 解析来源：{analysis_source_label}")
+    lines.append(f"- 生成模型：{generation_provider} / {generation_model}")
+    if arxiv_id:
+        lines.append(f"- arXiv ID：`{arxiv_id}`")
+    if doi:
+        lines.append(f"- DOI：`{doi}`")
+    lines.append("")
+
     lines.append("## 代码与资源")
     lines.append("")
     for label, value in resource_items:
@@ -2801,22 +3001,7 @@ def generate_reading_report(
         lines.append(f"- 结果证据锚点：{result_evidence[0]}")
     lines.append("")
 
-    lines.append("## 推荐指数")
-    lines.append("")
-    lines.append(f"{recommendation_stars}（{recommendation_score}/5）")
-    lines.append(f"- 推荐理由：{recommendation_reason}")
-    lines.append("")
-
-    lines.append("## 我的笔记")
-    lines.append("")
-    lines.append("- 我最想复现或借鉴的点：")
-    lines.append("- 这篇论文和我当前方向的连接：")
-    lines.append("- 下一步要不要继续追作者 / 代码 / 后续工作：")
-    lines.append("")
-    lines.append("---")
-    lines.append("")
-    lines.append(f"*报告生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M')}*")
-    return "\n".join(lines)
+    return "\n".join(lines).rstrip() + "\n"
 
 
 def resolve_selected_papers(paper_refs: List[int], papers: List[Dict]) -> List[Dict]:

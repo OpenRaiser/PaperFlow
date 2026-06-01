@@ -1236,33 +1236,62 @@ def _generate_json_with_configured_llm(
     timeout_override: Optional[float] = None,
 ) -> Optional[Dict[str, Any]]:
     """Generate a JSON response using the configured parser backend."""
+    def annotate(result: Optional[Dict[str, Any]], provider: str, model: str) -> Optional[Dict[str, Any]]:
+        if not isinstance(result, dict):
+            return result
+        annotated = dict(result)
+        annotated.setdefault("generation_provider", provider)
+        annotated.setdefault("generation_model", model)
+        return annotated
+
     provider = _get_llm_parser_provider()
     if provider == "disabled":
         return None
 
     if provider in {"local", "auto"}:
+        local_model_path = _get_local_llm_model_path()
         local_result = _generate_json_with_local_llm(
             system_prompt,
             user_text,
             max_new_tokens=max_tokens,
         )
         if local_result is not None or provider == "local":
-            return local_result
+            local_model = local_model_path.name if local_model_path else "LOCAL_LLM_MODEL_PATH"
+            return annotate(local_result, "local", local_model)
 
     if provider in {"hf_api", "auto"}:
         hf_result = _generate_json_with_hf_api(system_prompt, user_text, max_tokens=max_tokens)
         if hf_result is not None or provider == "hf_api":
-            return hf_result
+            hf_provider = _resolve_hf_provider("HF_LLM_PROVIDER")
+            return annotate(hf_result, f"huggingface:{hf_provider}", _get_hf_llm_model())
 
     if provider in {"openai", "auto"}:
-        return _generate_json_with_openai(
+        openai_result = _generate_json_with_openai(
             system_prompt,
             user_text,
             max_tokens=max_tokens,
             timeout_override=timeout_override,
         )
+        raw_provider = os.environ.get("LLM_PARSER_PROVIDER", "").strip().lower()
+        openai_provider = (
+            "dashscope"
+            if raw_provider in {"dashscope", "aliyun", "bailian"} or _should_prefer_dashscope_credentials()
+            else "openai-compatible"
+        )
+        model = _get_first_env_value("LLM_PARSER_OPENAI_MODEL", "DASHSCOPE_LLM_MODEL") or "gpt-4o-mini"
+        return annotate(openai_result, openai_provider, model)
 
     return None
+
+
+def _fallback_generation_metadata() -> Dict[str, str]:
+    provider = os.environ.get("LLM_PARSER_PROVIDER", "auto").strip() or "auto"
+    model = (
+        _get_first_env_value("LLM_PARSER_OPENAI_MODEL", "DASHSCOPE_LLM_MODEL", "HF_LLM_MODEL")
+        or (_get_local_llm_model_path().name if _get_local_llm_model_path() else "")
+        or "configured-llm"
+    )
+    return {"generation_provider": provider, "generation_model": model}
 
 
 def parse_intent_with_llm(text: str, known_topics: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
@@ -1648,8 +1677,9 @@ def synthesize_reading_report_with_llm(
         "可以改写证据，不要大段逐字复制。"
         "只输出 JSON 对象，不要 Markdown，不要解释，不要代码块。字段包括："
         "one_sentence_summary, research_background, core_method, key_results, "
-        "main_contributions, limitations, relevance_points, reading_focus, recommendation_label, analysis_note。"
-        "main_contributions, limitations, relevance_points, reading_focus 必须是字符串数组；其他字段是字符串。"
+        "main_contributions, limitations, relevance_points, reading_focus, keywords, recommendation_label, analysis_note。"
+        "main_contributions, limitations, relevance_points, reading_focus, keywords 必须是字符串数组；其他字段是字符串。"
+        "keywords 用 5-8 个英文小写短语，按论文核心话题排序，例如 [\"diffusion model\", \"video generation\", \"long context\"]。"
         "analysis_note 用一句话说明本次生成是否参考了 PDF 检索证据。"
         "其中 recommendation_label 只能是“强烈推荐”“推荐阅读”“值得快速浏览”“按需阅读”之一。"
     )
@@ -1662,6 +1692,9 @@ def synthesize_reading_report_with_llm(
     )
     if not isinstance(result, dict):
         return None
+    fallback_metadata = _fallback_generation_metadata()
+    result.setdefault("generation_provider", fallback_metadata["generation_provider"])
+    result.setdefault("generation_model", fallback_metadata["generation_model"])
 
     normalized: Dict[str, Any] = {}
     for key in ("one_sentence_summary", "research_background", "core_method", "key_results", "recommendation_label", "analysis_note"):
@@ -1669,7 +1702,12 @@ def synthesize_reading_report_with_llm(
         if value:
             normalized[key] = value
 
-    for key in ("main_contributions", "limitations", "relevance_points", "reading_focus"):
+    for key in ("generation_provider", "generation_model"):
+        value = str(result.get(key, "")).strip()
+        if value:
+            normalized[key] = value
+
+    for key in ("main_contributions", "limitations", "relevance_points", "reading_focus", "keywords"):
         values = _clean_generated_list(result.get(key))
         if values:
             normalized[key] = values

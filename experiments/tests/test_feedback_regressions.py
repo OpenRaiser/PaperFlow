@@ -170,6 +170,72 @@ def test_build_learning_signals_includes_contrastive_pair_explanation():
     assert any("你选了 01" in signal and "跳过了 02" in signal for signal in signals)
 
 
+def test_incremental_feedback_merges_previous_selection_for_same_push(
+    test_db_path,
+    sample_profile,
+    monkeypatch,
+):
+    _use_test_db(test_db_path)
+
+    profile = copy.deepcopy(sample_profile)
+    profile["user_id"] = "user_rolea"
+    db_ops.create_profile("user_rolea", profile)
+
+    papers = [
+        {
+            "id": idx + 1,
+            "title": f"Paper {idx + 1}",
+            "authors": ["Alice"],
+            "category": "high_relevant" if idx < 4 else "maybe_interested",
+        }
+        for idx in range(5)
+    ]
+
+    first_result = feedback_agent.process_feedback(
+        user_id="user_rolea",
+        push_id="push_incremental",
+        reply="1 2 3",
+        papers=papers,
+        send_to_feishu=False,
+    )
+
+    captured = {}
+
+    def fake_send_text(target_id, text, use_chat_id=False):
+        captured.setdefault("messages", []).append(text)
+        return {"ok": True}
+
+    def fake_create_reports(**kwargs):
+        captured["report_kwargs"] = kwargs
+        return []
+
+    monkeypatch.setattr(feedback_agent, "send_text", fake_send_text)
+    monkeypatch.setattr(feedback_agent, "create_reading_reports_for_selection", fake_create_reports)
+
+    second_result = feedback_agent.process_feedback(
+        user_id="user_rolea",
+        push_id="push_incremental",
+        reply="4",
+        papers=papers,
+        chat_id="oc_rolea",
+        send_to_feishu=True,
+    )
+
+    summary = captured["messages"][0]
+
+    assert first_result["selected_count"] == 3
+    assert second_result["selected_count"] == 4
+    assert second_result["newly_selected_count"] == 1
+    assert second_result["previously_selected_count"] == 3
+    assert second_result["skipped_count"] == 1
+    assert "累计选择：01-04（4 篇）" in summary
+    assert "本次新增：04（1 篇）" in summary
+    assert "此前已选：01-03（3 篇）" in summary
+    assert "暂未选择：05（1 篇）" in summary
+    assert "暂未选择：01-03" not in summary
+    assert captured["report_kwargs"]["selected"] == {4}
+
+
 def test_process_feedback_triggers_reading_report_generation_for_selected_papers(
     test_db_path,
     sample_profile,
