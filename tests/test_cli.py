@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -16,6 +17,12 @@ runner = CliRunner()
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+
+
+def plain_output(value: str) -> str:
+    """Normalize Rich/Typer help output for CI assertions."""
+    return ANSI_RE.sub("", value)
 
 
 @pytest.fixture(autouse=True)
@@ -73,17 +80,19 @@ def test_cli_demo_runs_with_mock_providers() -> None:
 def test_cli_read_help_lists_arguments() -> None:
     result = runner.invoke(app, ["read", "--help"])
     assert result.exit_code == 0
-    assert "PAPER_IDS" in result.stdout.upper()
-    assert "--user-id" in result.stdout
-    assert "--push-id" in result.stdout
+    output = plain_output(result.stdout)
+    assert "PAPER_IDS" in output.upper()
+    assert "--user-id" in output
+    assert "--push-id" in output
 
 
 @pytest.mark.unit
 def test_cli_profile_help_lists_bootstrap_sources() -> None:
     result = runner.invoke(app, ["profile", "--help"])
     assert result.exit_code == 0
+    output = plain_output(result.stdout)
     for opt in ("--user-id", "--natural-language", "--pdf", "--scholar-url", "--homepage-url"):
-        assert opt in result.stdout
+        assert opt in output
 
 
 @pytest.mark.unit
@@ -139,32 +148,36 @@ def test_cli_profile_delegates_to_coldstart_agent(monkeypatch: pytest.MonkeyPatc
 def test_cli_feedback_help_lists_options() -> None:
     result = runner.invoke(app, ["feedback", "--help"])
     assert result.exit_code == 0
+    output = plain_output(result.stdout)
     for opt in ("--user-id", "--push-id", "--reply"):
-        assert opt in result.stdout
+        assert opt in output
 
 
 @pytest.mark.unit
 def test_cli_gui_help_lists_options() -> None:
     result = runner.invoke(app, ["gui", "--help"])
     assert result.exit_code == 0
+    output = plain_output(result.stdout)
     for opt in ("--host", "--port", "--no-browser"):
-        assert opt in result.stdout
+        assert opt in output
 
 
 @pytest.mark.unit
 def test_cli_daily_help_lists_options() -> None:
     result = runner.invoke(app, ["daily", "--help"])
     assert result.exit_code == 0
+    output = plain_output(result.stdout)
     for opt in ("--user-id", "--days", "--output", "--dry-run"):
-        assert opt in result.stdout
+        assert opt in output
 
 
 @pytest.mark.unit
 def test_cli_eval_help_lists_options() -> None:
     result = runner.invoke(app, ["eval", "--help"])
     assert result.exit_code == 0
+    output = plain_output(result.stdout)
     for opt in ("--benchmark-dir", "--predictions", "--output"):
-        assert opt in result.stdout
+        assert opt in output
 
 
 @pytest.mark.unit
