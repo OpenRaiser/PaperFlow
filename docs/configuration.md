@@ -78,6 +78,84 @@ Used when `PAPERFLOW_LLM_PROVIDER=ollama` or `PAPERFLOW_EMBED_PROVIDER=ollama`.
 | `LOG_LEVEL`                                | `INFO`                   | Python logging level                     |
 | `PAPERFLOW_SUPPRESS_HTTP_RETRY_WARNINGS`   | `true`                   | Hide noisy retry warnings                |
 | `PAPERFLOW_ALLOW_MOCK_PAPERS`              | `false`                  | Allow mock papers in real pipelines      |
+| `PAPERFLOW_PDF_DIR`                        | `./data/papers`          | Persistent PDF save directory            |
+| `PAPERFLOW_READING_REPORTS_DIR`            | `./data/reading_reports` | Persistent reading-report Markdown directory |
+| `PAPERFLOW_STORAGE_MONTHLY_SUBDIR`         | `false`                  | Append `arXiv - May 2026` style subfolders |
+| `PAPERFLOW_WRITE_FEISHU`                   | `false`                  | Let local GUI reading reports also create Feishu docs |
+| `PAPERFLOW_WIKI_INGEST`                    | `true`                   | Mirror runtime events into the local wiki |
+| `PAPERFLOW_WIKI_DIR`                       | `./data/wiki`            | Markdown mirror directory for wiki nodes |
+| `PAPERFLOW_MONTHLY_REPORT_DIR`             | `./data/wiki/monthly_reports` | Obsidian-friendly monthly report output directory |
+| `PAPERFLOW_TOPIC_INDEX_DIR`                | empty                    | Optional separate Topic Index output directory |
+
+## Obsidian-style local storage
+
+Set the PDF and reading-report directories to any local folder. For example,
+both can point to the same monthly Obsidian folder:
+
+```env
+PAPERFLOW_PDF_DIR=/Users/mario/Documents/Obsidian Vault/Daily Note/Daily Note 2026/arXiv - May 2026
+PAPERFLOW_READING_REPORTS_DIR=/Users/mario/Documents/Obsidian Vault/Daily Note/Daily Note 2026/arXiv - May 2026
+```
+
+If you prefer to configure only the year-level root and let PaperFlow create
+month folders, enable:
+
+```env
+PAPERFLOW_PDF_DIR=/Users/mario/Documents/Obsidian Vault/Daily Note/Daily Note 2026
+PAPERFLOW_READING_REPORTS_DIR=/Users/mario/Documents/Obsidian Vault/Daily Note/Daily Note 2026
+PAPERFLOW_STORAGE_MONTHLY_SUBDIR=true
+```
+
+With monthly subfolders enabled, PaperFlow writes files under names like
+`arXiv - May 2026`, based on the paper publish date when available.
+
+To export an Obsidian-friendly monthly reading summary and topic index into a
+Daily Note folder, set:
+
+```env
+PAPERFLOW_MONTHLY_REPORT_DIR=/Users/mario/Documents/Obsidian Vault/Daily Note/Daily Note 2026
+PAPERFLOW_TOPIC_INDEX_DIR=/Users/mario/Documents/Obsidian Vault/Daily Note/Daily Note 2026/topic index
+```
+
+Then run:
+
+```bash
+paperflow wiki monthly --user-id user_alice --month 2026-05
+```
+
+This writes `PaperFlow Monthly Report - 2026-05.md` and `Topic Index -
+2026-05.md`. You can override the configured directories for one run:
+
+```bash
+paperflow wiki monthly \
+  --user-id user_alice \
+  --month 2026-05 \
+  --output-dir "/Users/mario/Documents/Obsidian Vault/Daily Note/Daily Note 2026" \
+  --topic-index-dir "/Users/mario/Documents/Obsidian Vault/Daily Note/Daily Note 2026/topic index"
+```
+
+The GUI uses the same variables. In the GUI, the arXiv/PDF fields are input
+addresses; generated Markdown reports still go to
+`PAPERFLOW_READING_REPORTS_DIR`. See
+[../deployments/desktop/README.md](../deployments/desktop/README.md).
+
+## Local PaperFlow Wiki
+
+The wiki is a local memory layer over `data/paperflow.db`. It stores paper,
+section, topic, and trajectory nodes, then mirrors them to Markdown files so
+they can be inspected with normal editors or Obsidian.
+
+```bash
+paperflow wiki init
+paperflow wiki backfill --user-id user_alice
+paperflow wiki topics --user-id user_alice
+paperflow wiki embed --user-id user_alice
+paperflow wiki search "graph rag" --user-id user_alice
+paperflow wiki ask "What have I read about graph RAG?" --user-id user_alice
+```
+
+Set `PAPERFLOW_WIKI_INGEST=false` to turn off automatic ingestion while
+keeping the rest of the PaperFlow pipeline unchanged.
 
 ## Interest-drift defaults
 
@@ -98,10 +176,11 @@ short-window vs long-window interest centroids.
 | `PAPERFLOW_AUTHOR_DECAY`                | 0.005   | Per-day author-weight decay          |
 | `PAPERFLOW_INSTITUTION_DECAY`           | 0.005   | Per-day institution-weight decay     |
 
-## Feishu / Lark deployment
+## Feishu / Lark
 
-Only needed if you deploy under `deployments/feishu/`. Plain CLI users can
-leave the whole block empty.
+These values are only needed if you want PaperFlow to create Feishu/Lark docs
+or run the Feishu webhook deployment. Plain local-only users can leave the
+whole block empty.
 
 | Variable                       | Purpose                                          |
 |--------------------------------|--------------------------------------------------|
@@ -110,11 +189,19 @@ leave the whole block empty.
 | `FEISHU_BOT_NAME`              | Display name in generated messages               |
 | `FEISHU_USER_ID`               | Default Feishu user_id for push targeting        |
 | `FEISHU_CLI_CMD`               | Optional path to `lark-cli` / `lark-cli.cmd`     |
+| `FEISHU_IM_IDENTITY`           | `bot` by default; use `user` only after user auth |
 | `FEISHU_VERIFICATION_TOKEN`    | Webhook verification token                       |
 | `NGROK_AUTHTOKEN`              | ngrok auth token (for local webhook exposure)    |
 | `NGROK_PATH`                   | Optional path to the ngrok binary                |
+| `NGROK_DOMAIN`                 | Optional static ngrok domain for stable callbacks |
 
-For full Feishu setup, see [feishu-webhook-setup.md](feishu-webhook-setup.md).
+Reading-report document export and webhook delivery are separate:
+
+- Feishu document export needs Feishu app credentials and `lark-cli`; it does
+  not need ngrok. See [feishu-doc-export.md](feishu-doc-export.md).
+- Feishu bot webhook / scheduled delivery needs event callbacks and ngrok.
+  See [feishu-webhook-setup.md](feishu-webhook-setup.md).
+- Unified feedback/profile learning: see [feedback-loop.md](feedback-loop.md).
 
 ## Role configuration
 

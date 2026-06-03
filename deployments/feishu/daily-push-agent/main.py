@@ -11,7 +11,7 @@ import math
 import re
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import Any, List, Dict, Optional, Set
 from dataclasses import dataclass
 from collections import defaultdict
 
@@ -41,6 +41,10 @@ journal_fetch_recent = journal_fetcher.get_recent_papers
 db_ops = importlib.import_module("skills.storage-helper.scripts.db_ops")
 get_profile = db_ops.get_profile
 update_profile = db_ops.update_profile
+try:
+    wiki_daily_ingest = importlib.import_module("agents.wiki-agent.ingest.from_daily_push")
+except Exception:
+    wiki_daily_ingest = None
 
 profile_updater = importlib.import_module("skills.profile-updater.scripts.update_profile")
 calculate_paper_score = profile_updater.calculate_paper_score
@@ -75,6 +79,44 @@ except ImportError:
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "config")
 ROLE_META_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "data", "roles.json")
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+EMPTY_PUSH_FALLBACK_DAYS = 7
+EMPTY_PUSH_FALLBACK_TOP_K = 7
+
+
+def _wiki_ingest_enabled() -> bool:
+    return os.environ.get("PAPERFLOW_WIKI_INGEST", "1").strip().lower() not in {
+        "0",
+        "false",
+        "off",
+        "no",
+    }
+
+
+def ingest_pushed_paper_to_wiki(
+    *,
+    user_id: str,
+    push_id: str,
+    paper: Dict,
+    category: Optional[str],
+    metadata: Dict,
+    behavior_log_id: Optional[int] = None,
+) -> Optional[Dict]:
+    """Best-effort wiki ingestion hook for daily-push candidates."""
+    if not _wiki_ingest_enabled() or wiki_daily_ingest is None:
+        return None
+    try:
+        return wiki_daily_ingest.ingest_pushed_paper(
+            user_id=user_id,
+            push_id=push_id,
+            paper=paper,
+            category=category,
+            metadata=metadata,
+            behavior_log_id=behavior_log_id,
+        )
+    except Exception as exc:
+        print(f"  Wiki daily-push ingest skipped due to error: {exc}")
+        return None
 
 
 def load_yaml_config(filename: str) -> Dict:
@@ -647,6 +689,118 @@ def _title_has_any_token(title: str, tokens: tuple) -> bool:
     return any(f" {str(token).lower()} " in normalized_title for token in tokens if str(token).strip())
 
 
+def _normalize_arxiv_key(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    text = text.replace("https://arxiv.org/abs/", "")
+    text = text.replace("http://arxiv.org/abs/", "")
+    text = text.replace("https://arxiv.org/pdf/", "")
+    text = text.replace("http://arxiv.org/pdf/", "")
+    text = text.removesuffix(".pdf")
+    return re.sub(r"v\d+$", "", text)
+
+
+def _normalize_identity_text(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+
+
+def get_user_handled_paper_keys(user_id: str) -> Dict[str, Set[str]]:
+    """Return paper identities this user has already acted on.
+
+    The fallback pool should avoid papers the user explicitly selected,
+    skipped, or already generated a reading report for.
+    """
+    conn = db_ops.get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT DISTINCT p.id, p.arxiv_id, p.doi, p.title
+        FROM behavior_logs bl
+        JOIN papers p ON p.id = bl.paper_id
+        WHERE bl.user_id = ?
+          AND bl.action IN ('selected', 'skipped', 'created_report')
+        """,
+        (user_id,),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+
+    keys: Dict[str, Set[str]] = {"ids": set(), "arxiv": set(), "doi": set(), "titles": set()}
+    for row in rows:
+        paper_id = row["id"] if "id" in row.keys() else None
+        if paper_id is not None:
+            keys["ids"].add(str(paper_id))
+        arxiv_key = _normalize_arxiv_key(row["arxiv_id"] if "arxiv_id" in row.keys() else "")
+        if arxiv_key:
+            keys["arxiv"].add(arxiv_key)
+        doi_key = _normalize_identity_text(row["doi"] if "doi" in row.keys() else "")
+        if doi_key:
+            keys["doi"].add(doi_key)
+        title_key = _normalize_identity_text(row["title"] if "title" in row.keys() else "")
+        if title_key:
+            keys["titles"].add(title_key)
+    return keys
+
+
+def filter_user_handled_papers(user_id: str, papers: List[Dict]) -> tuple[List[Dict], int]:
+    """Remove fallback candidates already selected/skipped/read by the user."""
+    handled = get_user_handled_paper_keys(user_id)
+    filtered: List[Dict] = []
+    dropped = 0
+    for paper in papers:
+        paper_id = str(paper.get("id") or "")
+        arxiv_key = _normalize_arxiv_key(
+            paper.get("arxiv_id") or paper.get("url") or paper.get("paper_url") or paper.get("pdf_url")
+        )
+        doi_key = _normalize_identity_text(paper.get("doi"))
+        title_key = _normalize_identity_text(paper.get("title"))
+        already_handled = (
+            (paper_id and paper_id in handled["ids"])
+            or (arxiv_key and arxiv_key in handled["arxiv"])
+            or (doi_key and doi_key in handled["doi"])
+            or (title_key and title_key in handled["titles"])
+        )
+        if already_handled:
+            dropped += 1
+            continue
+        filtered.append(paper)
+    return filtered, dropped
+
+
+def build_relaxed_fallback_scores(
+    papers: List[Dict],
+    profile: Dict,
+    weights: Dict,
+    *,
+    top_k: int = EMPTY_PUSH_FALLBACK_TOP_K,
+) -> List[PaperWithScore]:
+    """Return the closest weak matches when strict categorization yields no push."""
+    candidates: List[PaperWithScore] = []
+    for paper in papers:
+        score = calculate_paper_score(paper, profile, weights)
+        relevance_signal = compute_relevance_signal(paper, profile)
+        drift_bonus, drift_topics = compute_drift_bonus(paper, profile, weights)
+        reading_signal_bonus, reading_signal_topics = compute_reading_signal_bonus(paper, profile, weights)
+        score = min(1.0, score + drift_bonus + reading_signal_bonus)
+        category = "must_read" if is_must_read(paper, profile) else "edge_relevant"
+        candidates.append(
+            PaperWithScore(
+                paper=paper,
+                score=score,
+                category=category,
+                relevance_signal=relevance_signal,
+                drift_bonus=drift_bonus,
+                drift_topics=drift_topics,
+                reading_signal_bonus=reading_signal_bonus,
+                reading_signal_topics=reading_signal_topics,
+            )
+        )
+
+    candidates.sort(key=_hard_priority_tuple, reverse=True)
+    return candidates[: max(1, int(top_k))]
+
+
 def fetch_and_process_papers(
     days: int = 1,
     arxiv_categories: List[str] = None,
@@ -1127,6 +1281,60 @@ def daily_push(
     # 4. 排序并分类
     print("Sorting and categorizing papers...")
     scored_papers = sort_and_categorize(papers, profile, weights)
+    fallback_metadata: Dict[str, Any] = {
+        "fallback_used": False,
+        "initial_days": days,
+        "initial_total_fetched": len(papers),
+    }
+
+    fallback_days = max(EMPTY_PUSH_FALLBACK_DAYS, int(days or 1))
+    if not scored_papers and int(days or 1) < fallback_days:
+        print(
+            f"No papers passed strict filtering for {days} day(s); "
+            f"trying {fallback_days}-day unhandled fallback..."
+        )
+        fallback_papers = fetch_and_process_papers(
+            days=fallback_days,
+            arxiv_categories=arxiv_categories,
+            conferences=[],
+            journals=[],
+            limit_per_source=limit_per_source,
+        )
+        fallback_total_fetched = len(fallback_papers)
+        fallback_papers, fallback_dropped = filter_user_handled_papers(user_id, fallback_papers)
+        print(
+            f"Fallback pool: fetched {fallback_total_fetched}, "
+            f"dropped {fallback_dropped} already handled, kept {len(fallback_papers)}"
+        )
+        fallback_scored = sort_and_categorize(fallback_papers, profile, weights) if fallback_papers else []
+        relaxed_fallback_used = False
+        if not fallback_scored and fallback_papers:
+            print(
+                "Fallback strict filtering still produced 0 papers; "
+                f"using top {EMPTY_PUSH_FALLBACK_TOP_K} closest weak matches."
+            )
+            fallback_scored = build_relaxed_fallback_scores(
+                fallback_papers,
+                profile,
+                weights,
+                top_k=EMPTY_PUSH_FALLBACK_TOP_K,
+            )
+            relaxed_fallback_used = bool(fallback_scored)
+
+        fallback_metadata.update(
+            {
+                "fallback_used": bool(fallback_scored),
+                "fallback_days": fallback_days,
+                "fallback_total_fetched": fallback_total_fetched,
+                "fallback_filtered_already_handled": fallback_dropped,
+                "fallback_kept_candidates": len(fallback_papers),
+                "fallback_relaxed": relaxed_fallback_used,
+                "fallback_source_scope": "arxiv",
+            }
+        )
+        if fallback_scored:
+            papers = fallback_papers
+            scored_papers = fallback_scored
 
     # 5. 生成推送卡片
     date_str = datetime.now().strftime("%m-%d")
@@ -1135,6 +1343,23 @@ def daily_push(
 
     # 6. 保存推送记录到数据库
     print(f"Saving push record: {push_id}")
+    if not scored_papers:
+        db_ops.log_behavior(
+            user_id=user_id,
+            push_id=push_id,
+            paper_id=None,
+            action="push_empty",
+            action_type="push",
+            category="empty_push",
+            metadata={
+                "paper_count": 0,
+                "total_fetched": len(papers),
+                "reason": "all_candidates_filtered",
+                "days": days,
+                "push_context": "daily_push",
+                **fallback_metadata,
+            },
+        )
     for i, p in enumerate(scored_papers):
         paper = p.paper
         paper_id = paper.get("id")
@@ -1173,34 +1398,46 @@ def daily_push(
         # 记录推送行为（无论论文是否新保存）
         if paper_id:
             try:
-                db_ops.log_behavior(
+                push_metadata = {
+                    "score": p.score,
+                    "category": p.category,
+                    "relevance_signal": p.relevance_signal,
+                    "rank": i + 1,
+                    "push_context": "daily_push_fallback" if fallback_metadata.get("fallback_used") else "daily_push",
+                    "fallback_used": fallback_metadata.get("fallback_used", False),
+                    "fallback_days": fallback_metadata.get("fallback_days"),
+                    "fallback_relaxed": fallback_metadata.get("fallback_relaxed", False),
+                    # Preserve source links so downstream selected-paper reading
+                    # can still resolve the original landing page / PDF after DB reload.
+                    "url": paper.get("url"),
+                    "paper_url": paper.get("paper_url") or paper.get("url"),
+                    "pdf_url": paper.get("pdf_url"),
+                    "doi_url": paper.get("doi_url"),
+                    "openreview_url": paper.get("openreview_url"),
+                    "source": paper.get("source"),
+                    "journal": paper.get("journal"),
+                    "venue": paper.get("venue") or paper.get("journal"),
+                    "publish_date": paper.get("publish_date"),
+                    "categories": paper.get("categories", []),
+                    "keywords": paper.get("keywords", []),
+                    "topics": paper.get("topics", []),
+                }
+                behavior_log_id = db_ops.log_behavior(
                     user_id=user_id,
                     push_id=push_id,
                     paper_id=paper_id,
                     action="pushed",
                     action_type="push",
                     category=p.category,
-                    metadata={
-                        "score": p.score,
-                        "category": p.category,
-                        "relevance_signal": p.relevance_signal,
-                        "rank": i + 1,
-                        "push_context": "daily_push",
-                        # Preserve source links so downstream selected-paper reading
-                        # can still resolve the original landing page / PDF after DB reload.
-                        "url": paper.get("url"),
-                        "paper_url": paper.get("paper_url") or paper.get("url"),
-                        "pdf_url": paper.get("pdf_url"),
-                        "doi_url": paper.get("doi_url"),
-                        "openreview_url": paper.get("openreview_url"),
-                        "source": paper.get("source"),
-                        "journal": paper.get("journal"),
-                        "venue": paper.get("venue") or paper.get("journal"),
-                        "publish_date": paper.get("publish_date"),
-                        "categories": paper.get("categories", []),
-                        "keywords": paper.get("keywords", []),
-                        "topics": paper.get("topics", []),
-                    }
+                    metadata=push_metadata,
+                )
+                ingest_pushed_paper_to_wiki(
+                    user_id=user_id,
+                    push_id=push_id,
+                    paper=paper,
+                    category=p.category,
+                    metadata=push_metadata,
+                    behavior_log_id=behavior_log_id,
                 )
             except Exception as e:
                 print(f"  Paper {i+1} log error: {e}")
@@ -1259,6 +1496,7 @@ def daily_push(
         "push_id": push_id,
         "paper_count": len(scored_papers),
         "total_fetched": len(papers),
+        **fallback_metadata,
     }
 
 

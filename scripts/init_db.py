@@ -17,6 +17,9 @@ def ensure_runtime_dirs() -> None:
         "data",
         "data/db_backups",
         "data/embeddings_cache",
+        "data/papers",
+        "data/reading_reports",
+        "data/wiki",
         "data/webhook_task_locks",
         "models",
     ):
@@ -32,6 +35,9 @@ def main() -> int:
 
     db_ops = importlib.import_module("skills.storage-helper.scripts.db_ops")
     db_ops.init_db()
+
+    wiki_db = importlib.import_module("skills.wiki-store.scripts.wiki_db")
+    wiki_db.init_wiki_schema()
 
     print(f"[OK] Runtime directories ready: {PROJECT_ROOT}")
     print(f"[OK] Database ready: {PROJECT_ROOT / 'data' / 'paperflow.db'}")

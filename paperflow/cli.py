@@ -7,6 +7,8 @@ Wraps the user-facing entry points described in the README:
     paperflow daily      Run a single daily push pipeline pass
     paperflow read       Generate a reading report for a paper
     paperflow feedback   Record feedback on a recommendation
+    paperflow wiki       Inspect the local PaperFlow Wiki
+    paperflow gui        Start the local browser GUI
     paperflow doctor     Verify the local install + provider settings
     paperflow demo       End-to-end demo with the bundled mock providers
     paperflow eval       Run the public PaperFlow-Bench evaluator
@@ -40,6 +42,8 @@ app = typer.Typer(
     no_args_is_help=True,
     invoke_without_command=True,
 )
+wiki_app = typer.Typer(help="Inspect and search the local PaperFlow Wiki.", add_completion=False)
+app.add_typer(wiki_app, name="wiki")
 
 
 def _run_python(script: Path, *args: str) -> int:
@@ -54,6 +58,14 @@ def _run_python(script: Path, *args: str) -> int:
     typer.echo(f"$ {' '.join(cmd)}")
     completed = subprocess.run(cmd, cwd=str(PROJECT_ROOT), env=env)
     return completed.returncode
+
+
+def _run_wiki(*args: str) -> int:
+    script = PROJECT_ROOT / "agents" / "wiki-agent" / "main.py"
+    if not script.exists():
+        typer.echo(f"[error] wiki agent not found: {script}", err=True)
+        return 1
+    return _run_python(script, *args)
 
 
 @app.callback()
@@ -212,6 +224,162 @@ def feedback(
     if feishu_user_id:
         args.extend(["--feishu-user-id", feishu_user_id])
     raise typer.Exit(code=_run_python(script, *args))
+
+
+@app.command()
+def gui(
+    host: str = typer.Option("127.0.0.1", "--host", help="Host interface for the local GUI server."),
+    port: int = typer.Option(8765, "--port", "-p", help="Port for the local GUI server."),
+    no_browser: bool = typer.Option(False, "--no-browser", help="Do not open the browser automatically."),
+) -> None:
+    """Start the local browser GUI."""
+    script = PROJECT_ROOT / "deployments" / "desktop" / "server.py"
+    if not script.exists():
+        typer.echo(f"[error] desktop GUI server not found: {script}", err=True)
+        raise typer.Exit(code=1)
+    args = ["--host", host, "--port", str(port)]
+    if no_browser:
+        args.append("--no-browser")
+    raise typer.Exit(code=_run_python(script, *args))
+
+
+@wiki_app.command("init")
+def wiki_init() -> None:
+    """Initialize the local wiki tables and folders."""
+    raise typer.Exit(code=_run_wiki("init"))
+
+
+@wiki_app.command("list")
+def wiki_list(
+    user_id: str = typer.Option(..., "--user-id", "-u", help="PaperFlow user ID."),
+    node_type: Optional[str] = typer.Option(None, "--type", help="Filter by paper, section, trajectory, or topic."),
+    limit: int = typer.Option(20, "--limit", "-n", help="Maximum number of nodes to print."),
+    json_output: bool = typer.Option(False, "--json", help="Print JSON instead of a text table."),
+) -> None:
+    """List recent wiki nodes for a user."""
+    args = ["list", "--user-id", user_id, "--limit", str(limit)]
+    if node_type:
+        args.extend(["--type", node_type])
+    if json_output:
+        args.append("--json")
+    raise typer.Exit(code=_run_wiki(*args))
+
+
+@wiki_app.command("search")
+def wiki_search(
+    query: str = typer.Argument(..., help="Search query."),
+    user_id: str = typer.Option(..., "--user-id", "-u", help="PaperFlow user ID."),
+    node_type: Optional[str] = typer.Option(None, "--type", help="Filter by paper, section, trajectory, or topic."),
+    limit: int = typer.Option(20, "--limit", "-n", help="Maximum number of nodes to print."),
+    json_output: bool = typer.Option(False, "--json", help="Print JSON instead of a text table."),
+) -> None:
+    """Search wiki nodes for a user."""
+    args = ["search", query, "--user-id", user_id, "--limit", str(limit)]
+    if node_type:
+        args.extend(["--type", node_type])
+    if json_output:
+        args.append("--json")
+    raise typer.Exit(code=_run_wiki(*args))
+
+
+@wiki_app.command("stats")
+def wiki_stats(
+    user_id: str = typer.Option(..., "--user-id", "-u", help="PaperFlow user ID."),
+    json_output: bool = typer.Option(False, "--json", help="Print JSON instead of text."),
+) -> None:
+    """Show local wiki node, edge, and citation counts."""
+    args = ["stats", "--user-id", user_id]
+    if json_output:
+        args.append("--json")
+    raise typer.Exit(code=_run_wiki(*args))
+
+
+@wiki_app.command("embed")
+def wiki_embed(
+    user_id: str = typer.Option(..., "--user-id", "-u", help="PaperFlow user ID."),
+    force: bool = typer.Option(False, "--force", help="Recompute existing embeddings."),
+    limit: int = typer.Option(500, "--limit", help="Maximum number of nodes to embed."),
+    json_output: bool = typer.Option(False, "--json", help="Print JSON instead of text."),
+) -> None:
+    """Embed wiki nodes for vector search."""
+    args = ["embed", "--user-id", user_id, "--limit", str(limit)]
+    if force:
+        args.append("--force")
+    if json_output:
+        args.append("--json")
+    raise typer.Exit(code=_run_wiki(*args))
+
+
+@wiki_app.command("topics")
+def wiki_topics(
+    user_id: str = typer.Option(..., "--user-id", "-u", help="PaperFlow user ID."),
+    min_count: int = typer.Option(2, "--min-count", help="Minimum keyword frequency."),
+    limit: int = typer.Option(50, "--limit", help="Maximum number of topics to create."),
+    json_output: bool = typer.Option(False, "--json", help="Print JSON instead of text."),
+) -> None:
+    """Build keyword topic nodes from paper nodes."""
+    args = ["topics", "--user-id", user_id, "--min-count", str(min_count), "--limit", str(limit)]
+    if json_output:
+        args.append("--json")
+    raise typer.Exit(code=_run_wiki(*args))
+
+
+@wiki_app.command("ask")
+def wiki_ask(
+    question: str = typer.Argument(..., help="Question to ask over the local wiki."),
+    user_id: str = typer.Option(..., "--user-id", "-u", help="PaperFlow user ID."),
+    limit: int = typer.Option(8, "--limit", help="Maximum number of snippets to cite."),
+    json_output: bool = typer.Option(False, "--json", help="Print JSON instead of text."),
+) -> None:
+    """Ask a RAG question over the local wiki."""
+    args = ["ask", question, "--user-id", user_id, "--limit", str(limit)]
+    if json_output:
+        args.append("--json")
+    raise typer.Exit(code=_run_wiki(*args))
+
+
+@wiki_app.command("backfill")
+def wiki_backfill(
+    user_id: Optional[str] = typer.Option(None, "--user-id", "-u", help="PaperFlow user ID."),
+    all_users: bool = typer.Option(False, "--all", help="Backfill every user found in the database."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Count work without writing wiki data."),
+    json_output: bool = typer.Option(False, "--json", help="Print JSON instead of text."),
+) -> None:
+    """Backfill existing behavior logs into the local wiki."""
+    args = ["backfill"]
+    if user_id:
+        args.extend(["--user-id", user_id])
+    if all_users:
+        args.append("--all")
+    if dry_run:
+        args.append("--dry-run")
+    if json_output:
+        args.append("--json")
+    raise typer.Exit(code=_run_wiki(*args))
+
+
+@wiki_app.command("monthly")
+def wiki_monthly(
+    user_id: str = typer.Option(..., "--user-id", "-u", help="PaperFlow user ID."),
+    month: Optional[str] = typer.Option(None, "--month", help="Month to export in YYYY-MM format."),
+    output_dir: Optional[Path] = typer.Option(None, "--output-dir", help="Monthly report output directory."),
+    topic_index_dir: Optional[Path] = typer.Option(None, "--topic-index-dir", help="Topic Index output directory."),
+    no_topic_index: bool = typer.Option(False, "--no-topic-index", help="Only write the monthly report."),
+    json_output: bool = typer.Option(False, "--json", help="Print JSON instead of text."),
+) -> None:
+    """Export an Obsidian-friendly monthly report and topic index."""
+    args = ["monthly", "--user-id", user_id]
+    if month:
+        args.extend(["--month", month])
+    if output_dir:
+        args.extend(["--output-dir", str(output_dir)])
+    if topic_index_dir:
+        args.extend(["--topic-index-dir", str(topic_index_dir)])
+    if no_topic_index:
+        args.append("--no-topic-index")
+    if json_output:
+        args.append("--json")
+    raise typer.Exit(code=_run_wiki(*args))
 
 
 @app.command()

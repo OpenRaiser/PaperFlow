@@ -35,6 +35,12 @@ def test_load_provider_config_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
         "PAPERFLOW_EMBED_PROVIDER",
         "PAPERFLOW_EMBED_MODEL",
         "PAPERFLOW_EMBED_DIMENSIONS",
+        "LLM_PARSER_PROVIDER",
+        "LLM_PARSER_OPENAI_MODEL",
+        "DASHSCOPE_LLM_MODEL",
+        "HF_LLM_MODEL",
+        "EMBEDDING_PROVIDER",
+        "EMBEDDING_MODEL",
     ]:
         monkeypatch.delenv(var, raising=False)
 
@@ -62,6 +68,29 @@ def test_load_provider_config_unknown_falls_back(monkeypatch: pytest.MonkeyPatch
     config = load_provider_config()
     assert config.llm_provider == "openai"
     assert config.embed_provider == "sentence_transformers"
+
+
+@pytest.mark.unit
+def test_load_provider_config_accepts_legacy_env_aliases(monkeypatch: pytest.MonkeyPatch) -> None:
+    for var in [
+        "PAPERFLOW_LLM_PROVIDER",
+        "PAPERFLOW_LLM_MODEL",
+        "PAPERFLOW_EMBED_PROVIDER",
+        "PAPERFLOW_EMBED_MODEL",
+        "PAPERFLOW_EMBED_DIMENSIONS",
+    ]:
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("LLM_PARSER_PROVIDER", "openai")
+    monkeypatch.setenv("LLM_PARSER_OPENAI_MODEL", "gemini-3-flash-preview")
+    monkeypatch.setenv("EMBEDDING_PROVIDER", "openai")
+    monkeypatch.setenv("EMBEDDING_MODEL", "Qwen/Qwen3-Embedding-8B")
+
+    config = load_provider_config()
+
+    assert config.llm_provider == "openai"
+    assert config.llm_model == "gemini-3-flash-preview"
+    assert config.embed_provider == "openai"
+    assert config.embed_model == "Qwen/Qwen3-Embedding-8B"
 
 
 @pytest.mark.unit

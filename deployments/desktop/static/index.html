@@ -1,0 +1,443 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>PaperFlow 本地工作台</title>
+    <link rel="icon" href="favicon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <div class="shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="mark">PF</div>
+          <div>
+            <h1>PaperFlow</h1>
+            <p>Research workspace</p>
+          </div>
+        </div>
+
+        <label class="label" for="userSelect">用户画像</label>
+        <div class="row">
+          <select id="userSelect"></select>
+          <button id="refreshUsersBtn" class="icon-btn" title="刷新用户" aria-label="刷新用户">↻</button>
+        </div>
+
+        <nav class="nav">
+          <button class="nav-item active" data-view="dashboard">仪表盘</button>
+          <button class="nav-item" data-view="push">每日推送</button>
+          <button class="nav-item" data-view="reading">精读论文</button>
+          <button class="nav-item" data-view="wiki">本地知识库</button>
+          <button class="nav-item" data-view="mustread">必读规则</button>
+          <button class="nav-item" data-view="roles">角色管理</button>
+          <button class="nav-item" data-view="history">反馈历史</button>
+          <button class="nav-item" data-view="profile">画像设置</button>
+          <button class="nav-item" data-view="settings">运行设置</button>
+        </nav>
+
+        <div class="side-note">
+          <span class="dot"></span>
+          <span id="healthText">正在检查运行环境...</span>
+        </div>
+      </aside>
+
+      <main class="main">
+        <header class="topbar">
+          <div>
+            <p class="eyebrow">个性化论文推荐与精读</p>
+            <h2 id="pageTitle">仪表盘</h2>
+          </div>
+          <div class="top-actions">
+            <button class="ghost-btn" data-quick-view="push">每日推送</button>
+            <button class="ghost-btn" data-quick-view="wiki">知识库</button>
+            <div class="status" id="statusText">就绪</div>
+          </div>
+        </header>
+
+        <section id="dashboard" class="view active">
+          <div class="home-stage">
+            <div class="home-copy">
+              <div class="release-kicker">
+                <span>CLI</span>
+                <span>Local GUI</span>
+                <span>Feishu/Lark</span>
+              </div>
+              <div class="home-title">
+                <p class="eyebrow">Personalized Scientific Reading Agent</p>
+                <h3><span>PaperFlow</span> 本地研究工作台</h3>
+                <p class="home-subtitle">每日推荐、精读报告、反馈学习、本地知识库。</p>
+              </div>
+              <div class="composer-card">
+                <div class="composer-text">
+                  <strong>选择下一步</strong>
+                  <span>当前画像会同步影响推送、精读和知识库检索。</span>
+                </div>
+                <div class="composer-actions">
+                  <button class="primary" data-quick-view="push">运行每日推送</button>
+                  <button data-quick-view="reading">生成精读</button>
+                  <button data-quick-view="wiki">询问知识库</button>
+                </div>
+              </div>
+            </div>
+
+            <div class="release-art" aria-label="PaperFlow 发布版视觉">
+              <img src="assets/paperflow-readme-hero.png" alt="PaperFlow personalized scientific reading banner">
+            </div>
+          </div>
+
+          <div class="grid stats">
+            <div class="stat">
+              <span>最新推送</span>
+              <strong id="latestPushStat">-</strong>
+            </div>
+            <div class="stat">
+              <span>知识节点</span>
+              <strong id="wikiNodeStat">-</strong>
+            </div>
+            <div class="stat">
+              <span>待精读</span>
+              <strong id="readingQueueStat">0</strong>
+            </div>
+          </div>
+
+          <div class="dashboard-grid">
+            <div class="panel">
+              <div class="panel-head">
+                <div>
+                  <h3>任务日志</h3>
+                  <p>当前浏览器会话中的操作状态。</p>
+                </div>
+                <button id="clearTaskLogBtn">清空</button>
+              </div>
+              <div id="taskLog" class="activity-list empty">暂无任务。</div>
+            </div>
+
+            <div class="panel">
+              <div class="panel-head">
+                <div>
+                  <h3>最近活动</h3>
+                  <p>本地数据库中最近写入的反馈、报告与画像更新。</p>
+                </div>
+                <button id="refreshDashboardBtn">刷新</button>
+              </div>
+              <div id="activityList" class="activity-list empty">尚未加载活动记录。</div>
+            </div>
+          </div>
+        </section>
+
+        <section id="push" class="view">
+          <div class="panel">
+            <div class="panel-head">
+              <div>
+                <h3>每日推送</h3>
+                <p>运行或加载最新个性化论文列表，一次完成多选反馈与精读。</p>
+              </div>
+              <div class="actions">
+                <label class="days-control" title="抓取最近几天的论文">
+                  <span>近</span>
+                  <input id="daysInput" type="number" min="1" max="14" value="1" aria-label="抓取天数">
+                  <span>天</span>
+                </label>
+                <button id="loadPushBtn">加载最新</button>
+                <button id="runDailyBtn" class="primary">运行推送</button>
+              </div>
+            </div>
+
+            <div id="pushMeta" class="meta-line">尚未加载推送。</div>
+            <div id="paperList" class="paper-list empty">请先运行每日推送，或加载最近一次推送。</div>
+
+            <div class="submit-bar">
+              <div>
+                <strong id="selectionSummary">0 篇待精读，0 篇标记为不感兴趣</strong>
+                <p>只有勾选过的论文会被写入明确反馈。</p>
+                <label class="checkline subtle-check">
+                  <input id="writeFeishuReports" type="checkbox">
+                  同时尝试写入飞书文档
+                </label>
+              </div>
+              <div class="actions">
+                <button id="submitFeedbackBtn">提交反馈</button>
+                <button id="submitAndReadBtn" class="primary">提交并精读</button>
+              </div>
+            </div>
+          </div>
+
+          <div id="reportResults" class="panel hidden">
+            <div class="panel-head">
+              <div>
+                <h3>精读报告</h3>
+                <p>生成的本地 Markdown 文件，以及可选的飞书文档链接。</p>
+              </div>
+            </div>
+            <div id="reportList"></div>
+          </div>
+        </section>
+
+        <section id="reading" class="view">
+          <div class="split">
+            <div class="panel">
+              <div class="panel-head">
+                <div>
+                  <h3>精读 arXiv 论文</h3>
+                  <p>粘贴 arXiv ID 或链接，生成本地 Markdown 精读报告。</p>
+                </div>
+              </div>
+              <label>
+                arXiv ID 或链接
+                <input id="directArxivId" placeholder="2605.30353 或 https://arxiv.org/abs/2605.30353">
+              </label>
+              <label class="checkline subtle-check">
+                <input id="directWriteFeishu" type="checkbox">
+                同时尝试写入飞书文档
+              </label>
+              <div class="actions end">
+                <button id="readArxivBtn" class="primary">生成报告</button>
+              </div>
+            </div>
+
+            <div class="panel">
+              <div class="panel-head">
+                <div>
+                  <h3>精读本地 PDF</h3>
+                  <p>填写已有 PDF 路径，报告会保存到当前配置的精读目录。</p>
+                </div>
+              </div>
+              <label>
+                PDF 路径
+                <input id="directPdfPath" placeholder="D:/papers/example.pdf">
+              </label>
+              <label>
+                可选标题
+                <input id="directPdfTitle" placeholder="论文标题">
+              </label>
+              <label class="checkline subtle-check">
+                <input id="directPdfWriteFeishu" type="checkbox">
+                同时尝试写入飞书文档
+              </label>
+              <div class="actions end">
+                <button id="readPdfBtn" class="primary">生成报告</button>
+              </div>
+            </div>
+          </div>
+
+          <div id="directReportResults" class="panel hidden">
+            <div class="panel-head">
+              <div>
+                <h3>生成结果</h3>
+                <p>精读代理返回的本地 Markdown / PDF 路径。</p>
+              </div>
+            </div>
+            <div id="directReportList"></div>
+          </div>
+        </section>
+
+        <section id="wiki" class="view">
+          <div class="panel">
+            <div class="panel-head">
+              <div>
+                <h3>本地知识库</h3>
+                <p>检索由推送、反馈、精读报告和画像漂移生成的私有知识库。</p>
+              </div>
+              <button id="refreshWikiBtn">统计</button>
+            </div>
+
+            <div class="wiki-tools">
+              <input id="wikiQuery" placeholder="搜索论文、主题、精读报告...">
+              <button id="wikiSearchBtn">搜索</button>
+            </div>
+            <div id="wikiStats" class="meta-line">尚未加载知识库统计。</div>
+            <div id="wikiResults" class="result-list empty">暂无检索结果。</div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-head">
+              <div>
+                <h3>询问知识库</h3>
+                <p>基于本地片段回答问题。Mock 提供商也可用于烟测。</p>
+              </div>
+            </div>
+            <textarea id="wikiQuestion" rows="3" placeholder="我最近读过哪些关于 scientific agents 的论文？"></textarea>
+            <div class="actions end">
+              <button id="wikiAskBtn" class="primary">提问</button>
+            </div>
+            <pre id="wikiAnswer" class="answer empty">暂无回答。</pre>
+          </div>
+        </section>
+
+        <section id="mustread" class="view">
+          <div class="panel">
+            <div class="panel-head">
+              <div>
+                <h3>必读规则</h3>
+                <p>用于强约束推荐的作者、机构和窄关键词。</p>
+              </div>
+              <button id="refreshMustReadBtn">刷新</button>
+            </div>
+            <div id="mustReadList" class="must-grid empty">尚未加载必读规则。</div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-head">
+              <div>
+                <h3>编辑规则</h3>
+                <p>宽泛兴趣应放在画像里；必读规则适合具体作者、机构或短语。</p>
+              </div>
+            </div>
+            <div class="form-grid">
+              <label>
+                类型
+                <select id="mustReadType">
+                  <option value="author">作者</option>
+                  <option value="institution">机构</option>
+                  <option value="keyword">关键词</option>
+                </select>
+              </label>
+              <label>
+                值
+                <input id="mustReadValue" placeholder="Mohammed AlQuraishi">
+              </label>
+            </div>
+            <div class="actions end">
+              <button id="removeMustReadBtn">移除</button>
+              <button id="addMustReadBtn" class="primary">添加</button>
+            </div>
+          </div>
+        </section>
+
+        <section id="roles" class="view">
+          <div class="panel">
+            <div class="panel-head">
+              <div>
+                <h3>角色管理</h3>
+                <p>管理角色元数据，并切换当前研究上下文。</p>
+              </div>
+              <button id="refreshRolesBtn">刷新</button>
+            </div>
+            <div id="roleList" class="role-list empty">尚未加载角色。</div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-head">
+              <div>
+                <h3>创建角色</h3>
+                <p>创建角色时会同步创建对应用户画像，例如 user_rolea。</p>
+              </div>
+            </div>
+            <div class="form-grid">
+              <label>
+                角色名
+                <input id="roleName" placeholder="rolea">
+              </label>
+              <label>
+                飞书群 ID
+                <input id="roleChatId" placeholder="可选">
+              </label>
+            </div>
+            <label>
+              研究方向描述
+              <textarea id="roleDescription" rows="4" placeholder="面向科学发现的 LLM agents..."></textarea>
+            </label>
+            <div class="actions end">
+              <button id="createRoleBtn" class="primary">创建角色</button>
+            </div>
+          </div>
+        </section>
+
+        <section id="history" class="view">
+          <div class="panel">
+            <div class="panel-head">
+              <div>
+                <h3>反馈历史</h3>
+                <p>筛选选择、跳过、精读报告和画像更新记录。</p>
+              </div>
+              <div class="actions">
+                <select id="activityFilter" title="活动筛选">
+                  <option value="">全部动作</option>
+                  <option value="selected">已选择</option>
+                  <option value="skipped">已跳过</option>
+                  <option value="created_report">精读报告</option>
+                  <option value="profile_updated">画像漂移</option>
+                  <option value="must_read_update">必读规则</option>
+                </select>
+                <button id="refreshHistoryBtn">刷新</button>
+              </div>
+            </div>
+            <div id="historyList" class="activity-list empty">尚未加载历史记录。</div>
+          </div>
+        </section>
+
+        <section id="profile" class="view">
+          <div class="panel">
+            <div class="panel-head">
+              <div>
+                <h3>创建或更新画像</h3>
+                <p>从自我描述、Scholar 页面、主页或本地 PDF 冷启动。</p>
+              </div>
+            </div>
+            <div class="form-grid">
+              <label>
+                用户 ID
+                <input id="profileUserId" placeholder="user_alice">
+              </label>
+              <label>
+                Google Scholar 链接
+                <input id="scholarUrl" placeholder="https://scholar.google.com/citations?user=...">
+              </label>
+              <label>
+                个人主页链接
+                <input id="homepageUrl" placeholder="https://example.edu/~alice">
+              </label>
+              <label>
+                PDF 路径
+                <input id="pdfPaths" placeholder="C:/papers/a.pdf; C:/papers/b.pdf">
+              </label>
+            </div>
+            <label>
+              研究方向描述
+              <textarea id="naturalLanguage" rows="5" placeholder="我研究面向科学发现的 LLM agents..."></textarea>
+            </label>
+            <label class="checkline">
+              <input id="resetProfile" type="checkbox">
+              重置已有画像
+            </label>
+            <div class="actions end">
+              <button id="saveProfileBtn" class="primary">保存画像</button>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-head">
+              <div>
+                <h3>画像快照</h3>
+                <p>核心方向、主题权重、必读规则和漂移状态。</p>
+              </div>
+              <button id="refreshProfileBtn">刷新</button>
+            </div>
+            <pre id="profileSnapshot" class="answer empty">尚未加载画像。</pre>
+          </div>
+        </section>
+
+        <section id="settings" class="view">
+          <div class="panel">
+            <div class="panel-head">
+              <div>
+                <h3>运行设置</h3>
+                <p>这些值来自 .env 和本地默认配置。需要修改时请编辑 .env。</p>
+              </div>
+              <button id="refreshSettingsBtn">刷新</button>
+            </div>
+            <div id="settingsList" class="settings-list empty">尚未加载设置。</div>
+            <div class="provider-tests">
+              <button id="testLlmBtn">测试 LLM</button>
+              <button id="testEmbedBtn">测试 Embedding</button>
+            </div>
+            <pre id="providerTestOutput" class="answer empty">尚未运行提供商测试。</pre>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <script src="app.js"></script>
+  </body>
+</html>

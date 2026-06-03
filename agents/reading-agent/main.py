@@ -17,6 +17,7 @@ import os
 import json
 import re
 import hashlib
+import shutil
 import tempfile
 from html import unescape
 from datetime import datetime
@@ -71,8 +72,13 @@ get_recent_created_report_by_source = getattr(
 profile_updater = importlib.import_module("skills.profile-updater.scripts.update_profile")
 ensure_profile_schema = profile_updater.ensure_profile_schema
 update_profile_with_reading_signal = profile_updater.update_profile_with_reading_signal
+try:
+    wiki_reading_ingest = importlib.import_module("agents.wiki-agent.ingest.from_reading_report")
+except Exception:
+    wiki_reading_ingest = None
 
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 PDF_DOWNLOAD_TIMEOUT = float(os.environ.get("READING_REPORT_PDF_TIMEOUT", "60"))
 ARXIV_DETAIL_TIMEOUT = float(os.environ.get("READING_REPORT_ARXIV_TIMEOUT", "12"))
 MAX_ABSTRACT_CHARS = int(os.environ.get("READING_REPORT_ABSTRACT_CHARS", "1200"))
@@ -89,6 +95,122 @@ READING_REPORT_OUTPUT_VERSION = os.environ.get("READING_REPORT_OUTPUT_VERSION", 
 READING_REPORT_PROFILE_RETRIEVAL_WEIGHT = float(os.environ.get("READING_REPORT_PROFILE_RETRIEVAL_WEIGHT", "0.25"))
 HTTP_RETRY_TOTAL = int(os.environ.get("PAPERFLOW_HTTP_RETRIES", "2"))
 HTTP_RETRY_BACKOFF = float(os.environ.get("PAPERFLOW_HTTP_BACKOFF", "0.8"))
+
+
+MONTH_LABELS = {
+    1: "Jan",
+    2: "Feb",
+    3: "Mar",
+    4: "Apr",
+    5: "May",
+    6: "Jun",
+    7: "Jul",
+    8: "Aug",
+    9: "Sept",
+    10: "Oct",
+    11: "Nov",
+    12: "Dec",
+}
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"0", "false", "off", "no", ""}
+
+
+def _resolve_configured_dir(env_name: str, default_relative: str, paper: Optional[Dict[str, Any]] = None) -> Path:
+    configured = os.environ.get(env_name, "").strip()
+    base_dir = Path(configured).expanduser() if configured else PROJECT_ROOT / default_relative
+    if not base_dir.is_absolute():
+        base_dir = PROJECT_ROOT / base_dir
+    if _env_flag("PAPERFLOW_STORAGE_MONTHLY_SUBDIR", default=False):
+        base_dir = base_dir / _month_folder_name(paper or {})
+    base_dir.mkdir(parents=True, exist_ok=True)
+    return base_dir.resolve()
+
+
+def _parse_publish_month(paper: Dict[str, Any]) -> datetime:
+    for key in ("publish_date", "published", "updated", "created_at", "fetched_at"):
+        raw = _clean_text(paper.get(key))
+        if not raw:
+            continue
+        for fmt, width in (("%Y-%m-%d", 10), ("%Y/%m/%d", 10), ("%Y-%m", 7), ("%Y/%m", 7)):
+            try:
+                return datetime.strptime(raw[:width], fmt)
+            except ValueError:
+                continue
+        match = re.search(r"(20\d{2})[-/](\d{1,2})", raw)
+        if match:
+            year = int(match.group(1))
+            month = max(1, min(12, int(match.group(2))))
+            return datetime(year, month, 1)
+    return datetime.now()
+
+
+def _month_folder_name(paper: Dict[str, Any]) -> str:
+    date = _parse_publish_month(paper)
+    return f"arXiv - {MONTH_LABELS.get(date.month, date.strftime('%b'))} {date.year}"
+
+
+def _safe_filename(value: Any, *, max_len: int = 120) -> str:
+    text = _clean_text(value)
+    text = re.sub(r"[\\/:*?\"<>|]+", "-", text)
+    text = re.sub(r"\s+", " ", text).strip(" .-_")
+    text = re.sub(r"[-_ ]{2,}", "-", text)
+    return (text or "paper")[:max_len].strip(" .-_") or "paper"
+
+
+def _paper_file_stem(paper: Dict[str, Any]) -> str:
+    arxiv_id = _clean_text(paper.get("arxiv_id"))
+    if arxiv_id:
+        return _safe_filename(arxiv_id.replace("/", "-"))
+    doi = _clean_text(paper.get("doi"))
+    if doi:
+        return "doi-" + _safe_filename(doi, max_len=110)
+    title = _clean_text(paper.get("title"))
+    if title:
+        return _safe_filename(title)
+    paper_id = _clean_text(paper.get("id"))
+    return _safe_filename(paper_id or "paper")
+
+
+def _wiki_ingest_enabled() -> bool:
+    return os.environ.get("PAPERFLOW_WIKI_INGEST", "1").strip().lower() not in {
+        "0",
+        "false",
+        "off",
+        "no",
+    }
+
+
+def ingest_reading_report_to_wiki(
+    *,
+    user_id: str,
+    paper: Dict[str, Any],
+    report_content: str,
+    report_payload: Dict[str, Any],
+    report_path: Optional[str] = None,
+    doc_url: Optional[str] = None,
+    doc_token: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Best-effort wiki ingestion hook for generated reading reports."""
+    if not _wiki_ingest_enabled() or wiki_reading_ingest is None:
+        return None
+    try:
+        return wiki_reading_ingest.ingest_reading_report(
+            user_id=user_id,
+            paper=paper,
+            report_md=report_content,
+            payload=report_payload,
+            report_path=report_path,
+            doc_url=doc_url,
+            doc_token=doc_token,
+        )
+    except Exception as exc:
+        print(f"  Wiki ingest skipped due to error: {exc}")
+        return None
 DEFAULT_REQUEST_HEADERS = {
     "User-Agent": os.environ.get(
         "PAPERFLOW_HTTP_USER_AGENT",
@@ -1020,6 +1142,8 @@ def _build_reused_doc_entry(
         "title": doc_title,
         "url": _clean_text(report_record.get("doc_url")) or None,
         "doc_token": _clean_text(report_record.get("doc_token")) or None,
+        "report_path": _clean_text((report_record.get("metadata") or {}).get("report_path")) or None,
+        "pdf_path": _clean_text((report_record.get("metadata") or {}).get("pdf_path")) or None,
         "report_payload": None,
         "reused": True,
         "created_at": report_record.get("timestamp"),
@@ -1594,6 +1718,56 @@ def _download_pdf(pdf_url: str, title: str, referer: Optional[str] = None) -> st
         return temp_file.name
 
 
+def _persist_pdf_file(source_pdf_path: str, paper: Dict[str, Any], pdf_url: str = "") -> Optional[str]:
+    source_path = Path(source_pdf_path).expanduser()
+    if not source_path.exists():
+        return None
+    target_dir = _resolve_configured_dir("PAPERFLOW_PDF_DIR", "data/papers", paper)
+    target_path = target_dir / f"{_paper_file_stem(paper)}.pdf"
+    if source_path.resolve() != target_path.resolve():
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source_path, target_path)
+    print(f"  Saved PDF: {target_path}")
+    return str(target_path)
+
+
+def _save_reading_report_markdown(
+    *,
+    user_id: str,
+    paper: Dict[str, Any],
+    report_content: str,
+    report_payload: Dict[str, Any],
+    doc_url: Optional[str] = None,
+    doc_token: Optional[str] = None,
+) -> str:
+    target_dir = _resolve_configured_dir("PAPERFLOW_READING_REPORTS_DIR", "data/reading_reports", paper)
+    report_path = target_dir / f"{_paper_file_stem(paper)} - reading-report.md"
+    metadata = {
+        "user_id": user_id,
+        "paper_id": paper.get("id"),
+        "arxiv_id": paper.get("arxiv_id"),
+        "doi": paper.get("doi"),
+        "title": paper.get("title"),
+        "publish_date": paper.get("publish_date"),
+        "pdf_path": paper.get("pdf_path"),
+        "pdf_url": paper.get("pdf_url"),
+        "doc_url": doc_url,
+        "doc_token": doc_token,
+        "generation_provider": report_payload.get("generation_provider"),
+        "generation_model": report_payload.get("generation_model"),
+        "report_version": READING_REPORT_OUTPUT_VERSION,
+        "saved_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    frontmatter = ["---"]
+    for key, value in metadata.items():
+        if value not in (None, "", [], {}):
+            frontmatter.append(f"{key}: {json.dumps(value, ensure_ascii=False)}")
+    frontmatter.extend(["---", ""])
+    report_path.write_text("\n".join(frontmatter) + report_content.strip() + "\n", encoding="utf-8")
+    print(f"  Saved reading markdown: {report_path}")
+    return str(report_path)
+
+
 def _parse_pdf_for_report(pdf_path: str) -> Dict[str, Any]:
     pdf_parser = _load_pdf_parser()
     text = pdf_parser.extract_text_from_pdf(pdf_path)
@@ -1632,6 +1806,9 @@ def enrich_paper_for_reading_report(paper: Dict[str, Any]) -> Tuple[Dict[str, An
             print(f"  Parsing local PDF: {local_pdf_path}")
             parsed_pdf = _parse_pdf_for_report(local_pdf_path)
             parsed_pdf["source_kind"] = "pdf"
+            stored_pdf_path = _persist_pdf_file(local_pdf_path, enriched, _clean_text(enriched.get("pdf_url")))
+            if stored_pdf_path:
+                enriched["pdf_path"] = stored_pdf_path
             print("  Local PDF parsed successfully")
 
             # Enrich metadata from parsed PDF
@@ -1678,6 +1855,7 @@ def enrich_paper_for_reading_report(paper: Dict[str, Any]) -> Tuple[Dict[str, An
     if pdf_url and should_parse_pdf:
         download_candidates = _build_pdf_download_candidates(enriched, pdf_url) or [pdf_url]
         last_exception: Optional[Exception] = None
+        stored_pdf_path: Optional[str] = None
         try:
             for download_candidate in download_candidates:
                 try:
@@ -1691,6 +1869,9 @@ def enrich_paper_for_reading_report(paper: Dict[str, Any]) -> Tuple[Dict[str, An
                     parsed_pdf = _parse_pdf_for_report(temp_pdf_path)
                     parsed_pdf["source_kind"] = "pdf"
                     enriched["pdf_url"] = download_candidate
+                    stored_pdf_path = _persist_pdf_file(temp_pdf_path, enriched, download_candidate)
+                    if stored_pdf_path:
+                        enriched["pdf_path"] = stored_pdf_path
                     pdf_error = None
                     print("  PDF enrichment parsed successfully")
                     break
@@ -1706,7 +1887,9 @@ def enrich_paper_for_reading_report(paper: Dict[str, Any]) -> Tuple[Dict[str, An
         finally:
             if temp_pdf_path:
                 try:
-                    Path(temp_pdf_path).unlink(missing_ok=True)
+                    temp_path = Path(temp_pdf_path)
+                    if not stored_pdf_path or temp_path.resolve() != Path(stored_pdf_path).resolve():
+                        temp_path.unlink(missing_ok=True)
                 except OSError:
                     pass
 
@@ -3327,11 +3510,41 @@ def create_reading_report(
             )
 
             doc_title = f"[精读] {enriched_paper.get('title', 'Unknown')[:80]}"
-            doc_info = create_doc(title=doc_title, content=report_content, folder_id=folder_id)
-            doc_url = extract_doc_url(doc_info)
-            doc_token = extract_doc_token(doc_info)
-            if not doc_url and doc_token:
-                doc_url = _resolve_doc_url_from_meta(doc_token)
+            doc_info: Dict[str, Any] = {"title": doc_title, "local_only": True}
+            doc_url = None
+            doc_token = None
+            feishu_error = None
+            if send_to_feishu:
+                try:
+                    doc_info = create_doc(title=doc_title, content=report_content, folder_id=folder_id)
+                    doc_url = extract_doc_url(doc_info)
+                    doc_token = extract_doc_token(doc_info)
+                    if not doc_url and doc_token:
+                        doc_url = _resolve_doc_url_from_meta(doc_token)
+                except Exception as doc_exc:
+                    feishu_error = str(doc_exc)
+                    print(
+                        "  Feishu document creation failed; "
+                        f"local markdown will still be saved: {doc_exc}"
+                    )
+
+            report_path = _save_reading_report_markdown(
+                user_id=user_id,
+                paper=enriched_paper,
+                report_content=report_content,
+                report_payload=report_payload,
+                doc_url=doc_url,
+                doc_token=doc_token,
+            )
+            wiki_ingest_info = ingest_reading_report_to_wiki(
+                user_id=user_id,
+                paper=enriched_paper,
+                report_content=report_content,
+                report_payload=report_payload,
+                report_path=report_path,
+                doc_url=doc_url,
+                doc_token=doc_token,
+            )
 
             created_doc = {
                 "paper": enriched_paper,
@@ -3339,8 +3552,13 @@ def create_reading_report(
                 "title": doc_title,
                 "url": doc_url,
                 "doc_token": doc_token,
+                "report_path": report_path,
+                "pdf_path": enriched_paper.get("pdf_path"),
                 "report_payload": report_payload,
+                "wiki_ingest": wiki_ingest_info,
             }
+            if feishu_error:
+                created_doc["feishu_error"] = feishu_error
             prepared_docs[target_index] = created_doc
 
             behavior_metadata = {
@@ -3349,9 +3567,16 @@ def create_reading_report(
                 "paper_title": enriched_paper.get("title"),
                 "doc_token": doc_token,
                 "doc_url": doc_url,
+                "report_path": report_path,
+                "pdf_path": enriched_paper.get("pdf_path"),
                 "analysis_source": report_payload.get("analysis_source"),
                 "report_version": READING_REPORT_OUTPUT_VERSION,
             }
+            if feishu_error:
+                behavior_metadata["feishu_error"] = feishu_error
+            if wiki_ingest_info:
+                behavior_metadata["wiki_paper_node"] = wiki_ingest_info.get("paper_node")
+                behavior_metadata["wiki_section_count"] = wiki_ingest_info.get("section_count")
             for key in (
                 "report_source_type",
                 "report_source_key",

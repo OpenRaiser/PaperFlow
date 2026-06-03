@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="PaperFlow">
+  <defs>
+    <linearGradient id="paperflow-mark" x1="10" y1="8" x2="54" y2="56" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0b463d"/>
+      <stop offset="0.58" stop-color="#15836d"/>
+      <stop offset="1" stop-color="#e2a048"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="12" fill="url(#paperflow-mark)"/>
+  <path d="M18 17h15.5c7.2 0 12 4.3 12 10.8 0 6.7-4.9 10.9-12.4 10.9H27v9.8h-9V17zm9 7.5v12h5.4c4.1 0 6.5-2.2 6.5-5.9 0-3.9-2.4-6.1-6.5-6.1H27z" fill="#fff"/>
+  <path d="M41.5 48.5c5.7-2.4 8.8-6.5 9.4-12.4" fill="none" stroke="#fff" stroke-width="4" stroke-linecap="round"/>
+</svg>

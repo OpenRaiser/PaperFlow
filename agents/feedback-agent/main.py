@@ -44,6 +44,14 @@ get_drift_blend_weights = profile_updater.get_drift_blend_weights
 direction_lexicon = importlib.import_module("config.direction_lexicon")
 canonicalize_direction_terms = direction_lexicon.canonicalize_direction_terms
 format_direction_label = direction_lexicon.format_direction_label
+try:
+    wiki_feedback_ingest = importlib.import_module("agents.wiki-agent.ingest.from_feedback")
+except Exception:
+    wiki_feedback_ingest = None
+try:
+    wiki_drift_ingest = importlib.import_module("agents.wiki-agent.ingest.from_profile_drift")
+except Exception:
+    wiki_drift_ingest = None
 
 # 飞书报告器
 feishu_reporter = importlib.import_module("deployments.feishu.feishu-reporter.scripts.feishu_reporter")
@@ -56,6 +64,69 @@ CATEGORY_LABELS = {
     "maybe_interested": "🟡 可能感兴趣",
     "edge_relevant": "🔵 边缘相关",
 }
+
+
+def _wiki_ingest_enabled() -> bool:
+    return os.environ.get("PAPERFLOW_WIKI_INGEST", "1").strip().lower() not in {
+        "0",
+        "false",
+        "off",
+        "no",
+    }
+
+
+def ingest_feedback_to_wiki(
+    *,
+    user_id: str,
+    push_id: str,
+    paper: Dict[str, Any],
+    action: str,
+    action_type: str,
+    category: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+    behavior_log_id: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
+    """Best-effort wiki ingestion hook for explicit feedback events."""
+    if not _wiki_ingest_enabled() or wiki_feedback_ingest is None:
+        return None
+    try:
+        return wiki_feedback_ingest.ingest_feedback_event(
+            user_id=user_id,
+            push_id=push_id,
+            paper=paper,
+            action=action,
+            action_type=action_type,
+            category=category,
+            metadata=metadata,
+            behavior_log_id=behavior_log_id,
+        )
+    except Exception as exc:
+        print(f"  Wiki feedback ingest skipped due to error: {exc}")
+        return None
+
+
+def ingest_profile_drift_to_wiki(
+    *,
+    user_id: str,
+    before: Dict[str, Any],
+    after: Dict[str, Any],
+    evidence_papers: Optional[List[Dict[str, Any]]] = None,
+    source_ref: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Best-effort wiki ingestion hook for profile drift snapshots."""
+    if not _wiki_ingest_enabled() or wiki_drift_ingest is None:
+        return None
+    try:
+        return wiki_drift_ingest.ingest_drift(
+            user_id=user_id,
+            before=before,
+            after=after,
+            evidence_papers=evidence_papers or [],
+            source_ref=source_ref,
+        )
+    except Exception as exc:
+        print(f"  Wiki drift ingest skipped due to error: {exc}")
+        return None
 
 
 def _paper_topic_candidates(paper: Dict[str, Any]) -> List[str]:
@@ -610,19 +681,31 @@ def process_feedback(
         if 0 <= idx < len(papers):
             paper = papers[idx]
             paper_id = paper.get("id")  # 假设有数据库 ID
+            category = paper.get("category", "unknown")
+            metadata = {
+                "paper_number": paper_num,
+                "arxiv_id": paper.get("arxiv_id"),
+                "push_context": "daily_push",
+            }
 
-            log_behavior(
+            behavior_log_id = log_behavior(
                 user_id=user_id,
                 push_id=push_id,
                 paper_id=paper_id,
                 action="selected",
                 action_type="selected",
-                category=paper.get("category", "unknown"),
-                metadata={
-                    "paper_number": paper_num,
-                    "arxiv_id": paper.get("arxiv_id"),
-                    "push_context": "daily_push",
-                }
+                category=category,
+                metadata=metadata,
+            )
+            ingest_feedback_to_wiki(
+                user_id=user_id,
+                push_id=push_id,
+                paper=paper,
+                action="selected",
+                action_type="selected",
+                category=category,
+                metadata=metadata,
+                behavior_log_id=behavior_log_id,
             )
 
     all_numbers = set(range(1, len(papers) + 1))
@@ -650,20 +733,32 @@ def process_feedback(
             if 0 <= idx < len(papers):
                 paper = papers[idx]
                 paper_id = paper.get("id")
+                category = paper.get("category", "unknown")
+                metadata = {
+                    "paper_number": paper_num,
+                    "arxiv_id": paper.get("arxiv_id"),
+                    "push_context": "daily_push",
+                    "selection_state": "explicit_none" if is_none_command else "initial_unselected",
+                }
 
-                log_behavior(
+                behavior_log_id = log_behavior(
                     user_id=user_id,
                     push_id=push_id,
                     paper_id=paper_id,
                     action="skipped",
                     action_type="skipped",
-                    category=paper.get("category", "unknown"),
-                    metadata={
-                        "paper_number": paper_num,
-                        "arxiv_id": paper.get("arxiv_id"),
-                        "push_context": "daily_push",
-                        "selection_state": "explicit_none" if is_none_command else "initial_unselected",
-                    }
+                    category=category,
+                    metadata=metadata,
+                )
+                ingest_feedback_to_wiki(
+                    user_id=user_id,
+                    push_id=push_id,
+                    paper=paper,
+                    action="skipped",
+                    action_type="skipped",
+                    category=category,
+                    metadata=metadata,
+                    behavior_log_id=behavior_log_id,
                 )
 
     skip_profile_learning = reply_lower == "all lock"
@@ -674,6 +769,7 @@ def process_feedback(
     else:
         selected_for_learning = set(selected) if not previously_selected else set(newly_selected)
         skipped_for_learning = set(skipped) if (is_none_command or not previously_selected) else set()
+        profile_before_update = get_profile(user_id) or {}
         if selected_for_learning or skipped_for_learning or is_none_command:
             updated_profile = update_profile_based_on_selection(
                 user_id,
@@ -686,6 +782,19 @@ def process_feedback(
             )
         else:
             updated_profile = get_profile(user_id) or {}
+        evidence_numbers = sorted(set(selected_for_learning) | set(skipped_for_learning))
+        evidence_papers = [
+            papers[paper_num - 1]
+            for paper_num in evidence_numbers
+            if 0 <= paper_num - 1 < len(papers)
+        ]
+        ingest_profile_drift_to_wiki(
+            user_id=user_id,
+            before=profile_before_update,
+            after=updated_profile or {},
+            evidence_papers=evidence_papers,
+            source_ref=push_id,
+        )
         drift_state = (updated_profile or {}).get("drift_state", {}) or {}
         log_behavior(
             user_id=user_id,

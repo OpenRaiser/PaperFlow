@@ -87,6 +87,97 @@ def test_create_reading_report_sends_doc_links(monkeypatch):
     )
 
 
+def test_create_reading_report_saves_markdown_to_configured_dir(monkeypatch, tmp_path):
+    report_dir = tmp_path / "Obsidian Vault" / "Daily Note 2026" / "arXiv - May 2026"
+    pdf_path = tmp_path / "paper.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4\n")
+
+    monkeypatch.setenv("PAPERFLOW_READING_REPORTS_DIR", str(report_dir))
+    monkeypatch.setenv("PAPERFLOW_STORAGE_MONTHLY_SUBDIR", "false")
+    monkeypatch.setenv("PAPERFLOW_WIKI_INGEST", "false")
+    monkeypatch.setattr(reading_agent, "get_profile", lambda user_id: {"core_directions": {"agents": 0.8}})
+    monkeypatch.setattr(reading_agent, "get_existing_reading_reports_for_papers", lambda user_id, paper_ids: {})
+    monkeypatch.setattr(reading_agent, "get_recent_created_report_by_source", lambda *args, **kwargs: None)
+    monkeypatch.setattr(reading_agent, "_synthesize_report_with_llm", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        reading_agent,
+        "enrich_paper_for_reading_report",
+        lambda paper: ({**paper, "pdf_path": str(pdf_path)}, None, None),
+    )
+    monkeypatch.setattr(
+        reading_agent,
+        "create_doc",
+        lambda title, content, folder_id=None: {"url": "https://example.feishu.cn/docx/1", "obj_token": "doc_1"},
+    )
+    logged = []
+    monkeypatch.setattr(reading_agent, "log_behavior", lambda **kwargs: logged.append(kwargs))
+
+    docs = reading_agent.create_reading_report(
+        user_id="user_rolea",
+        paper_ids=[1],
+        papers=[
+            {
+                "id": 1,
+                "arxiv_id": "2605.30353",
+                "title": "Obsidian Friendly Paper",
+                "authors": ["Alice"],
+                "abstract": "A paper about local Markdown organization.",
+                "publish_date": "2026-05-31",
+            }
+        ],
+        send_to_feishu=False,
+    )
+
+    report_path = Path(docs[0]["report_path"])
+    assert report_path.parent == report_dir
+    assert report_path.name == "2605.30353 - reading-report.md"
+    assert "Obsidian Friendly Paper" in report_path.read_text(encoding="utf-8")
+    created_report_log = next(log for log in logged if log["action_type"] == "reading")
+    assert created_report_log["metadata"]["report_path"] == str(report_path)
+    assert created_report_log["metadata"]["pdf_path"] == str(pdf_path)
+
+
+def test_create_reading_report_keeps_local_markdown_when_feishu_doc_fails(monkeypatch, tmp_path):
+    report_dir = tmp_path / "reports"
+    monkeypatch.setenv("PAPERFLOW_READING_REPORTS_DIR", str(report_dir))
+    monkeypatch.setenv("PAPERFLOW_STORAGE_MONTHLY_SUBDIR", "false")
+    monkeypatch.setenv("PAPERFLOW_WIKI_INGEST", "false")
+    monkeypatch.setattr(reading_agent, "get_profile", lambda user_id: {"core_directions": {"agents": 0.8}})
+    monkeypatch.setattr(reading_agent, "get_existing_reading_reports_for_papers", lambda user_id, paper_ids: {})
+    monkeypatch.setattr(reading_agent, "get_recent_created_report_by_source", lambda *args, **kwargs: None)
+    monkeypatch.setattr(reading_agent, "_synthesize_report_with_llm", lambda *args, **kwargs: None)
+    monkeypatch.setattr(reading_agent, "enrich_paper_for_reading_report", lambda paper: (paper, None, None))
+    monkeypatch.setattr(
+        reading_agent,
+        "create_doc",
+        lambda title, content, folder_id=None: (_ for _ in ()).throw(RuntimeError("missing feishu config")),
+    )
+    logged = []
+    monkeypatch.setattr(reading_agent, "log_behavior", lambda **kwargs: logged.append(kwargs))
+
+    docs = reading_agent.create_reading_report(
+        user_id="user_rolea",
+        paper_ids=[1],
+        papers=[
+            {
+                "id": 1,
+                "arxiv_id": "2605.30354",
+                "title": "Local First Report",
+                "authors": ["Alice"],
+                "abstract": "A paper about local-first reading reports.",
+            }
+        ],
+        send_to_feishu=True,
+    )
+
+    assert len(docs) == 1
+    assert docs[0]["url"] is None
+    assert "missing feishu config" in docs[0]["feishu_error"]
+    assert Path(docs[0]["report_path"]).exists()
+    created_report_log = next(log for log in logged if log["action_type"] == "reading")
+    assert "missing feishu config" in created_report_log["metadata"]["feishu_error"]
+
+
 def test_create_reading_report_uses_tracking_links_when_public_url_available(monkeypatch):
     monkeypatch.setattr(reading_agent, "get_profile", lambda user_id: {"core_directions": {"machine-learning": 0.8}})
     monkeypatch.setattr(reading_agent, "log_behavior", lambda **kwargs: None)
@@ -496,11 +587,13 @@ def test_create_reading_report_uses_pdf_enrichment_for_doc_content(monkeypatch):
 
     assert len(docs) == 1
     assert docs[0]["report_payload"]["analysis_source"] == "pdf"
-    assert "two-stage planner" in captured["content"].lower()
-    assert "ranking quality" in captured["content"].lower()
-    assert "## 代码与资源" in captured["content"]
-    assert "## 推荐指数" in captured["content"]
-    assert "<!--" not in captured["content"]
+    report_content = Path(docs[0]["report_path"]).read_text(encoding="utf-8")
+    assert "two-stage planner" in report_content.lower()
+    assert "ranking quality" in report_content.lower()
+    assert "## 代码与资源" in report_content
+    assert "## 推荐指数" in report_content
+    assert "<!--" not in report_content
+    assert captured == {}
 
 
 def test_create_reading_report_regenerates_existing_doc_when_metadata_is_incomplete(monkeypatch):
@@ -566,8 +659,9 @@ def test_create_reading_report_regenerates_existing_doc_when_metadata_is_incompl
 
     assert len(docs) == 1
     assert docs[0].get("reused") is not True
-    assert docs[0]["url"] == "https://example.feishu.cn/docx/new"
-    assert "Recovered abstract from source page." in created["content"]
+    assert docs[0]["url"] is None
+    assert "Recovered abstract from source page." in Path(docs[0]["report_path"]).read_text(encoding="utf-8")
+    assert created == {}
 
 
 def test_create_reading_report_regenerates_old_version_report_even_when_metadata_complete(monkeypatch):
@@ -622,7 +716,9 @@ def test_create_reading_report_regenerates_old_version_report_even_when_metadata
 
     assert len(docs) == 1
     assert docs[0].get("reused") is not True
-    assert docs[0]["url"] == "https://example.feishu.cn/docx/regenerated"
+    assert docs[0]["url"] is None
+    assert Path(docs[0]["report_path"]).exists()
+    assert created == {}
 
 
 def test_enrich_paper_for_reading_report_replaces_feed_style_abstract(monkeypatch):
@@ -1100,8 +1196,9 @@ def test_create_reading_report_reuses_existing_docs_for_selected_papers(monkeypa
     assert len(docs) == 2
     assert docs[0]["url"] == "https://example.feishu.cn/docx/existing-1"
     assert docs[0]["reused"] is True
-    assert docs[1]["url"] == "https://example.feishu.cn/docx/new-2"
-    assert create_doc_calls == ["[精读] Paper Two"]
+    assert docs[1]["url"] is None
+    assert Path(docs[1]["report_path"]).exists()
+    assert create_doc_calls == []
 
 
 def test_create_reading_report_reuses_existing_pdf_doc_without_regeneration(monkeypatch):
@@ -1314,6 +1411,48 @@ def test_download_pdf_uses_http_get_with_pdf_accept_and_referer(monkeypatch):
     assert captured["accept_pdf"] is True
     assert captured["referer"] == "https://example.com/article"
     Path(pdf_path).unlink(missing_ok=True)
+
+
+def test_enrich_paper_persists_downloaded_pdf_to_configured_dir(monkeypatch, tmp_path):
+    storage_dir = tmp_path / "Obsidian Vault" / "Daily Note 2026" / "arXiv - May 2026"
+    source_pdf = tmp_path / "downloaded.pdf"
+    source_pdf.write_bytes(b"%PDF-1.4\nfake")
+
+    class EmptyFetcher:
+        @staticmethod
+        def get_paper_detail(arxiv_id, timeout=None):
+            return None
+
+    monkeypatch.setenv("PAPERFLOW_PDF_DIR", str(storage_dir))
+    monkeypatch.setenv("PAPERFLOW_STORAGE_MONTHLY_SUBDIR", "false")
+    monkeypatch.setattr(reading_agent, "_load_arxiv_fetcher", lambda: EmptyFetcher)
+    monkeypatch.setattr(reading_agent, "_download_pdf", lambda *args, **kwargs: str(source_pdf))
+    monkeypatch.setattr(
+        reading_agent,
+        "_parse_pdf_for_report",
+        lambda path: {
+            "abstract": "Parsed PDF abstract.",
+            "authors": ["Alice"],
+            "sections": {},
+            "full_text": "Parsed PDF abstract.",
+        },
+    )
+
+    enriched, parsed_pdf, pdf_error = reading_agent.enrich_paper_for_reading_report(
+        {
+            "arxiv_id": "2605.30353v1",
+            "title": "Stored PDF Paper",
+            "authors": [],
+            "abstract": "",
+            "publish_date": "2026-05-31",
+        }
+    )
+
+    stored_pdf = storage_dir / "2605.30353v1.pdf"
+    assert pdf_error is None
+    assert parsed_pdf is not None
+    assert stored_pdf.exists()
+    assert enriched["pdf_path"] == str(stored_pdf)
 
 
 def test_pick_download_referer_prefers_same_host():

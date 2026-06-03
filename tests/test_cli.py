@@ -46,7 +46,7 @@ def test_cli_version_flag_long() -> None:
 def test_cli_help_lists_all_commands() -> None:
     result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0
-    for command in ("init", "doctor", "profile", "daily", "read", "feedback", "demo", "eval"):
+    for command in ("init", "doctor", "profile", "daily", "read", "feedback", "wiki", "gui", "demo", "eval"):
         assert command in result.stdout
 
 
@@ -144,6 +144,14 @@ def test_cli_feedback_help_lists_options() -> None:
 
 
 @pytest.mark.unit
+def test_cli_gui_help_lists_options() -> None:
+    result = runner.invoke(app, ["gui", "--help"])
+    assert result.exit_code == 0
+    for opt in ("--host", "--port", "--no-browser"):
+        assert opt in result.stdout
+
+
+@pytest.mark.unit
 def test_cli_daily_help_lists_options() -> None:
     result = runner.invoke(app, ["daily", "--help"])
     assert result.exit_code == 0
@@ -157,6 +165,86 @@ def test_cli_eval_help_lists_options() -> None:
     assert result.exit_code == 0
     for opt in ("--benchmark-dir", "--predictions", "--output"):
         assert opt in result.stdout
+
+
+@pytest.mark.unit
+def test_cli_wiki_help_lists_subcommands() -> None:
+    result = runner.invoke(app, ["wiki", "--help"])
+    assert result.exit_code == 0
+    for command in ("init", "list", "search", "stats", "embed", "topics", "ask", "backfill", "monthly"):
+        assert command in result.stdout
+
+
+@pytest.mark.unit
+def test_cli_wiki_search_delegates_to_wiki_agent(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run_python(script: Path, *args: str) -> int:
+        captured["script"] = script
+        captured["args"] = list(args)
+        return 0
+
+    monkeypatch.setattr("paperflow.cli._run_python", fake_run_python)
+
+    result = runner.invoke(
+        app,
+        ["wiki", "search", "graph rag", "--user-id", "user_alice", "--type", "section", "--limit", "5"],
+    )
+
+    assert result.exit_code == 0
+    assert str(captured["script"]).endswith(str(Path("agents") / "wiki-agent" / "main.py"))
+    assert captured["args"] == [
+        "search",
+        "graph rag",
+        "--user-id",
+        "user_alice",
+        "--limit",
+        "5",
+        "--type",
+        "section",
+    ]
+
+
+@pytest.mark.unit
+def test_cli_wiki_monthly_delegates_to_wiki_agent(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run_python(script: Path, *args: str) -> int:
+        captured["script"] = script
+        captured["args"] = list(args)
+        return 0
+
+    monkeypatch.setattr("paperflow.cli._run_python", fake_run_python)
+
+    result = runner.invoke(
+        app,
+        [
+            "wiki",
+            "monthly",
+            "--user-id",
+            "user_alice",
+            "--month",
+            "2026-05",
+            "--output-dir",
+            str(tmp_path / "daily-note"),
+            "--topic-index-dir",
+            str(tmp_path / "topic-index"),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert str(captured["script"]).endswith(str(Path("agents") / "wiki-agent" / "main.py"))
+    assert captured["args"] == [
+        "monthly",
+        "--user-id",
+        "user_alice",
+        "--month",
+        "2026-05",
+        "--output-dir",
+        str(tmp_path / "daily-note"),
+        "--topic-index-dir",
+        str(tmp_path / "topic-index"),
+    ]
 
 
 @pytest.mark.unit

@@ -8,7 +8,7 @@ that compose the daily-pipeline / reading-report / feedback / drift loop.
                  +------------------------------------------+
                  |             paperflow CLI (typer)         |
                  |   init / doctor / daily / read / feedback |
-                 |   demo / eval                             |
+                 |   wiki / gui / demo / eval                |
                  +------------------------------------------+
                                      |
                                      v
@@ -35,10 +35,10 @@ that compose the daily-pipeline / reading-report / feedback / drift loop.
                                         +-----------------------+
                                                   ^
                                                   |
-                                  +---------------+----------------+
-                                  |  deployments/feishu/ (optional)|
-                                  |  webhook + daily push          |
-                                  +--------------------------------+
+                 +----------------+----------------+---------------+
+                 | deployments/desktop/             | deployments/feishu/ |
+                 | local browser GUI                | webhook + daily push|
+                 +----------------------------------+---------------------+
 ```
 
 ## CLI layer (`paperflow/cli.py`)
@@ -99,6 +99,7 @@ Agents are coarse-grained units that compose the user-visible pipeline:
 | `coldstart-agent`     | Bootstrap a structured profile from text/PDF/homepage      |
 | `reading-agent`       | Generate per-paper personalized reading reports            |
 | `feedback-agent`      | Translate user signals into profile + drift updates        |
+| `wiki-agent`          | Ingest pushes, reading reports, feedback, drift, and topics into the local wiki |
 | `must-read-manager`   | Maintain author/keyword anchor lists                       |
 | `profile-report-agent`| Produce long-form profile reports                          |
 | `master-coordinator`  | Cross-agent orchestration, intent parsing                  |
@@ -119,6 +120,7 @@ the agents call into:
 | `journal-fetcher`    | RSS / API journal fetchers                           |
 | `profile-updater`    | Score papers against profile, drift bookkeeping      |
 | `storage-helper`     | SQLite + embedding cache I/O                         |
+| `wiki-store`         | Wiki nodes, edges, citations, and Markdown mirrors   |
 | `feishu-reporter`    | Card rendering for the Feishu deployment             |
 
 Skills are resolved with `importlib` because some directory names contain
@@ -143,6 +145,41 @@ unrelated agents.
    display budget.
 5. **Push (optional).** If running under `deployments/feishu/`, the cards
    are rendered and pushed via the Feishu webhook.
+
+## Data flow: feedback and profile learning
+
+Feedback is surface-independent. CLI feedback, GUI feedback, and Feishu/Lark
+chat replies all converge on the same profile-learning path for the matching
+`user_id`:
+
+```text
+CLI paperflow feedback
+GUI selected / not-interested actions
+Feishu/Lark numeric replies
+        |
+        v
+agents/feedback-agent
+        |
+        +--> behavior_logs in data/paperflow.db
+        +--> skills/profile-updater updates topic weights and drift state
+        +--> wiki-agent mirrors paper / trajectory / topic evidence
+```
+
+Reading reports form a second, weaker signal path:
+
+```text
+paperflow read / GUI arXiv read / GUI local PDF read
+        |
+        v
+agents/reading-agent
+        |
+        +--> local Markdown report
+        +--> optional Feishu doc export
+        +--> reading-signal state in the profile
+        +--> wiki paper and section nodes
+```
+
+See [feedback-loop.md](feedback-loop.md) for the user-facing behavior.
 
 ## Storage
 
@@ -186,3 +223,23 @@ deployments/feishu/
 
 CLI users never need to look at this directory. See
 [feishu-webhook-setup.md](feishu-webhook-setup.md) if you want the bot.
+
+## Local GUI deployment (`deployments/desktop/`)
+
+The local GUI is another deployment surface, parallel to Feishu/Lark. It uses
+a Python stdlib HTTP server and static HTML/CSS/JS, so it adds no runtime
+dependency:
+
+```text
+deployments/desktop/
+├── server.py          Local HTTP API + static-file server
+├── shared/agents.py   GUI-safe wrapper around agents/skills
+├── static/            Browser UI
+└── README.md
+```
+
+`paperflow gui` starts the server and opens a browser. It reads and writes the
+same `data/paperflow.db`, `PAPERFLOW_PDF_DIR`,
+`PAPERFLOW_READING_REPORTS_DIR`, and `PAPERFLOW_WIKI_DIR` used by the CLI.
+It does not manage background schedules; scheduled push delivery remains in
+`deployments/feishu/`.

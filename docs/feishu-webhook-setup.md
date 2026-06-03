@@ -4,6 +4,9 @@
 
 `webhook + ngrok`
 
+如果只是把精读报告创建成飞书文档，不需要 webhook 或 ngrok；请看
+[feishu-doc-export.md](feishu-doc-export.md)。
+
 ## 1. 填好 `.env`
 
 最少需要：
@@ -249,7 +252,25 @@ python agents/role-manager/main.py --command "绑定 alice oc_xxxxxxxx"
 | `绑定 <name> <chat_id>` | 把 chat_id 写到 role 上 |
 | `角色列表` | 列出所有 role |
 
-### 5.5 怎么知道某个群的 chat_id
+### 5.5 飞书反馈和 CLI 反馈的关系
+
+飞书群里回复 `1 3`、`1-5`、`none`、`全部`、`没有` 时，webhook 会先根据
+`chat_id` 找到绑定的 role / `user_id`，然后调用和 CLI 一样的
+`feedback-agent`。因此下面两种方式对同一个 `user_id` 来说是等价的画像学习信号：
+
+```text
+飞书群里回复：1 3
+```
+
+```bash
+paperflow feedback --user-id user_alice --push-id <latest_push_id> --reply "1 3"
+```
+
+二者都会写入 `data/paperflow.db`，更新用户画像、selected/skipped 行为日志、
+drift 状态，并在开启 `PAPERFLOW_WIKI_INGEST=true` 时同步到本地 wiki。完整闭环见
+[feedback-loop.md](feedback-loop.md)。
+
+### 5.6 怎么知道某个群的 chat_id
 
 飞书界面里看不到 chat_id。最快的办法：bot 进群后，群里 @bot 发任意一句话，本地 webhook 终端会打印：
 

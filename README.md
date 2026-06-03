@@ -20,7 +20,10 @@ and adapt tomorrow's recommendations.
 ![Interest Drift](https://img.shields.io/badge/interest-drift-00897B.svg)
 ![Feishu/Lark](https://img.shields.io/badge/Feishu%2FLark-bot-00A1E9.svg)
 
-[Quick Start](#quick-start) | [CLI Usage](#cli-usage) |
+[Quick Start](#quick-start) | [Local GUI](#local-gui) |
+[GUI Preview](https://openraiser.github.io/PaperFlow/deployments/desktop/static/index.html?demo=1) |
+[CLI Usage](#cli-usage) |
+[Feedback Loop](docs/feedback-loop.md) |
 [Feishu/Lark Bot](#feishu--lark-bot) |
 [PaperFlow-Bench](#paperflow-bench) | [Reproduce](experiments/REPRODUCE.md)
 
@@ -32,10 +35,10 @@ and adapt tomorrow's recommendations.
 
 ## Current Release
 
-This first public release is a **CLI + optional Feishu/Lark bot** version. It
-does not include a graphical dashboard. You can run PaperFlow entirely from the
-terminal, or keep the Feishu/Lark webhook server alive for scheduled chat
-pushes.
+This first public release is a **CLI + local browser GUI + optional
+Feishu/Lark bot** version. You can run PaperFlow entirely from the terminal,
+open a local GUI for interactive paper selection, or keep the Feishu/Lark
+webhook server alive for scheduled chat pushes.
 
 <table>
   <tr>
@@ -48,7 +51,7 @@ pushes.
   </tr>
   <tr>
     <td><b>Runtime</b></td>
-    <td>Local Python CLI, SQLite, optional Feishu/Lark webhook + ngrok</td>
+    <td>Local Python CLI, local browser GUI, SQLite, optional Feishu/Lark webhook + ngrok</td>
   </tr>
   <tr>
     <td><b>Benchmark</b></td>
@@ -77,7 +80,7 @@ the system adapt tomorrow?**
 | Profile bootstrapping | Builds scholarly profiles from text, PDFs, homepages, or Google Scholar pages |
 | Daily recommendation | Fetches arXiv, OpenReview, and journal papers, then ranks a personalized daily digest |
 | Reading reports | Generates personalized paper reports from metadata and PDF content |
-| Feedback learning | Updates user state from selected, skipped, read, and natural-language feedback |
+| Feedback learning | Updates the same profile from CLI, GUI, Feishu/Lark, selected, skipped, read, and natural-language feedback |
 | Drift adaptation | Tracks short-window vs long-window interest movement across days |
 | Feishu/Lark bot | Sends daily pushes and weekly reports; routes chat feedback and PDF requests |
 | Benchmark tooling | Packages, downloads, predicts, and evaluates PaperFlow-Bench submissions |
@@ -110,6 +113,9 @@ paperflow daily --user-id user_alice
 
 # 5. Read selected papers (paper IDs come from the latest daily push)
 paperflow read 1 3 7 --user-id user_alice
+
+# Optional: use the local browser GUI for steps 4-5
+paperflow gui
 ```
 
 > **Step 3 is mandatory.** `paperflow daily / read / feedback` all read the
@@ -202,6 +208,36 @@ Inspect the resulting profile any time with:
 python scripts/show_profile.py user_alice
 ```
 
+## Local GUI
+
+Start the local browser GUI with:
+
+```bash
+paperflow gui
+```
+
+To preview the interface without installing PaperFlow, open the GitHub Pages
+mock-data preview:
+[PaperFlow GUI Preview](https://openraiser.github.io/PaperFlow/deployments/desktop/static/index.html?demo=1).
+
+The GUI uses the same local SQLite database as the CLI. It is designed for the
+real daily workflow: select a user profile, run or load the latest daily push,
+mark papers for reading, mark explicit negative feedback, generate local
+Markdown reading reports, manage must-read anchors, read an arXiv ID or local
+PDF directly, manage local research roles, filter feedback history, and search
+the PaperFlow Wiki. It does not run background schedules; scheduled
+Feishu/Lark delivery still uses `deployments/feishu/`.
+
+Useful options:
+
+```bash
+paperflow gui --port 8766
+paperflow gui --host 0.0.0.0 --no-browser
+```
+
+Detailed GUI notes are in
+[deployments/desktop/README.md](deployments/desktop/README.md).
+
 ## CLI Usage
 
 ```bash
@@ -216,7 +252,9 @@ paperflow --help
 | `paperflow profile` | Create or update a user profile from text, PDFs, Scholar, or homepage data |
 | `paperflow daily` | Generate a daily personalized paper push |
 | `paperflow read` | Generate a personalized reading report |
+| `paperflow wiki` | List, search, and inspect the local reading wiki |
 | `paperflow feedback` | Record feedback for a previous push |
+| `paperflow gui` | Start the local browser GUI |
 | `paperflow eval` | Evaluate PaperFlow-Bench predictions |
 
 Generate a daily recommendation card without sending it:
@@ -242,6 +280,43 @@ By default, `paperflow read` uses that user's latest push in
 paperflow read 1 3 7 --user-id user_role1 --push-id push_20260401_090000 --no-feishu
 ```
 
+Daily pushes, reading reports, feedback signals, and profile-drift snapshots
+are also ingested into the local PaperFlow Wiki. Inspect it:
+
+```bash
+paperflow wiki backfill --user-id user_role1
+paperflow wiki topics --user-id user_role1
+paperflow wiki stats --user-id user_role1
+paperflow wiki search "graph rag" --user-id user_role1
+paperflow wiki ask "What have I read about graph RAG?" --user-id user_role1
+```
+
+PDFs and reading-report Markdown can be saved directly into an Obsidian vault:
+
+```env
+PAPERFLOW_PDF_DIR=/Users/mario/Documents/Obsidian Vault/Daily Note/Daily Note 2026/arXiv - May 2026
+PAPERFLOW_READING_REPORTS_DIR=/Users/mario/Documents/Obsidian Vault/Daily Note/Daily Note 2026/arXiv - May 2026
+PAPERFLOW_MONTHLY_REPORT_DIR=/Users/mario/Documents/Obsidian Vault/Daily Note/Daily Note 2026
+PAPERFLOW_TOPIC_INDEX_DIR=/Users/mario/Documents/Obsidian Vault/Daily Note/Daily Note 2026/topic index
+```
+
+Export a monthly reading summary and Topic Index for Obsidian:
+
+```bash
+paperflow wiki monthly --user-id user_role1 --month 2026-05
+```
+
+Feishu/Lark document export is optional and separate from the GUI and CLI core.
+Configuration is in [docs/feishu-doc-export.md](docs/feishu-doc-export.md).
+After configuring Feishu, CLI usage is:
+
+```bash
+paperflow read 1 --user-id user_role1
+paperflow read 1 --user-id user_role1 --folder-id <feishu_folder_token>
+```
+
+In the GUI, tick "同时尝试写入飞书文档" when generating a reading report.
+
 Record feedback:
 
 ```bash
@@ -251,10 +326,18 @@ paperflow feedback \
   --reply "1, 3"
 ```
 
+Feedback from CLI, GUI, and Feishu/Lark bot replies is stored in the same
+SQLite database and updates the same profile for that `user_id`. See
+[docs/feedback-loop.md](docs/feedback-loop.md) for the full learning path.
+
 ## Feishu / Lark Bot
 
 The Feishu/Lark integration is optional. Use it when you want PaperFlow to run
 as a chat bot with scheduled pushes and weekly reports.
+
+If you only want reading reports exported as Feishu/Lark docs, use
+[docs/feishu-doc-export.md](docs/feishu-doc-export.md) instead; that path does
+not require ngrok or webhook callbacks.
 
 Add the Feishu/Lark and ngrok values to `.env`:
 
@@ -362,6 +445,7 @@ PaperFlow/
   paperflow/                 CLI and provider abstraction
   agents/                    Core workflow agents
   skills/                    Fetching, parsing, profile, and storage helpers
+  deployments/desktop/       Optional local browser GUI
   deployments/feishu/        Optional Feishu/Lark bot deployment
   experiments/               Benchmark and paper reproduction scripts
   scripts/                   Operational utilities
@@ -379,6 +463,19 @@ pytest experiments/tests -q
 
 The GitHub Actions workflow runs the main test suite. Experiment tests are kept
 in `experiments/tests/` for benchmark and reproduction validation.
+
+## Documentation
+
+For a complete guide map, see [docs/README.md](docs/README.md). The most common
+follow-ups are:
+
+- [docs/quickstart.md](docs/quickstart.md) for the first local run
+- [docs/configuration.md](docs/configuration.md) for environment variables and paths
+- [docs/feedback-loop.md](docs/feedback-loop.md) for CLI / GUI / Feishu profile learning
+- [deployments/desktop/README.md](deployments/desktop/README.md) for local GUI behavior
+- [PaperFlow GUI Preview](https://openraiser.github.io/PaperFlow/deployments/desktop/static/index.html?demo=1) for a no-install UI preview
+- [docs/feishu-doc-export.md](docs/feishu-doc-export.md) for Feishu document export
+- [docs/feishu-webhook-setup.md](docs/feishu-webhook-setup.md) for webhook + ngrok bot deployment
 
 ## Citation
 

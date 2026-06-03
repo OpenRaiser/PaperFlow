@@ -88,6 +88,14 @@ def _normalize_embed_provider(raw: Optional[str]) -> str:
     return "sentence_transformers"
 
 
+def _first_env(*names: str) -> str:
+    for name in names:
+        value = os.environ.get(name, "").strip()
+        if value:
+            return value
+    return ""
+
+
 def load_provider_config() -> ProviderConfig:
     """Read provider settings from the environment.
 
@@ -95,15 +103,24 @@ def load_provider_config() -> ProviderConfig:
     fine to call repeatedly, and tests can monkeypatch ``os.environ``.
     """
 
-    llm_provider = _normalize_llm_provider(os.environ.get("PAPERFLOW_LLM_PROVIDER"))
+    llm_provider = _normalize_llm_provider(
+        _first_env("PAPERFLOW_LLM_PROVIDER", "LLM_PARSER_PROVIDER")
+    )
     llm_model = (
-        os.environ.get("PAPERFLOW_LLM_MODEL", "").strip()
+        _first_env(
+            "PAPERFLOW_LLM_MODEL",
+            "LLM_PARSER_OPENAI_MODEL",
+            "DASHSCOPE_LLM_MODEL",
+            "HF_LLM_MODEL",
+        )
         or _DEFAULT_LLM_MODEL[llm_provider]
     )
 
-    embed_provider = _normalize_embed_provider(os.environ.get("PAPERFLOW_EMBED_PROVIDER"))
+    embed_provider = _normalize_embed_provider(
+        _first_env("PAPERFLOW_EMBED_PROVIDER", "EMBEDDING_PROVIDER")
+    )
     embed_model = (
-        os.environ.get("PAPERFLOW_EMBED_MODEL", "").strip()
+        _first_env("PAPERFLOW_EMBED_MODEL", "EMBEDDING_MODEL")
         or _DEFAULT_EMBED_MODEL[embed_provider]
     )
 

@@ -77,6 +77,9 @@ This creates:
 data/
 data/paperflow.db
 data/embeddings_cache/
+data/papers/
+data/reading_reports/
+data/wiki/
 models/
 ```
 
@@ -138,6 +141,62 @@ By default `paperflow read` pulls papers from the **latest push** for that
 user. Use `--push-id <push_id>` to read from a specific historical push
 instead.
 
+If you prefer a local interface for selection and feedback, start:
+
+```bash
+paperflow gui
+```
+
+The GUI lets you create or select a profile, run/load a daily push, multi-select
+papers for reading, mark explicit "not interested" feedback, generate local
+Markdown reports, manage must-read anchors, read an arXiv ID or local PDF
+directly, manage local research roles, filter feedback history, and search the
+local Wiki.
+
+Feedback has the same profile-learning effect across surfaces. A CLI command
+such as `paperflow feedback --reply "1 3"`, a GUI selection, and a Feishu/Lark
+reply with `1 3` all update the matching user's profile and drift state. See
+[feedback-loop.md](feedback-loop.md).
+
+Daily pushes, generated reading reports, explicit feedback, and profile-drift
+snapshots are also written into the local PaperFlow Wiki:
+
+```bash
+paperflow wiki backfill --user-id user_alice
+paperflow wiki topics --user-id user_alice
+paperflow wiki stats --user-id user_alice
+paperflow wiki search "literature mining" --user-id user_alice
+paperflow wiki ask "What have I read about literature mining?" --user-id user_alice
+```
+
+To save PDFs and reading-report Markdown directly into an Obsidian monthly
+folder, set:
+
+```env
+PAPERFLOW_PDF_DIR=/Users/mario/Documents/Obsidian Vault/Daily Note/Daily Note 2026/arXiv - May 2026
+PAPERFLOW_READING_REPORTS_DIR=/Users/mario/Documents/Obsidian Vault/Daily Note/Daily Note 2026/arXiv - May 2026
+PAPERFLOW_MONTHLY_REPORT_DIR=/Users/mario/Documents/Obsidian Vault/Daily Note/Daily Note 2026
+PAPERFLOW_TOPIC_INDEX_DIR=/Users/mario/Documents/Obsidian Vault/Daily Note/Daily Note 2026/topic index
+```
+
+Generate the Obsidian monthly summary and Topic Index from local wiki data:
+
+```bash
+paperflow wiki monthly --user-id user_alice --month 2026-05
+```
+
+For the local GUI, keep `PAPERFLOW_WRITE_FEISHU=false` unless you explicitly
+want reading reports to also create Feishu docs.
+
+Feishu/Lark document export is optional and separate from the GUI and CLI core.
+Configure it in [feishu-doc-export.md](feishu-doc-export.md). After that, run
+`paperflow read` without `--no-feishu`, or tick "同时尝试写入飞书文档" in the GUI.
+To create docs inside a folder, pass the folder token:
+
+```bash
+paperflow read 1 --user-id user_alice --folder-id <feishu_folder_token>
+```
+
 ## 9. (Optional) Feishu/Lark deployment
 
 If you want PaperFlow to push daily cards to a Feishu/Lark group, set up the
@@ -165,8 +224,9 @@ benchmark and ablation reproduction.
 
 ## What's next
 
+- **Browse the full documentation map** — see [README.md](README.md).
 - **Customize a profile** — see [configuration.md](configuration.md).
+- **Understand feedback learning** — see [feedback-loop.md](feedback-loop.md).
 - **Reproduce the paper** — see [reproduce.md](reproduce.md) and the
   [experiments/](../experiments/) directory.
-- **Inspect the architecture** — see the architecture section of the top-level
-  [README](../README.md).
+- **Inspect the architecture** — see [architecture.md](architecture.md).

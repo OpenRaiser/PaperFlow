@@ -103,6 +103,28 @@ def _build_paper_dict(
     return paper
 
 
+def _derive_push_metadata_from_papers(papers: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Lift push-level metadata duplicated on pushed paper rows."""
+    if not papers:
+        return {}
+    metadata = papers[0].get("metadata") or {}
+    push_metadata: Dict[str, Any] = {}
+    for key in (
+        "fallback_used",
+        "fallback_days",
+        "fallback_total_fetched",
+        "fallback_filtered_already_handled",
+        "fallback_kept_candidates",
+        "fallback_relaxed",
+        "fallback_source_scope",
+    ):
+        if key in metadata:
+            push_metadata[key] = metadata[key]
+    if push_metadata and "paper_count" not in push_metadata:
+        push_metadata["paper_count"] = len(papers)
+    return push_metadata
+
+
 def init_db() -> None:
     """Initialize database, create all tables"""
     conn = get_connection()
@@ -968,7 +990,7 @@ def get_latest_push(user_id: str) -> Optional[Dict]:
         SELECT push_id, MAX(timestamp) as timestamp
         FROM behavior_logs
         WHERE user_id = ?
-          AND action = 'pushed'
+          AND action IN ('pushed', 'push_empty')
         GROUP BY push_id
         ORDER BY timestamp DESC, push_id DESC
         LIMIT 1
@@ -993,12 +1015,30 @@ def get_latest_push(user_id: str) -> Optional[Dict]:
     papers = [_build_paper_dict(row, metadata_key="bl_metadata") for row in cursor.fetchall()]
     papers.sort(key=lambda paper: (paper.get("rank", 10**9), paper.get("behavior_log_id", 10**9)))
 
+    cursor.execute(
+        """
+        SELECT metadata
+        FROM behavior_logs
+        WHERE user_id = ?
+          AND push_id = ?
+          AND action = 'push_empty'
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (user_id, push_id),
+    )
+    metadata_row = cursor.fetchone()
+    push_metadata = _load_json_metadata(metadata_row["metadata"]) if metadata_row else {}
+    if not push_metadata:
+        push_metadata = _derive_push_metadata_from_papers(papers)
+
     conn.close()
 
     return {
         "push_id": push_id,
         "push_time": push_time,
-        "papers": papers
+        "papers": papers,
+        "metadata": push_metadata,
     }
 
 
@@ -1367,12 +1407,29 @@ def get_push_papers(push_id: str) -> Optional[Dict]:
     papers = [_build_paper_dict(row) for row in cursor.fetchall()]
     papers.sort(key=lambda paper: (paper.get("rank", 10**9), paper.get("behavior_log_id", 10**9)))
 
+    cursor.execute(
+        """
+        SELECT metadata
+        FROM behavior_logs
+        WHERE push_id = ?
+          AND action = 'push_empty'
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (push_id,),
+    )
+    metadata_row = cursor.fetchone()
+    push_metadata = _load_json_metadata(metadata_row["metadata"]) if metadata_row else {}
+    if not push_metadata:
+        push_metadata = _derive_push_metadata_from_papers(papers)
+
     conn.close()
 
     return {
         "push_id": push_id,
         "push_time": push_time,
-        "papers": papers
+        "papers": papers,
+        "metadata": push_metadata,
     }
 
 

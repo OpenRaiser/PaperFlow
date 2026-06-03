@@ -17,6 +17,8 @@ from db_ops import (
     get_paper_by_arxiv,
     log_behavior,
     get_behavior_logs,
+    get_latest_push,
+    get_push_papers,
     get_selection_stats,
     get_latest_selected_papers,
     clear_pending_selected_papers,
@@ -167,6 +169,63 @@ class TestBehaviorLogOperations:
 
         logs = get_behavior_logs("test_user", start_date, end_date)
         assert len(logs) == 2
+
+    def test_empty_push_is_returned_as_latest_push(self, test_db_path):
+        """An empty but completed push should not look like no push exists."""
+        import db_ops
+        db_ops.DB_PATH = test_db_path
+
+        log_behavior(
+            "test_user",
+            "push_empty_001",
+            None,
+            "push_empty",
+            "push",
+            "empty_push",
+            metadata={
+                "paper_count": 0,
+                "total_fetched": 15,
+                "reason": "all_candidates_filtered",
+            },
+        )
+
+        latest = get_latest_push("test_user")
+        assert latest is not None
+        assert latest["push_id"] == "push_empty_001"
+        assert latest["papers"] == []
+        assert latest["metadata"]["total_fetched"] == 15
+
+        by_id = get_push_papers("push_empty_001")
+        assert by_id is not None
+        assert by_id["papers"] == []
+        assert by_id["metadata"]["reason"] == "all_candidates_filtered"
+
+    def test_latest_push_derives_fallback_metadata_from_pushed_rows(self, test_db_path, sample_paper):
+        import db_ops
+        db_ops.DB_PATH = test_db_path
+
+        paper_id = add_paper(sample_paper)
+        log_behavior(
+            "test_user",
+            "push_fallback_001",
+            paper_id,
+            "pushed",
+            "push",
+            "edge_relevant",
+            metadata={
+                "rank": 1,
+                "fallback_used": True,
+                "fallback_days": 7,
+                "fallback_relaxed": True,
+                "fallback_total_fetched": 30,
+            },
+        )
+
+        latest = get_latest_push("test_user")
+        assert latest is not None
+        assert latest["metadata"]["fallback_used"] is True
+        assert latest["metadata"]["fallback_days"] == 7
+        assert latest["metadata"]["fallback_relaxed"] is True
 
 
 class TestSelectionStats:
