@@ -11,6 +11,8 @@ from deployments.desktop.shared import agents
 
 def test_desktop_server_routes_are_registered() -> None:
     assert "/api/health" in server.GET_ROUTES
+    assert "/api/source-options" in server.GET_ROUTES
+    assert "/api/settings" in server.POST_ROUTES
     assert "/api/submit" in server.POST_ROUTES
     assert "/api/roles" in server.GET_ROUTES
     assert "/api/roles" in server.POST_ROUTES
@@ -27,9 +29,40 @@ def test_desktop_server_routes_are_registered() -> None:
 def test_desktop_settings_exposes_storage_paths() -> None:
     settings = agents.settings()
     assert "paths" in settings
+    assert "editable_env" in settings
     assert "pdf_dir" in settings["paths"]
     assert "reading_reports_dir" in settings["paths"]
     assert "wiki_dir" in settings["paths"]
+
+
+def test_desktop_source_options_exposes_push_sources() -> None:
+    options = agents.source_options()
+
+    assert any(item["id"] == "cs.LG" for item in options["arxiv_categories"])
+    assert any(item["id"] == "ICLR" for item in options["conferences"])
+    assert options["journals"]
+
+
+def test_desktop_save_settings_updates_env_file(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    env_path = tmp_path / ".env"
+    env_path.write_text("PAPERFLOW_LLM_MODEL=old-model\nOPENAI_API_KEY=sk-existing\n", encoding="utf-8")
+    monkeypatch.setattr(agents, "ENV_PATH", env_path)
+
+    result = agents.save_settings(
+        {
+            "PAPERFLOW_LLM_MODEL": "new-model",
+            "OPENAI_API_KEY": "***",
+            "PAPERFLOW_WRITE_FEISHU": "true",
+            "UNSUPPORTED_KEY": "ignored",
+        }
+    )
+
+    text = env_path.read_text(encoding="utf-8")
+    assert "PAPERFLOW_LLM_MODEL=new-model" in text
+    assert "OPENAI_API_KEY=sk-existing" in text
+    assert "PAPERFLOW_WRITE_FEISHU=true" in text
+    assert "UNSUPPORTED_KEY" not in text
+    assert result["paths"]["write_feishu"] is True
 
 
 def test_desktop_health_is_json_ready() -> None:
@@ -40,13 +73,14 @@ def test_desktop_health_is_json_ready() -> None:
 
 def test_desktop_paper_card_backfills_arxiv_links() -> None:
     card = agents._paper_card(  # noqa: SLF001 - GUI payload normalization contract
-        {"title": "Arxiv Paper", "arxiv_id": "2606.02556v1"},
+        {"title": "Arxiv Paper", "arxiv_id": "2606.02556v1", "source": "arxiv"},
         1,
     )
 
     assert card["url"] == "https://arxiv.org/abs/2606.02556v1"
     assert card["pdf_url"] == "https://arxiv.org/pdf/2606.02556v1"
     assert card["arxiv_id"] == "2606.02556v1"
+    assert card["source"] == "arxiv"
 
 
 def test_desktop_paper_card_extracts_arxiv_id_from_url() -> None:
@@ -142,16 +176,22 @@ def test_desktop_submit_and_read_forwards_feishu_choice(monkeypatch: pytest.Monk
 
 
 def test_desktop_daily_push_preserves_empty_push_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        agents.daily_agent,
-        "daily_push",
-        lambda **kwargs: {
+    captured = {}
+
+    def fake_daily_push(**kwargs):
+        captured.update(kwargs)
+        return {
             "success": True,
             "push_id": "push_empty_001",
             "paper_count": 0,
             "total_fetched": 15,
             "reason": "all_candidates_filtered",
-        },
+        }
+
+    monkeypatch.setattr(
+        agents.daily_agent,
+        "daily_push",
+        fake_daily_push,
     )
     monkeypatch.setattr(
         agents.db_ops,
@@ -165,13 +205,22 @@ def test_desktop_daily_push_preserves_empty_push_metadata(monkeypatch: pytest.Mo
     )
     monkeypatch.setattr(agents.db_ops, "get_latest_push", lambda user_id: None)
 
-    payload = agents.run_daily_push("test_user", days=1)
+    payload = agents.run_daily_push(
+        "test_user",
+        days=1,
+        arxiv_categories=["cs.LG", "cs.CV"],
+        conferences=["ICLR"],
+        journals=[],
+    )
 
     assert payload["push"]["push_id"] == "push_empty_001"
     assert payload["push"]["papers"] == []
     assert payload["push"]["metadata"]["paper_count"] == 0
     assert payload["push"]["metadata"]["total_fetched"] == 15
     assert payload["push"]["metadata"]["reason"] == "all_candidates_filtered"
+    assert captured["arxiv_categories"] == ["cs.LG", "cs.CV"]
+    assert captured["conferences"] == ["ICLR"]
+    assert captured["journals"] == []
 
 
 def test_desktop_daily_push_preserves_fallback_metadata(monkeypatch: pytest.MonkeyPatch) -> None:

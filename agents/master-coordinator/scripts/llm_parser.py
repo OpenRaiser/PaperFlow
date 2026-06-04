@@ -1684,21 +1684,33 @@ def synthesize_reading_report_with_llm(
     )
 
     system_prompt = (
-        "你是科研论文精读助手。请基于提供的论文元数据、摘要、可用章节摘录和用户画像，"
-        "生成一份适合飞书文档使用的结构化中文精读内容。"
+        "你是科研论文精读助手，目标是给用户提供尽可能丰富、可判断、可复核的中文精读原材料。"
+        "完整性优先于压缩：覆盖论文动机、相关研究、技术路线、实验设计、关键发现、局限、可探索方向和总体判断；"
+        "不要为了简短省略重要机制、边界条件、反例或与用户画像相关的细节。"
+        "结构必须清晰，适合飞书文档阅读；每个长字段应写成多段中文，可以包含编号、短表格式描述或分点。"
+        "用户会自行筛选，你负责尽量不漏信息；允许适度重复以保持上下文完整，但不要灌水。"
+        "默认使用中文。只有关键词、论文专名、方法名、数据集名、模型名和必要术语保留英文。"
+        "请假设用户具备较强科研背景，从论文前沿问题和机制解释开始，不要写泛泛科普。"
         "如果提供了 retrieved_evidence，请优先参考这些 PDF 语义检索命中的证据片段，"
         "再结合 heuristic_draft 做润色和补全；当二者冲突时，优先采用 retrieved_evidence。"
         "如果提供了 field_evidence_map，请让每个输出字段优先参考它对应的证据锚点，"
-        "不要把 results 证据写到 research_background，也不要把 background 证据误写成方法贡献。"
-        "如果 PDF 文本明显包含页眉、图注、作者脚注、参考文献、表格残片或公式噪声，请主动忽略，"
-        "并改用更干净的摘要、Introduction、Method、Results 或 Conclusion 信息归纳。"
-        "如果 user_profile.report_preferences 显示 prefer_more_evidence=true 或 preferred_style=evidence_first，"
-        "请优先写出更具体的证据锚点和方法/结果依据，不要只给空泛总结。"
-        "不要编造具体实验数值；如果信息不足，请保持克制并明确指出需要回原文核对。"
+        "不要把 results 证据写到 problem_analysis，也不要把 background 证据误写成实验结果。"
+        "如果 PDF 文本明显包含页眉、图注、作者脚注、参考文献、表格残片、断行错误、公式噪声或 arXiv 页眉，"
+        "请主动忽略，并改用更干净的摘要、Introduction、Related Work、Method、Experiments、Discussion 或 Conclusion 信息归纳。"
+        "对关键判断做校准：已由论文明确支持的内容直接陈述；基于摘要/片段推断的内容标注“合理推断”；"
+        "证据不足、需要回原文确认的地方要在对应句子内说明。"
+        "不要编造具体实验数值、数据集、baseline、公式含义、作者动机或代码资源；信息不足时明确指出缺口。"
         "可以改写证据，不要大段逐字复制。"
+        "输出应接近深度读书笔记，而不是推荐卡片。每个 qa 字段通常写 250-700 个中文字；"
+        "如果论文信息充分，paper_summary 可以更长，用于完整复述论文主线。"
         "只输出 JSON 对象，不要 Markdown，不要解释，不要代码块。字段包括："
-        "one_sentence_summary, research_background, core_method, key_results, "
+        "one_sentence_summary, clean_abstract_summary, problem_analysis, related_work, solution_approach, experiments, "
+        "future_directions, paper_summary, research_background, core_method, key_results, "
         "main_contributions, limitations, relevance_points, reading_focus, keywords, recommendation_label, analysis_note。"
+        "problem_analysis 对应“这篇论文试图解决什么问题”；related_work 对应“有哪些相关研究”；"
+        "solution_approach 对应“论文如何解决这个问题”；experiments 对应“论文做了哪些实验”；"
+        "future_directions 对应“有什么可以进一步探索的点”；paper_summary 对应“总结一下论文的主要内容”。"
+        "research_background/core_method/key_results/main_contributions/limitations/relevance_points/reading_focus 是兼容旧模板的摘要字段，也要填写。"
         "main_contributions, limitations, relevance_points, reading_focus, keywords 必须是字符串数组；其他字段是字符串。"
         "keywords 用 5-8 个英文小写短语，按论文核心话题排序，例如 [\"diffusion model\", \"video generation\", \"long context\"]。"
         "analysis_note 用一句话说明本次生成是否参考了 PDF 检索证据。"
@@ -1708,7 +1720,7 @@ def synthesize_reading_report_with_llm(
     result = _generate_json_with_configured_llm(
         system_prompt=system_prompt,
         user_text=user_text,
-        max_tokens=int(os.environ.get("READING_REPORT_LLM_MAX_TOKENS", "4096")),
+        max_tokens=int(os.environ.get("READING_REPORT_LLM_MAX_TOKENS", "12000")),
         timeout_override=_get_reading_report_timeout(),
     )
     if not isinstance(result, dict):
@@ -1718,7 +1730,21 @@ def synthesize_reading_report_with_llm(
     result.setdefault("generation_model", fallback_metadata["generation_model"])
 
     normalized: Dict[str, Any] = {}
-    for key in ("one_sentence_summary", "research_background", "core_method", "key_results", "recommendation_label", "analysis_note"):
+    for key in (
+        "one_sentence_summary",
+        "clean_abstract_summary",
+        "problem_analysis",
+        "related_work",
+        "solution_approach",
+        "experiments",
+        "future_directions",
+        "paper_summary",
+        "research_background",
+        "core_method",
+        "key_results",
+        "recommendation_label",
+        "analysis_note",
+    ):
         value = str(result.get(key, "")).strip()
         if value:
             normalized[key] = value

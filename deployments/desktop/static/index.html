@@ -100,30 +100,6 @@
               <strong id="readingQueueStat">0</strong>
             </div>
           </div>
-
-          <div class="dashboard-grid">
-            <div class="panel">
-              <div class="panel-head">
-                <div>
-                  <h3>任务日志</h3>
-                  <p>当前浏览器会话中的操作状态。</p>
-                </div>
-                <button id="clearTaskLogBtn">清空</button>
-              </div>
-              <div id="taskLog" class="activity-list empty">暂无任务。</div>
-            </div>
-
-            <div class="panel">
-              <div class="panel-head">
-                <div>
-                  <h3>最近活动</h3>
-                  <p>本地数据库中最近写入的反馈、报告与画像更新。</p>
-                </div>
-                <button id="refreshDashboardBtn">刷新</button>
-              </div>
-              <div id="activityList" class="activity-list empty">尚未加载活动记录。</div>
-            </div>
-          </div>
         </section>
 
         <section id="push" class="view">
@@ -131,7 +107,7 @@
             <div class="panel-head">
               <div>
                 <h3>每日推送</h3>
-                <p>运行或加载最新个性化论文列表，一次完成多选反馈与精读。</p>
+                <p>运行后自动更新个性化论文列表，一次完成多选反馈与精读。</p>
               </div>
               <div class="actions">
                 <label class="days-control" title="抓取最近几天的论文">
@@ -139,8 +115,44 @@
                   <input id="daysInput" type="number" min="1" max="14" value="1" aria-label="抓取天数">
                   <span>天</span>
                 </label>
-                <button id="loadPushBtn">加载最新</button>
+                <button id="sortRelevanceBtn" type="button">按相关性排序</button>
                 <button id="runDailyBtn" class="primary">运行推送</button>
+              </div>
+            </div>
+
+            <div class="source-config">
+              <div class="source-toolbar">
+                <div>
+                  <strong>论文来源</strong>
+                  <span>按需选择 arXiv 类别、会议和期刊源。</span>
+                </div>
+                <div class="actions">
+                  <button id="selectAllSourcesBtn">全选</button>
+                  <button id="clearSourcesBtn">清空</button>
+                </div>
+              </div>
+              <div class="source-grid">
+                <div class="source-group">
+                  <div class="source-head">
+                    <strong>arXiv</strong>
+                    <button class="mini-btn" data-source-toggle="arxivCategories">切换</button>
+                  </div>
+                  <div id="arxivCategories" class="choice-list empty">正在加载类别。</div>
+                </div>
+                <div class="source-group">
+                  <div class="source-head">
+                    <strong>会议</strong>
+                    <button class="mini-btn" data-source-toggle="conferenceSources">切换</button>
+                  </div>
+                  <div id="conferenceSources" class="choice-list empty">正在加载会议。</div>
+                </div>
+                <div class="source-group">
+                  <div class="source-head">
+                    <strong>期刊</strong>
+                    <button class="mini-btn" data-source-toggle="journalSources">切换</button>
+                  </div>
+                  <div id="journalSources" class="choice-list empty">正在加载期刊。</div>
+                </div>
               </div>
             </div>
 
@@ -423,11 +435,15 @@
             <div class="panel-head">
               <div>
                 <h3>运行设置</h3>
-                <p>这些值来自 .env 和本地默认配置。需要修改时请编辑 .env。</p>
+                <p>与 .env 同步，保存后会立即更新当前 GUI 进程的环境变量。</p>
               </div>
-              <button id="refreshSettingsBtn">刷新</button>
+              <div class="actions">
+                <button id="refreshSettingsBtn">刷新</button>
+                <button id="saveSettingsBtn" class="primary">保存设置</button>
+              </div>
             </div>
             <div id="settingsList" class="settings-list empty">尚未加载设置。</div>
+            <div id="envSettingsForm" class="env-form empty">尚未加载 .env 设置。</div>
             <div class="provider-tests">
               <button id="testLlmBtn">测试 LLM</button>
               <button id="testEmbedBtn">测试 Embedding</button>

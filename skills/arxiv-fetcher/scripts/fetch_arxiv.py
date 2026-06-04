@@ -4,15 +4,21 @@ ArXiv Paper Fetcher
 """
 
 import os
+import re
 import requests
 import xml.etree.ElementTree as ET
+from html import unescape
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 import time
 import urllib.parse
 
 ARXIV_API_URL = "https://export.arxiv.org/api/query"
+ARXIV_LIST_URL = "https://arxiv.org/list"
 DEFAULT_REQUEST_TIMEOUT = float(os.environ.get("ARXIV_REQUEST_TIMEOUT", "12"))
+DEFAULT_RETRY_SLEEP = float(os.environ.get("ARXIV_RETRY_SLEEP", "5"))
+DEFAULT_MAX_RETRIES = int(os.environ.get("ARXIV_MAX_RETRIES", "1"))
+DEFAULT_RATE_LIMIT_WAIT = float(os.environ.get("ARXIV_RATE_LIMIT_WAIT", "0"))
 DEFAULT_REQUEST_HEADERS = {"User-Agent": "PaperFlow/0.1 ArxivFetcher"}
 
 # arXiv 类别映射
@@ -26,12 +32,130 @@ CATEGORIES = {
     "stat.ML": "Machine Learning",
 }
 
+
+def _fetch_arxiv_query(search_query: str, limit: int, max_retries: int = DEFAULT_MAX_RETRIES) -> List[Dict]:
+    encoded_query = urllib.parse.quote(search_query, safe='')
+    url = f"{ARXIV_API_URL}?search_query={encoded_query}&start=0&max_results={limit}&sortBy=submittedDate&sortOrder=descending"
+
+    for attempt in range(max_retries):
+        try:
+            print(f"Attempt {attempt + 1}/{max_retries}...")
+            response = requests.get(url, timeout=DEFAULT_REQUEST_TIMEOUT, headers=DEFAULT_REQUEST_HEADERS)
+            if response.status_code == 429:
+                wait_time = DEFAULT_RATE_LIMIT_WAIT * (attempt + 1)
+                if wait_time <= 0 or attempt >= max_retries - 1:
+                    print("Rate limited (429), skipping arXiv fetch for this query.")
+                    return []
+                print(f"Rate limited (429), waiting {wait_time:g}s before retry...")
+                time.sleep(wait_time)
+                continue
+            response.raise_for_status()
+            return parse_arxiv_xml(response.text) or []
+        except requests.Timeout:
+            if attempt < max_retries - 1:
+                print("Request timeout, retrying...")
+                time.sleep(DEFAULT_RETRY_SLEEP)
+            else:
+                print(f"Error fetching from arXiv after {max_retries} attempts: timeout")
+                return []
+        except requests.RequestException as e:
+            if attempt < max_retries - 1:
+                print(f"Request failed: {e}, retrying...")
+                time.sleep(DEFAULT_RETRY_SLEEP)
+            else:
+                print(f"Error fetching from arXiv after {max_retries} attempts: {e}")
+                return []
+    return []
+
+
+def fetch_latest(
+    categories: List[str] = None,
+    limit: int = 100,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+) -> List[Dict]:
+    """Fetch latest arXiv papers without a submittedDate constraint."""
+    if categories:
+        search_query = " OR ".join([f"cat:{cat}" for cat in categories])
+        if len(categories) > 1:
+            search_query = f"({search_query})"
+    else:
+        search_query = "all:*"
+    return _fetch_arxiv_query(search_query, limit, max_retries=max_retries)
+
+
+def _clean_html_text(value: str) -> str:
+    text = re.sub(r"<[^>]+>", " ", value or "")
+    text = unescape(text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _parse_arxiv_list_page(html: str, category: str, limit: int) -> List[Dict]:
+    pairs = re.findall(r"<dt>(.*?)</dt>\s*<dd>(.*?)</dd>", html or "", flags=re.DOTALL | re.IGNORECASE)
+    papers: List[Dict] = []
+    for dt_html, dd_html in pairs:
+        id_match = re.search(r'href="/abs/([^"]+)"', dt_html)
+        if not id_match:
+            continue
+        arxiv_id = unescape(id_match.group(1)).strip()
+        title_match = re.search(
+            r'<div class="list-title[^"]*">\s*<span[^>]*>\s*Title:\s*</span>(.*?)</div>',
+            dd_html,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+        author_block = re.search(
+            r'<div class="list-authors[^"]*">(.*?)</div>',
+            dd_html,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+        authors_html = author_block.group(1) if author_block else ""
+        authors = [
+            _clean_html_text(match)
+            for match in re.findall(r"<a[^>]*>(.*?)</a>", authors_html, flags=re.DOTALL | re.IGNORECASE)
+        ]
+        title = _clean_html_text(title_match.group(1) if title_match else "")
+        if not title:
+            continue
+        papers.append(
+            {
+                "arxiv_id": arxiv_id,
+                "title": title,
+                "authors": [author for author in authors if author],
+                "abstract": "",
+                "categories": [category],
+                "publish_date": "",
+                "url": f"https://arxiv.org/abs/{arxiv_id}",
+                "paper_url": f"https://arxiv.org/abs/{arxiv_id}",
+                "pdf_url": f"https://arxiv.org/pdf/{arxiv_id}",
+            }
+        )
+        if len(papers) >= limit:
+            break
+    return papers
+
+
+def fetch_recent_list_page(category: str, limit: int = 100) -> List[Dict]:
+    """Fetch recent papers from arxiv.org/list/<category>/recent as an API fallback."""
+    category = str(category or "").strip()
+    if not category:
+        return []
+    archive = category.split(".", 1)[0]
+    url = f"{ARXIV_LIST_URL}/{urllib.parse.quote(archive, safe='-')}/new"
+    try:
+        print(f"Fetching arXiv recent list page for {category}...")
+        response = requests.get(url, timeout=DEFAULT_REQUEST_TIMEOUT, headers=DEFAULT_REQUEST_HEADERS)
+        response.raise_for_status()
+        return _parse_arxiv_list_page(response.text, category, limit)
+    except requests.RequestException as exc:
+        print(f"Error fetching arXiv recent list page for {category}: {exc}")
+        return []
+
+
 def fetch_by_date(
     start_date: str,
     end_date: str,
     categories: List[str] = None,
     limit: int = 100,
-    max_retries: int = 3
+    max_retries: int = DEFAULT_MAX_RETRIES,
 ) -> List[Dict]:
     """
     按日期范围抓取论文
@@ -54,35 +178,7 @@ def fetch_by_date(
     else:
         search_query = f"submittedDate:[{start_date}000000 TO {end_date}235959]"
 
-    # 直接构建完整 URL，避免 requests 参数编码问题
-    encoded_query = urllib.parse.quote(search_query, safe='')
-    url = f"{ARXIV_API_URL}?search_query={encoded_query}&start=0&max_results={limit}&sortBy=submittedDate&sortOrder=descending"
-
-    for attempt in range(max_retries):
-        try:
-            print(f"Attempt {attempt + 1}/{max_retries}...")
-            response = requests.get(url, timeout=60, headers=DEFAULT_REQUEST_HEADERS)
-            if response.status_code == 429:
-                wait_time = (attempt + 1) * 30  # 30s, 60s, 90s
-                print(f"Rate limited (429), waiting {wait_time}s before retry...")
-                time.sleep(wait_time)
-                continue
-            response.raise_for_status()
-            return parse_arxiv_xml(response.text)
-        except requests.Timeout:
-            if attempt < max_retries - 1:
-                print(f"Request timeout, retrying...")
-                time.sleep(10)
-            else:
-                print(f"Error fetching from arXiv after {max_retries} attempts: timeout")
-                return []
-        except requests.RequestException as e:
-            if attempt < max_retries - 1:
-                print(f"Request failed: {e}, retrying...")
-                time.sleep(10)
-            else:
-                print(f"Error fetching from arXiv after {max_retries} attempts: {e}")
-                return []
+    return _fetch_arxiv_query(search_query, limit, max_retries=max_retries)
 
 def parse_arxiv_xml(xml_content: str) -> List[Dict]:
     """

@@ -243,13 +243,15 @@ def ingest_reading_report(
     sections = [
         ("abstract", "Abstract", paper.get("abstract")),
         ("tldr", "TL;DR", payload.get("one_sentence_summary")),
-        ("Q1-research-background", "Q1 Research background", payload.get("research_background")),
-        ("Q2-core-method", "Q2 Core method", payload.get("core_method")),
-        ("Q3-key-results", "Q3 Key results", payload.get("key_results")),
-        ("Q4-contributions", "Q4 Contributions", payload.get("main_contributions")),
-        ("Q5-limitations", "Q5 Limitations", payload.get("limitations")),
-        ("Q6-relevance", "Q6 Relevance", payload.get("relevance_points")),
-        ("Q7-reading-plan", "Q7 Reading plan", payload.get("reading_focus")),
+        ("Q1-problem-analysis", "Q1 Problem analysis", payload.get("problem_analysis") or payload.get("research_background")),
+        ("Q2-related-work", "Q2 Related work", payload.get("related_work")),
+        ("Q3-solution-approach", "Q3 Solution approach", payload.get("solution_approach") or payload.get("core_method")),
+        ("Q4-experiments", "Q4 Experiments", payload.get("experiments") or payload.get("key_results")),
+        ("Q5-future-directions", "Q5 Future directions", payload.get("future_directions") or payload.get("limitations")),
+        ("Q6-paper-summary", "Q6 Paper summary", payload.get("paper_summary")),
+        ("legacy-contributions", "Legacy contributions", payload.get("main_contributions")),
+        ("legacy-relevance", "Legacy relevance", payload.get("relevance_points")),
+        ("reading-plan", "Reading plan", payload.get("reading_focus")),
         ("recommendation-reason", "Recommendation reason", payload.get("recommendation_reason")),
     ]
 

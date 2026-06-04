@@ -155,6 +155,7 @@ def profile(
 def daily(
     user_id: str = typer.Option(..., "--user-id", "-u", help="Run the daily pipeline for this user."),
     days: int = typer.Option(1, "--days", help="Fetch papers from the last N days."),
+    limit_per_source: int = typer.Option(100, "--limit-per-source", help="Max papers to fetch per source."),
     output: Optional[Path] = typer.Option(None, "--output", "-o", help="Write the push card to a text file."),
     send_feishu: bool = typer.Option(False, "--send-feishu", help="Send the push through Feishu/Lark."),
     chat_id: Optional[str] = typer.Option(None, "--chat-id", help="Optional Feishu/Lark chat ID."),
@@ -167,7 +168,7 @@ def daily(
     if not script.exists():
         typer.echo(f"[error] daily-push agent not found under deployments/feishu/ or agents/", err=True)
         raise typer.Exit(code=1)
-    args: list[str] = ["--user-id", user_id, "--days", str(days)]
+    args: list[str] = ["--user-id", user_id, "--days", str(days), "--limit-per-source", str(limit_per_source)]
     if output:
         args.extend(["--output", str(output)])
     if chat_id:

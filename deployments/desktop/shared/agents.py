@@ -12,6 +12,7 @@ import json
 import os
 import re
 import threading
+import yaml
 from copy import deepcopy
 from contextlib import contextmanager
 from datetime import datetime, timedelta
@@ -38,6 +39,37 @@ _FEISHU_DOC_PATCH_LOCK = threading.Lock()
 _DAILY_TASK_LOCK = threading.Lock()
 _DAILY_TASKS: Dict[str, Dict[str, Any]] = {}
 _DAILY_TASK_BY_USER: Dict[str, str] = {}
+
+ENV_PATH = PROJECT_ROOT / ".env"
+EDITABLE_ENV_KEYS = [
+    "PAPERFLOW_LLM_PROVIDER",
+    "PAPERFLOW_LLM_MODEL",
+    "PAPERFLOW_EMBED_PROVIDER",
+    "PAPERFLOW_EMBED_MODEL",
+    "PAPERFLOW_EMBED_DIMENSIONS",
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "OPENAI_API_TIMEOUT",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_API_TIMEOUT",
+    "OLLAMA_BASE_URL",
+    "OLLAMA_API_TIMEOUT",
+    "PAPERFLOW_PDF_DIR",
+    "PAPERFLOW_READING_REPORTS_DIR",
+    "PAPERFLOW_MONTHLY_REPORT_DIR",
+    "PAPERFLOW_TOPIC_INDEX_DIR",
+    "PAPERFLOW_WIKI_DIR",
+    "PAPERFLOW_WIKI_INGEST",
+    "PAPERFLOW_WRITE_FEISHU",
+    "FEISHU_APP_ID",
+    "FEISHU_APP_SECRET",
+    "FEISHU_BOT_NAME",
+    "FEISHU_USER_ID",
+    "FEISHU_CLI_CMD",
+    "FEISHU_IM_IDENTITY",
+    "FEISHU_VERIFICATION_TOKEN",
+]
 
 
 def _load_json(value: Any, default: Any) -> Any:
@@ -74,6 +106,22 @@ def _unique_ints(values: Iterable[Any], *, minimum: int = 1, maximum: Optional[i
             continue
         seen.add(number)
         result.append(number)
+    return result
+
+
+def _string_list(values: Any) -> List[str]:
+    if values is None:
+        return []
+    if isinstance(values, str):
+        values = [values]
+    result: List[str] = []
+    seen: Set[str] = set()
+    for value in values or []:
+        text = str(value or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        result.append(text)
     return result
 
 
@@ -185,6 +233,7 @@ def _paper_card(paper: Dict[str, Any], number: int) -> Dict[str, Any]:
         "category": paper.get("category") or metadata.get("category") or "unknown",
         "score": _to_float(paper.get("score") or metadata.get("score")),
         "rank": paper.get("rank") or metadata.get("rank") or number,
+        "source": paper.get("source") or metadata.get("source") or "",
         "venue": paper.get("venue") or paper.get("journal") or metadata.get("venue") or "",
         "publish_date": paper.get("publish_date") or metadata.get("publish_date") or "",
         "categories": categories if isinstance(categories, list) else [],
@@ -203,6 +252,34 @@ def _push_payload(push: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         "push_time": push.get("push_time") or push.get("created_at"),
         "papers": [_paper_card(paper, index) for index, paper in enumerate(papers, start=1)],
         "metadata": dict(push.get("metadata") or {}),
+    }
+
+
+def _preview_key(paper: Dict[str, Any]) -> str:
+    return str(
+        paper.get("id")
+        or paper.get("arxiv_id")
+        or paper.get("doi")
+        or paper.get("title")
+        or ""
+    ).strip().casefold()
+
+
+def _preview_payload(task: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    items = list(task.get("preview_items") or [])
+    if not items:
+        return None
+    return {
+        "push_id": task.get("task_id"),
+        "push_time": task.get("started_at") or task.get("created_at"),
+        "papers": [_paper_card(paper, index) for index, paper in enumerate(items, start=1)],
+        "metadata": {
+            "preview": True,
+            "phase": task.get("progress_phase") or task.get("status"),
+            "fetched_count": int(task.get("fetched_count") or 0),
+            "ranked_count": int(task.get("ranked_count") or 0),
+            "total_fetched": int(task.get("fetched_count") or len(items)),
+        },
     }
 
 
@@ -251,6 +328,142 @@ def _safe_env() -> Dict[str, str]:
     return result
 
 
+def _read_env_file() -> Dict[str, str]:
+    values: Dict[str, str] = {}
+    if not ENV_PATH.exists():
+        return values
+    for raw_line in ENV_PATH.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key.strip()] = value.strip().strip('"').strip("'")
+    return values
+
+
+def _env_edit_payload() -> List[Dict[str, str]]:
+    file_values = _read_env_file()
+    sensitive = ("KEY", "TOKEN", "SECRET", "PASSWORD")
+    rows = []
+    for key in EDITABLE_ENV_KEYS:
+        raw_value = file_values.get(key, os.environ.get(key, ""))
+        rows.append(
+            {
+                "key": key,
+                "value": "***" if any(part in key for part in sensitive) and raw_value else str(raw_value),
+                "is_secret": bool(any(part in key for part in sensitive)),
+                "present": bool(str(raw_value).strip()),
+            }
+        )
+    return rows
+
+
+def _serialize_env_value(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if any(char.isspace() for char in text) or "#" in text:
+        escaped = text.replace("\\", "\\\\").replace('"', '\\"')
+        return f'"{escaped}"'
+    return text
+
+
+def _merge_env_file(updates: Dict[str, str]) -> None:
+    existing_lines = ENV_PATH.read_text(encoding="utf-8").splitlines() if ENV_PATH.exists() else []
+    used: Set[str] = set()
+    next_lines: List[str] = []
+
+    for line in existing_lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in line:
+            next_lines.append(line)
+            continue
+        key = line.split("=", 1)[0].strip()
+        if key in updates:
+            next_lines.append(f"{key}={_serialize_env_value(updates[key])}")
+            used.add(key)
+        else:
+            next_lines.append(line)
+
+    missing = [key for key in EDITABLE_ENV_KEYS if key in updates and key not in used]
+    if missing and next_lines and next_lines[-1].strip():
+        next_lines.append("")
+    for key in missing:
+        next_lines.append(f"{key}={_serialize_env_value(updates[key])}")
+
+    ENV_PATH.write_text("\n".join(next_lines).rstrip() + "\n", encoding="utf-8")
+
+
+def save_settings(values: Dict[str, Any]) -> Dict[str, Any]:
+    updates: Dict[str, str] = {}
+    for key, value in (values or {}).items():
+        normalized_key = str(key or "").strip()
+        if normalized_key not in EDITABLE_ENV_KEYS:
+            continue
+        text = str(value or "").strip()
+        if text == "***":
+            continue
+        updates[normalized_key] = text
+
+    if not updates:
+        return settings()
+
+    _merge_env_file(updates)
+    for key, value in updates.items():
+        os.environ[key] = value
+    return settings()
+
+
+def source_options() -> Dict[str, Any]:
+    arxiv_items = [
+        {"id": key, "label": f"{key} - {label}"}
+        for key, label in sorted(getattr(arxiv_fetcher, "CATEGORIES", {}).items())
+    ]
+
+    conferences: List[Dict[str, Any]] = []
+    try:
+        config = yaml.safe_load((PROJECT_ROOT / "config" / "conferences.yaml").read_text(encoding="utf-8")) or {}
+        for item in config.get("conferences", []) or []:
+            name = str(item.get("name") or "").strip()
+            if not name:
+                continue
+            conferences.append(
+                {
+                    "id": name,
+                    "label": name,
+                    "group": str(item.get("venue_type") or ""),
+                    "enabled": bool(item.get("enabled", True)),
+                }
+            )
+    except Exception:
+        conferences = [{"id": name, "label": name, "enabled": True} for name in daily_agent.load_default_conferences()]
+
+    journals: List[Dict[str, Any]] = []
+    try:
+        config = yaml.safe_load((PROJECT_ROOT / "config" / "journals.yaml").read_text(encoding="utf-8")) or {}
+        for group, items in (config.get("journals", {}) or {}).items():
+            for item in items or []:
+                name = str(item.get("name") or "").strip()
+                if not name:
+                    continue
+                journals.append(
+                    {
+                        "id": name,
+                        "label": name,
+                        "group": str(group or ""),
+                        "enabled": bool(item.get("enabled", True)),
+                    }
+                )
+    except Exception:
+        journals = [{"id": name, "label": name, "enabled": True} for name in daily_agent.load_default_journals()]
+
+    return {
+        "arxiv_categories": arxiv_items,
+        "conferences": conferences,
+        "journals": journals,
+    }
+
+
 @contextmanager
 def _local_only_feishu_doc_patch(enabled: bool):
     if not enabled:
@@ -287,6 +500,7 @@ def health() -> Dict[str, Any]:
 def settings() -> Dict[str, Any]:
     return {
         "project_root": str(PROJECT_ROOT),
+        "env_path": str(ENV_PATH),
         "database": str(db_ops.DB_PATH),
         "paths": {
             "pdf_dir": _configured_path("PAPERFLOW_PDF_DIR", "data/exports"),
@@ -301,6 +515,7 @@ def settings() -> Dict[str, Any]:
             "write_feishu": _env_bool("PAPERFLOW_WRITE_FEISHU", default=False),
         },
         "env": _safe_env(),
+        "editable_env": _env_edit_payload(),
     }
 
 
@@ -516,12 +731,24 @@ def create_or_update_profile(
     return {"result": result, "profile": _profile_summary(db_ops.get_profile(user_id.strip()))}
 
 
-def run_daily_push(user_id: str, days: int = 1, limit_per_source: int = 30) -> Dict[str, Any]:
+def run_daily_push(
+    user_id: str,
+    days: int = 1,
+    limit_per_source: int = 100,
+    arxiv_categories: Optional[Iterable[Any]] = None,
+    conferences: Optional[Iterable[Any]] = None,
+    journals: Optional[Iterable[Any]] = None,
+    progress_callback: Optional[Any] = None,
+) -> Dict[str, Any]:
     result = daily_agent.daily_push(
         user_id=user_id,
         days=max(1, int(days or 1)),
-        limit_per_source=max(1, int(limit_per_source or 30)),
+        arxiv_categories=_string_list(arxiv_categories) if arxiv_categories is not None else None,
+        conferences=_string_list(conferences) if conferences is not None else None,
+        journals=_string_list(journals) if journals is not None else None,
+        limit_per_source=max(1, int(limit_per_source or 100)),
         send_to_feishu=False,
+        progress_callback=progress_callback,
     )
     push = None
     if isinstance(result, dict) and result.get("push_id"):
@@ -554,7 +781,69 @@ def _task_timestamp() -> str:
 
 
 def _daily_task_payload(task: Dict[str, Any]) -> Dict[str, Any]:
-    return deepcopy({key: value for key, value in task.items() if key != "thread"})
+    payload = deepcopy(
+        {
+            key: value
+            for key, value in task.items()
+            if key not in {"thread", "preview_items_by_key"}
+        }
+    )
+    payload["preview_push"] = _preview_payload(task)
+    return payload
+
+
+def _make_daily_progress_callback(task_id: str):
+    def callback(event: Dict[str, Any]) -> None:
+        if not isinstance(event, dict):
+            return
+        phase = str(event.get("phase") or "").strip()
+        paper = event.get("paper")
+        with _DAILY_TASK_LOCK:
+            task = _DAILY_TASKS.get(task_id)
+            if not task:
+                return
+            task["progress_phase"] = phase or task.get("progress_phase")
+            task["updated_at"] = _task_timestamp()
+            if phase == "source_complete":
+                task.setdefault("source_counts", {})[str(event.get("source") or "unknown")] = int(event.get("count") or 0)
+            if phase == "deduplicated":
+                task["deduplicated_count"] = int(event.get("count") or 0)
+            if phase == "scored":
+                task["scored_count"] = int(event.get("count") or 0)
+            if not isinstance(paper, dict):
+                return
+
+            key = _preview_key(paper)
+            if not key:
+                return
+            by_key = task.setdefault("preview_items_by_key", {})
+            items = task.setdefault("preview_items", [])
+
+            if phase == "ranked" and task.get("preview_mode") != "ranked":
+                task["preview_mode"] = "ranked"
+                by_key.clear()
+                items.clear()
+
+            item = dict(paper)
+            if phase == "fetched":
+                item.setdefault("category", "pending")
+            if phase == "ranked":
+                item["score"] = event.get("score")
+                item["category"] = event.get("category") or item.get("category") or "unknown"
+                item["rank"] = event.get("rank") or len(items) + 1
+
+            if key in by_key:
+                index = by_key[key]
+                items[index].update(item)
+            else:
+                by_key[key] = len(items)
+                items.append(item)
+
+            task["fetched_count"] = max(int(task.get("fetched_count") or 0), len(items))
+            if phase == "ranked":
+                task["ranked_count"] = int(task.get("ranked_count") or 0) + 1
+
+    return callback
 
 
 def _finish_daily_task(task_id: str) -> None:
@@ -567,10 +856,21 @@ def _finish_daily_task(task_id: str) -> None:
         task["updated_at"] = task["started_at"]
         user_id = str(task["user_id"])
         days = int(task.get("days") or 1)
-        limit_per_source = int(task.get("limit_per_source") or 30)
+        limit_per_source = int(task.get("limit_per_source") or 100)
+        arxiv_categories = task.get("arxiv_categories")
+        conferences = task.get("conferences")
+        journals = task.get("journals")
 
     try:
-        result = run_daily_push(user_id, days=days, limit_per_source=limit_per_source)
+        result = run_daily_push(
+            user_id,
+            days=days,
+            limit_per_source=limit_per_source,
+            arxiv_categories=arxiv_categories,
+            conferences=conferences,
+            journals=journals,
+            progress_callback=_make_daily_progress_callback(task_id),
+        )
     except Exception as exc:  # pragma: no cover - exercised through GUI/server boundary
         with _DAILY_TASK_LOCK:
             task = _DAILY_TASKS.get(task_id)
@@ -591,7 +891,14 @@ def _finish_daily_task(task_id: str) -> None:
             task["updated_at"] = task["completed_at"]
 
 
-def start_daily_push_task(user_id: str, days: int = 1, limit_per_source: int = 30) -> Dict[str, Any]:
+def start_daily_push_task(
+    user_id: str,
+    days: int = 1,
+    limit_per_source: int = 100,
+    arxiv_categories: Optional[Iterable[Any]] = None,
+    conferences: Optional[Iterable[Any]] = None,
+    journals: Optional[Iterable[Any]] = None,
+) -> Dict[str, Any]:
     cleaned_user_id = str(user_id or "").strip()
     if not cleaned_user_id:
         raise ValueError("user_id is required")
@@ -610,7 +917,10 @@ def start_daily_push_task(user_id: str, days: int = 1, limit_per_source: int = 3
             "user_id": cleaned_user_id,
             "status": "queued",
             "days": max(1, int(days or 1)),
-            "limit_per_source": max(1, int(limit_per_source or 30)),
+            "limit_per_source": max(1, int(limit_per_source or 100)),
+            "arxiv_categories": _string_list(arxiv_categories) if arxiv_categories is not None else None,
+            "conferences": _string_list(conferences) if conferences is not None else None,
+            "journals": _string_list(journals) if journals is not None else None,
             "created_at": now,
             "updated_at": now,
             "started_at": None,
@@ -618,6 +928,12 @@ def start_daily_push_task(user_id: str, days: int = 1, limit_per_source: int = 3
             "error": None,
             "result": None,
             "push": None,
+            "preview_items": [],
+            "preview_items_by_key": {},
+            "preview_mode": "fetched",
+            "progress_phase": "queued",
+            "fetched_count": 0,
+            "ranked_count": 0,
         }
         thread = threading.Thread(target=_finish_daily_task, args=(task_id,), daemon=True)
         task["thread"] = thread

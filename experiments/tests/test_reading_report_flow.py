@@ -324,9 +324,10 @@ def test_generate_reading_report_contains_real_sections_without_placeholders():
     report = reading_agent.generate_reading_report(paper, profile, report_payload=payload)
 
     assert "<!--" not in report
-    assert "### Q1 这篇论文试图解决什么问题？" in report
-    assert "### Q4 主要贡献或创新点是什么？" in report
-    assert "### Q6 这篇论文和我的研究有什么关系？" in report
+    assert "Q1: 这篇论文试图解决什么问题？" in report
+    assert "Q2: 有哪些相关研究？" in report
+    assert "Q4: 论文做了哪些实验？" in report
+    assert "Q6: 总结一下论文的主要内容" in report
     assert "## 代码与资源" in report
     assert "## 推荐指数" in report
     assert "adaptive scientific agent framework" in report.lower()
@@ -462,9 +463,9 @@ def test_generate_reading_report_keeps_full_template_and_links_on_fallback():
     )
     report = reading_agent.generate_reading_report(paper, profile, report_payload=report_payload)
 
-    assert "### Q2 它提出了什么方法？" in report
-    assert "### Q3 主要结果是什么？" in report
-    assert "### Q4 主要贡献或创新点是什么？" in report
+    assert "Q2: 有哪些相关研究？" in report
+    assert "Q3: 论文如何解决这个问题？" in report
+    assert "Q4: 论文做了哪些实验？" in report
     assert "## 代码与资源" in report
     assert "## 推荐指数" in report
     assert "https://arxiv.org/abs/2604.12345" in report

@@ -5,10 +5,10 @@ const state = {
   skipped: new Set(),
   activity: [],
   roles: [],
-  taskLog: [],
   dailyTaskId: "",
   dailyTaskStatus: "",
   dailyTaskPollId: null,
+  sourceOptionsLoaded: false,
 };
 
 const DEMO_MODE =
@@ -250,34 +250,6 @@ function localizeError(message) {
 
 function setStatus(text, busy = false) {
   $("statusText").textContent = busy ? `${text}...` : text;
-  addTaskLog(busy ? `${text}...` : text);
-}
-
-function addTaskLog(text) {
-  if (!text) return;
-  state.taskLog.unshift({
-    text,
-    time: new Date().toLocaleTimeString(),
-  });
-  state.taskLog = state.taskLog.slice(0, 30);
-  renderTaskLog();
-}
-
-function renderTaskLog() {
-  const target = $("taskLog");
-  if (!target) return;
-  if (!state.taskLog.length) {
-    target.className = "activity-list empty";
-    target.textContent = "暂无任务。";
-    return;
-  }
-  target.className = "activity-list";
-  target.innerHTML = state.taskLog.map((item) => `
-    <div class="activity-item compact">
-      <h4>${escapeHtml(item.text)}</h4>
-      <p>${escapeHtml(item.time)}</p>
-    </div>
-  `).join("");
 }
 
 async function api(path, options = {}) {
@@ -334,6 +306,7 @@ async function demoApi(path, options = {}) {
     return {
       ok: true,
       project_root: "GitHub Pages preview",
+      env_path: ".env",
       database: "mock://paperflow.db",
       paths: {
         pdf_dir: "data/exports",
@@ -347,7 +320,37 @@ async function demoApi(path, options = {}) {
         wiki_ingest: true,
         write_feishu: false,
       },
+      editable_env: [
+        { key: "PAPERFLOW_LLM_PROVIDER", value: "mock", is_secret: false, present: true },
+        { key: "PAPERFLOW_LLM_MODEL", value: "paperflow-preview", is_secret: false, present: true },
+        { key: "PAPERFLOW_EMBED_PROVIDER", value: "hash", is_secret: false, present: true },
+        { key: "PAPERFLOW_EMBED_MODEL", value: "", is_secret: false, present: false },
+        { key: "OPENAI_API_KEY", value: "", is_secret: true, present: false },
+        { key: "OPENAI_BASE_URL", value: "", is_secret: false, present: false },
+      ],
     };
+  }
+  if (route === "/api/source-options") {
+    return {
+      ok: true,
+      arxiv_categories: [
+        { id: "cs.AI", label: "cs.AI - Artificial Intelligence" },
+        { id: "cs.LG", label: "cs.LG - Machine Learning" },
+        { id: "cs.CV", label: "cs.CV - Computer Vision" },
+      ],
+      conferences: [
+        { id: "ICLR", label: "ICLR", group: "ML", enabled: true },
+        { id: "NeurIPS", label: "NeurIPS", group: "ML", enabled: true },
+        { id: "CVPR", label: "CVPR", group: "CV", enabled: true },
+      ],
+      journals: [
+        { id: "Nature", label: "Nature", group: "weekly_scan_top", enabled: true },
+        { id: "Science", label: "Science", group: "weekly_scan_top", enabled: true },
+      ],
+    };
+  }
+  if (route === "/api/settings" && options.method === "POST") {
+    return demoApi("/api/settings", { method: "GET" });
   }
   if (route === "/api/users") {
     return { ok: true, users: [DEMO_USER] };
@@ -500,6 +503,15 @@ function switchView(name) {
   targetView.classList.add("active");
   targetNav.classList.add("active");
   $("pageTitle").textContent = targetNav.textContent;
+  if (name === "settings") {
+    runAction(refreshSettings);
+  }
+  if (name === "push") {
+    runAction(loadSourceOptions);
+    if (!["queued", "running"].includes(state.dailyTaskStatus)) {
+      runAction(loadLatestPush);
+    }
+  }
 }
 
 function renderUsers(users, preferredUserId = state.userId) {
@@ -539,6 +551,67 @@ async function loadRoles() {
   const data = await api("/api/roles");
   state.roles = data.roles || [];
   renderRoles(state.roles);
+}
+
+async function loadSourceOptions() {
+  if (state.sourceOptionsLoaded) return;
+  const data = await api("/api/source-options");
+  renderChoiceList("arxivCategories", data.arxiv_categories || [], "arxiv");
+  renderChoiceList("conferenceSources", data.conferences || [], "conference");
+  renderChoiceList("journalSources", data.journals || [], "journal");
+  state.sourceOptionsLoaded = true;
+}
+
+function renderChoiceList(targetId, items, groupName) {
+  const target = $(targetId);
+  if (!target) return;
+  if (!items.length) {
+    target.className = "choice-list empty";
+    target.textContent = "没有可用来源。";
+    return;
+  }
+  target.className = "choice-list";
+  target.innerHTML = items.map((item) => {
+    const disabled = item.enabled === false ? " disabled" : "";
+    const checked = item.enabled === false ? "" : " checked";
+    const group = item.group ? `<span>${escapeHtml(item.group)}</span>` : "";
+    return `
+      <label class="source-choice">
+        <input type="checkbox" name="${groupName}" value="${escapeHtml(item.id)}"${checked}${disabled}>
+        <span>${escapeHtml(item.label || item.id)}</span>
+        ${group}
+      </label>
+    `;
+  }).join("");
+}
+
+function selectedSourceValues(name) {
+  return [...document.querySelectorAll(`input[name="${name}"]:checked`)]
+    .map((input) => input.value)
+    .filter(Boolean);
+}
+
+function collectDailyOptions() {
+  return {
+    arxiv_categories: selectedSourceValues("arxiv"),
+    conferences: selectedSourceValues("conference"),
+    journals: selectedSourceValues("journal"),
+  };
+}
+
+function setAllSources(checked) {
+  document.querySelectorAll(".choice-list input[type='checkbox']:not(:disabled)").forEach((input) => {
+    input.checked = checked;
+  });
+}
+
+function toggleSourceGroup(targetId) {
+  const inputs = [...document.querySelectorAll(`#${targetId} input[type='checkbox']:not(:disabled)`)];
+  if (!inputs.length) return;
+  const shouldCheck = inputs.some((input) => !input.checked);
+  inputs.forEach((input) => {
+    input.checked = shouldCheck;
+  });
 }
 
 function renderRoles(roles) {
@@ -633,20 +706,24 @@ async function refreshProfile() {
   renderProfile(data.profile || data.raw || {});
 }
 
-function renderPush(push) {
+function renderPush(push, options = {}) {
+  const preserveSelection = Boolean(options.preserveSelection);
   state.push = push || null;
-  state.selected.clear();
-  state.skipped.clear();
-  $("reportResults").classList.add("hidden");
-  $("reportList").innerHTML = "";
+  if (!preserveSelection) {
+    state.selected.clear();
+    state.skipped.clear();
+    $("reportResults").classList.add("hidden");
+    $("reportList").innerHTML = "";
+  }
   const metadata = push?.metadata || {};
   const fallbackText = metadata.fallback_used
     ? ` | ${metadata.fallback_days || 7} 天兜底${metadata.fallback_relaxed ? "（宽松匹配）" : ""}`
     : "";
+  const previewText = metadata.preview ? " | 实时预览" : "";
 
   if (!push || !push.papers || !push.papers.length) {
     if (push) {
-      $("pushMeta").textContent = `推送 ${push.push_id || ""} | ${push.push_time || "未知时间"} | 0 篇论文${fallbackText}`;
+      $("pushMeta").textContent = `推送 ${push.push_id || ""} | ${push.push_time || "未知时间"} | 0 篇论文${fallbackText}${previewText}`;
       $("latestPushStat").textContent = "0";
     } else {
       $("pushMeta").textContent = "尚未加载推送。";
@@ -665,7 +742,7 @@ function renderPush(push) {
     return;
   }
 
-  $("pushMeta").textContent = `推送 ${push.push_id} | ${push.push_time || "未知时间"} | ${push.papers.length} 篇论文${fallbackText}`;
+  $("pushMeta").textContent = `推送 ${push.push_id} | ${push.push_time || "未知时间"} | ${push.papers.length} 篇论文${fallbackText}${previewText}`;
   $("latestPushStat").textContent = push.papers.length;
   $("paperList").className = "paper-list";
   $("paperList").innerHTML = "";
@@ -675,6 +752,8 @@ function renderPush(push) {
     card.className = "paper-card";
     const authors = (paper.authors || []).slice(0, 5).join(", ");
     const category = paper.category && paper.category !== "unknown" ? paper.category : "未知";
+    const sourceLabel = formatSourceLabel(paper.source || paper.metadata?.source || "");
+    const categoryClass = categoryBadgeClass(paper.category || "");
     const links = [
       paper.url ? `<a href="${paper.url}" target="_blank" rel="noreferrer">原文</a>` : "",
       paper.pdf_url ? `<a href="${paper.pdf_url}" target="_blank" rel="noreferrer">PDF</a>` : "",
@@ -685,20 +764,22 @@ function renderPush(push) {
           <h4 class="paper-title">${paper.number}. ${escapeHtml(paper.title)}</h4>
           <div class="paper-meta">${escapeHtml(authors || "未知作者")}</div>
         </div>
-        <span class="badge blue">${escapeHtml(category)}</span>
+        <span class="badge ${categoryClass}">${escapeHtml(formatCategoryLabel(category))}</span>
       </div>
       <div class="badge-row">
+        ${sourceLabel ? `<span class="badge source-badge">${escapeHtml(sourceLabel)}</span>` : ""}
         ${formatDateBadge(paper.publish_date) ? `<span class="badge">${escapeHtml(formatDateBadge(paper.publish_date))}</span>` : ""}
+        ${Number.isFinite(Number(paper.score)) ? `<span class="badge">相关性 ${Number(paper.score).toFixed(2)}</span>` : ""}
       </div>
       <p class="paper-abstract">${escapeHtml(paper.abstract || "暂无摘要。")}</p>
       <div class="paper-meta">${links}</div>
       <div class="card-actions">
         <label class="checkline">
-          <input type="checkbox" data-action="read" data-number="${paper.number}">
+          <input type="checkbox" data-action="read" data-number="${paper.number}" ${state.selected.has(Number(paper.number)) ? "checked" : ""}>
           精读
         </label>
         <label class="checkline">
-          <input type="checkbox" data-action="skip" data-number="${paper.number}">
+          <input type="checkbox" data-action="skip" data-number="${paper.number}" ${state.skipped.has(Number(paper.number)) ? "checked" : ""}>
           不感兴趣
         </label>
       </div>
@@ -710,6 +791,43 @@ function renderPush(push) {
     input.addEventListener("change", handlePaperCheck);
   });
   updateSelectionSummary();
+}
+
+function formatCategoryLabel(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  const labels = {
+    pending: "待评分",
+    must_read: "必读命中",
+    high_relevant: "高度相关",
+    maybe_interested: "可能相关",
+    edge_relevant: "边缘相关",
+    unknown: "未知",
+  };
+  return labels[normalized] || value || "未知";
+}
+
+function relevanceSortValue(paper) {
+  const categoryRank = {
+    must_read: 5,
+    high_relevant: 4,
+    maybe_interested: 3,
+    edge_relevant: 2,
+    pending: 1,
+  };
+  const category = String(paper?.category || "").trim().toLowerCase();
+  const score = Number(paper?.score);
+  return (categoryRank[category] || 0) * 1000 + (Number.isFinite(score) ? score : -1);
+}
+
+function sortCurrentPushByRelevance() {
+  if (!state.push || !Array.isArray(state.push.papers) || !state.push.papers.length) return;
+  const sorted = [...state.push.papers].sort((a, b) => relevanceSortValue(b) - relevanceSortValue(a));
+  state.push = {
+    ...state.push,
+    papers: sorted,
+  };
+  renderPush(state.push, { preserveSelection: true });
+  setStatus("已按相关性排序");
 }
 
 function handlePaperCheck(event) {
@@ -749,6 +867,28 @@ function formatDateBadge(value) {
   return dateMatch ? dateMatch[1] : text;
 }
 
+function formatSourceLabel(value) {
+  const text = String(value || "").trim();
+  if (!text) return "";
+  const normalized = text.toLowerCase();
+  const labels = {
+    arxiv: "arXiv",
+    openreview: "OpenReview",
+    journal: "Journal",
+    local_pdf: "Local PDF",
+  };
+  return labels[normalized] || text;
+}
+
+function categoryBadgeClass(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (normalized === "must_read") return "relevance-strongest";
+  if (normalized === "high_relevant") return "relevance-strong";
+  if (normalized === "maybe_interested") return "relevance-medium";
+  if (normalized === "edge_relevant") return "relevance-light";
+  return "relevance-light";
+}
+
 async function loadLatestPush() {
   const userId = ensureUser();
   setStatus("加载最新推送", true);
@@ -777,7 +917,7 @@ function scheduleDailyTaskPolling() {
       setStatus(localizeError(error.message || String(error)));
       console.error(error);
     });
-  }, 1800);
+  }, 700);
 }
 
 async function handleDailyTask(task, options = {}) {
@@ -792,10 +932,16 @@ async function handleDailyTask(task, options = {}) {
 
   if (task.status === "queued" || task.status === "running") {
     setDailyButtonBusy(true);
+    if (task.preview_push && task.preview_push.papers && task.preview_push.papers.length) {
+      renderPush(task.preview_push, { preserveSelection: true });
+    }
     if (!options.fromPoll || previousStatus !== task.status) {
-      setStatus(task.status === "queued" ? "每日推送排队中" : "每日推送运行中", true);
+      const previewCount = task.preview_push?.papers?.length || 0;
+      const progressText = previewCount ? `每日推送运行中，已展示 ${previewCount} 篇` : "每日推送运行中";
+      setStatus(task.status === "queued" ? "每日推送排队中" : progressText, true);
     } else {
-      $("statusText").textContent = "每日推送运行中...";
+      const previewCount = task.preview_push?.papers?.length || 0;
+      $("statusText").textContent = previewCount ? `每日推送运行中，已展示 ${previewCount} 篇...` : "每日推送运行中...";
     }
     scheduleDailyTaskPolling();
     return;
@@ -807,6 +953,8 @@ async function handleDailyTask(task, options = {}) {
   if (task.status === "completed") {
     if (task.push) renderPush(task.push);
     const count = task.push?.papers?.length || 0;
+    state.dailyTaskId = "";
+    state.dailyTaskStatus = "";
     await Promise.allSettled([refreshDashboard(), refreshWikiStats()]);
     if (!options.silent) {
       setStatus(count ? "每日推送完成" : "每日推送完成，但本轮没有通过筛选的论文");
@@ -815,8 +963,12 @@ async function handleDailyTask(task, options = {}) {
   }
 
   if (task.status === "failed") {
+    state.dailyTaskId = "";
+    state.dailyTaskStatus = "";
     if (!options.silent) {
-      setStatus(task.error || "每日推送失败");
+      const message = task.error || "每日推送失败";
+      setStatus(message);
+      window.alert(`每日推送失败：\n${message}`);
     }
   }
 }
@@ -834,10 +986,17 @@ async function refreshDailyTaskStatus(options = {}) {
 async function runDaily() {
   const userId = ensureUser();
   const days = Number($("daysInput").value || 1);
+  await loadSourceOptions();
+  const sourceOptions = collectDailyOptions();
+  const selectedSourceCount =
+    sourceOptions.arxiv_categories.length + sourceOptions.conferences.length + sourceOptions.journals.length;
+  if (!selectedSourceCount) {
+    throw new Error("请至少选择一个论文来源。");
+  }
   setStatus("启动每日推送", true);
   const data = await api("/api/daily/start", {
     method: "POST",
-    body: JSON.stringify({ user_id: userId, days }),
+    body: JSON.stringify({ user_id: userId, days, ...sourceOptions }),
   });
   await handleDailyTask(data.task);
 }
@@ -992,7 +1151,6 @@ async function refreshDashboard() {
 }
 
 function renderActivity(items) {
-  renderActivityList("activityList", items.slice(0, 8), "");
   renderActivityList("historyList", items, $("activityFilter") ? $("activityFilter").value : "");
 }
 
@@ -1136,6 +1294,7 @@ async function refreshSettings() {
   const paths = data.paths || {};
   const rows = [
     ["项目根目录", data.project_root],
+    [".env 文件", data.env_path],
     ["数据库", data.database],
     ["PDF 保存目录", paths.pdf_dir],
     ["精读报告目录", paths.reading_reports_dir],
@@ -1150,12 +1309,53 @@ async function refreshSettings() {
   $("settingsList").innerHTML = rows.map(([key, value]) => `
     <div class="setting-item"><strong>${escapeHtml(key)}</strong><br><code>${escapeHtml(value || "")}</code></div>
   `).join("");
+  renderEnvSettings(data.editable_env || []);
   ["writeFeishuReports", "directWriteFeishu", "directPdfWriteFeishu"].forEach((id) => {
     const target = $(id);
     if (target && !target.dataset.userTouched) {
       target.checked = Boolean(paths.write_feishu);
     }
   });
+}
+
+function renderEnvSettings(items) {
+  const target = $("envSettingsForm");
+  if (!target) return;
+  if (!items.length) {
+    target.className = "env-form empty";
+    target.textContent = "没有可编辑的 .env 设置。";
+    return;
+  }
+  target.className = "env-form";
+  target.innerHTML = items.map((item) => {
+    const type = item.is_secret ? "password" : "text";
+    const value = item.value || "";
+    return `
+      <label class="env-field">
+        <span>${escapeHtml(item.key)}</span>
+        <input data-env-key="${escapeHtml(item.key)}" type="${type}" value="${escapeHtml(value)}" autocomplete="off">
+      </label>
+    `;
+  }).join("");
+}
+
+async function saveSettings() {
+  const values = {};
+  document.querySelectorAll("[data-env-key]").forEach((input) => {
+    values[input.dataset.envKey] = input.value;
+  });
+  setStatus("保存运行设置", true);
+  const data = await api("/api/settings", {
+    method: "POST",
+    body: JSON.stringify({ values }),
+  });
+  const paths = data.paths || {};
+  renderEnvSettings(data.editable_env || []);
+  ["writeFeishuReports", "directWriteFeishu", "directPdfWriteFeishu"].forEach((id) => {
+    const target = $(id);
+    if (target) target.checked = Boolean(paths.write_feishu);
+  });
+  setStatus("运行设置已保存");
 }
 
 async function testProvider(kind) {
@@ -1202,15 +1402,15 @@ function bindEvents() {
       await refreshDailyTaskStatus({ silent: true });
     });
   });
-  $("clearTaskLogBtn").addEventListener("click", () => {
-    state.taskLog = [];
-    renderTaskLog();
-  });
-  $("refreshDashboardBtn").addEventListener("click", () => runAction(refreshDashboard));
   $("refreshHistoryBtn").addEventListener("click", () => runAction(refreshDashboard));
   $("activityFilter").addEventListener("change", () => renderActivity(state.activity));
-  $("loadPushBtn").addEventListener("click", () => runAction(loadLatestPush));
+  $("sortRelevanceBtn").addEventListener("click", () => runAction(sortCurrentPushByRelevance));
   $("runDailyBtn").addEventListener("click", () => runAction(runDaily));
+  $("selectAllSourcesBtn").addEventListener("click", () => setAllSources(true));
+  $("clearSourcesBtn").addEventListener("click", () => setAllSources(false));
+  document.querySelectorAll("[data-source-toggle]").forEach((button) => {
+    button.addEventListener("click", () => toggleSourceGroup(button.dataset.sourceToggle));
+  });
   $("submitFeedbackBtn").addEventListener("click", () => runAction(() => submit(false)));
   $("submitAndReadBtn").addEventListener("click", () => runAction(() => submit(true)));
   $("readArxivBtn").addEventListener("click", () => runAction(readArxivDirect));
@@ -1226,6 +1426,7 @@ function bindEvents() {
   $("saveProfileBtn").addEventListener("click", () => runAction(saveProfile));
   $("refreshProfileBtn").addEventListener("click", () => runAction(refreshProfile));
   $("refreshSettingsBtn").addEventListener("click", () => runAction(refreshSettings));
+  $("saveSettingsBtn").addEventListener("click", () => runAction(saveSettings));
   $("testLlmBtn").addEventListener("click", () => runAction(() => testProvider("llm")));
   $("testEmbedBtn").addEventListener("click", () => runAction(() => testProvider("embedding")));
   ["writeFeishuReports", "directWriteFeishu", "directPdfWriteFeishu"].forEach((id) => {
@@ -1242,7 +1443,9 @@ async function runAction(fn) {
   try {
     await fn();
   } catch (error) {
-    setStatus(localizeError(error.message || String(error)));
+    const message = localizeError(error.message || String(error));
+    setStatus(message);
+    window.alert(message);
     console.error(error);
   }
 }
@@ -1259,6 +1462,7 @@ async function boot() {
     refreshDashboard(),
     refreshWikiStats(),
     refreshSettings(),
+    loadSourceOptions(),
     loadLatestPush(),
     refreshProfile(),
     refreshMustRead(),

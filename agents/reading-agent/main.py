@@ -19,6 +19,7 @@ import re
 import hashlib
 import shutil
 import tempfile
+import inspect
 from html import unescape
 from datetime import datetime
 from typing import Dict, List, Optional, Any, Tuple
@@ -92,7 +93,7 @@ READING_REPORT_EVIDENCE_VERSION = (
     or "2026-04-27-v4"
 )
 READING_REPORT_EVIDENCE_CACHE_ENABLED = os.environ.get("READING_REPORT_EVIDENCE_CACHE_ENABLED", "1").strip().lower() not in {"0", "false", "off", "no"}
-READING_REPORT_OUTPUT_VERSION = os.environ.get("READING_REPORT_OUTPUT_VERSION", "2026-05-31-v4").strip() or "2026-05-31-v4"
+READING_REPORT_OUTPUT_VERSION = os.environ.get("READING_REPORT_OUTPUT_VERSION", "2026-06-04-v5").strip() or "2026-06-04-v5"
 READING_REPORT_PROFILE_RETRIEVAL_WEIGHT = float(os.environ.get("READING_REPORT_PROFILE_RETRIEVAL_WEIGHT", "0.25"))
 HTTP_RETRY_TOTAL = int(os.environ.get("PAPERFLOW_HTTP_RETRIES", "2"))
 HTTP_RETRY_BACKOFF = float(os.environ.get("PAPERFLOW_HTTP_BACKOFF", "0.8"))
@@ -132,7 +133,7 @@ def _resolve_configured_dir(
     base_dir = Path(configured).expanduser() if configured else PROJECT_ROOT / default_relative
     if not base_dir.is_absolute():
         base_dir = PROJECT_ROOT / base_dir
-    if user_id:
+    if user_id and not configured:
         base_dir = role_utils.apply_output_scope(
             base_dir,
             user_id,
@@ -2930,7 +2931,7 @@ def build_heuristic_report_payload(
     }
 
 
-def _normalize_string_list(value: Any, limit: int = 4) -> List[str]:
+def _normalize_string_list(value: Any, limit: int = 4, max_chars: int = 180) -> List[str]:
     if isinstance(value, str):
         candidates = re.split(r"\n+|[;；]+", value)
     elif isinstance(value, list):
@@ -2942,8 +2943,53 @@ def _normalize_string_list(value: Any, limit: int = 4) -> List[str]:
     for candidate in candidates:
         cleaned = re.sub(r"^\s*[-*•\d\.\)\(]+\s*", "", str(candidate)).strip()
         if len(cleaned) >= 4:
-            items.append(_truncate_text(cleaned, 180))
+            items.append(_truncate_text(cleaned, max_chars))
     return _unique_preserve_order(items)[:limit]
+
+
+def _looks_like_extraction_noise(text: str) -> bool:
+    cleaned = _clean_text(text)
+    if not cleaned:
+        return False
+    lowered = cleaned.lower()
+    noise_markers = (
+        "arxiv:",
+        "[cs.",
+        "correspondence to:",
+        "copyright",
+        "accepted by",
+        "proceedings of",
+        "doi:",
+    )
+    marker_hits = sum(1 for marker in noise_markers if marker in lowered)
+    short_line_count = sum(1 for line in cleaned.splitlines() if 0 < len(line.strip()) <= 18)
+    digit_ratio = sum(ch.isdigit() for ch in cleaned) / max(1, len(cleaned))
+    return marker_hits >= 2 or short_line_count >= 6 or digit_ratio > 0.12
+
+
+def _append_template_qa_block(lines: List[str], qid: str, question: str, content: Any) -> None:
+    lines.append(f"{qid}: {question}")
+    lines.append("")
+    if isinstance(content, list):
+        values = [_clean_text(item) for item in content if _clean_text(item)]
+        if values:
+            for item in values:
+                lines.append(f"- {item}")
+        else:
+            lines.append("当前信息不足，建议回到原文对应章节核对。")
+    else:
+        text = _clean_text(content)
+        if text:
+            for paragraph in re.split(r"\n{2,}", text):
+                paragraph = paragraph.strip()
+                if paragraph:
+                    lines.append(paragraph)
+                    lines.append("")
+            if lines and lines[-1] == "":
+                lines.pop()
+        else:
+            lines.append("当前信息不足，建议回到原文对应章节核对。")
+    lines.append("")
 
 
 def _synthesize_report_with_llm(
@@ -2979,12 +3025,39 @@ def _synthesize_report_with_llm(
         return {"analysis_note": fallback_note}
 
 
+def _enrich_paper_for_reading_report_compat(
+    paper: Dict[str, Any],
+    *,
+    user_id: Optional[str] = None,
+) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]], Optional[str]]:
+    """Call the enrichment hook while tolerating older one-argument test doubles."""
+    try:
+        signature = inspect.signature(enrich_paper_for_reading_report)
+        if "user_id" in signature.parameters:
+            return enrich_paper_for_reading_report(paper, user_id=user_id)
+    except (TypeError, ValueError):
+        pass
+    return enrich_paper_for_reading_report(paper)
+
+
 def _merge_report_payload(base: Dict[str, Any], llm_payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     if not isinstance(llm_payload, dict):
         return base
 
     merged = dict(base)
-    for key in ("one_sentence_summary", "research_background", "core_method", "key_results"):
+    for key in (
+        "one_sentence_summary",
+        "clean_abstract_summary",
+        "problem_analysis",
+        "related_work",
+        "solution_approach",
+        "experiments",
+        "future_directions",
+        "paper_summary",
+        "research_background",
+        "core_method",
+        "key_results",
+    ):
         value = _clean_text(llm_payload.get(key))
         if value:
             merged[key] = value
@@ -2994,7 +3067,7 @@ def _merge_report_payload(base: Dict[str, Any], llm_payload: Optional[Dict[str, 
         merged["analysis_note"] = _append_analysis_note(merged.get("analysis_note"), analysis_note)
 
     for key in ("main_contributions", "limitations", "relevance_points", "reading_focus"):
-        values = _normalize_string_list(llm_payload.get(key))
+        values = _normalize_string_list(llm_payload.get(key), max_chars=320)
         if values:
             merged[key] = values
 
@@ -3052,6 +3125,9 @@ def generate_reading_report(
     payload = report_payload or build_heuristic_report_payload(paper, user_profile)
     title = _clean_text(paper.get("title")) or "Untitled Paper"
     abstract = _clean_abstract_text(payload.get("abstract") or paper.get("abstract"))
+    clean_abstract_summary = _clean_text(payload.get("clean_abstract_summary"))
+    if clean_abstract_summary and (not _clean_text(abstract) or _looks_like_extraction_noise(abstract)):
+        abstract = clean_abstract_summary
     if not _clean_text(abstract):
         fallback_source = _get_direct_pdf_url(paper) or _get_first_url(
             paper,
@@ -3124,52 +3200,51 @@ def generate_reading_report(
             lines.append(f"> {paragraph.strip()}")
     lines.append("")
 
-    _append_qa_block(
-        lines,
-        "Q1",
-        "这篇论文试图解决什么问题？",
-        payload.get("research_background") or "建议先回到原文摘要和引言确认研究问题。",
-    )
-    _append_qa_block(
-        lines,
-        "Q2",
-        "它提出了什么方法？",
-        payload.get("core_method") or "当前未成功提炼方法细节，请重点阅读 Method / Approach 部分。",
-    )
-    _append_qa_block(
-        lines,
-        "Q3",
-        "主要结果是什么？",
-        payload.get("key_results") or "当前没有提炼出明确结果，请重点核对实验表格和主要指标。",
-    )
-    _append_qa_block(
-        lines,
-        "Q4",
-        "主要贡献或创新点是什么？",
-        payload.get("main_contributions") or [],
-    )
-    _append_qa_block(
-        lines,
-        "Q5",
-        "局限性和注意事项是什么？",
-        payload.get("limitations") or [],
-    )
-    _append_qa_block(
-        lines,
-        "Q6",
-        "这篇论文和我的研究有什么关系？",
-        payload.get("relevance_points") or [],
-    )
-    reading_plan = []
-    if analysis_note:
-        reading_plan.append(analysis_note)
-    reading_plan.extend(payload.get("reading_focus") or [])
-    _append_qa_block(
-        lines,
-        "Q7",
-        "我应该怎么读？",
-        reading_plan,
-    )
+    problem_analysis = payload.get("problem_analysis") or payload.get("research_background") or "建议先回到原文摘要和引言确认研究问题。"
+    related_work = payload.get("related_work")
+    if not related_work:
+        related_work_items = payload.get("main_contributions") or []
+        related_work = (
+            "当前自动解析没有稳定提取出 Related Work 的完整脉络。可先从论文引言、相关工作章节和引用线索核对它主要对比了哪些方法。"
+        )
+        if related_work_items:
+            related_work += "\n\n从当前证据可见，论文的定位至少包括：" + "；".join(str(item) for item in related_work_items[:3]) + "。"
+    solution_approach = payload.get("solution_approach") or payload.get("core_method") or "当前未成功提炼方法细节，请重点阅读 Method / Approach 部分。"
+    experiments = payload.get("experiments")
+    if not experiments:
+        result_text = _clean_text(payload.get("key_results"))
+        experiments = result_text or "当前没有提炼出明确实验设置，请重点核对 Experiments / Results、表格、图示和主要指标。"
+    future_directions = payload.get("future_directions")
+    if not future_directions:
+        future_items = []
+        future_items.extend(payload.get("limitations") or [])
+        future_items.extend(payload.get("reading_focus") or [])
+        future_directions = future_items or ["当前信息不足，建议从局限性、失败案例、消融缺口和跨领域泛化四个角度回原文继续挖掘。"]
+    paper_summary = payload.get("paper_summary")
+    if not paper_summary:
+        summary_parts = [
+            _clean_text(payload.get("one_sentence_summary")),
+            _clean_text(payload.get("research_background")),
+            _clean_text(payload.get("core_method")),
+            _clean_text(payload.get("key_results")),
+        ]
+        contributions = payload.get("main_contributions") or []
+        limitations = payload.get("limitations") or []
+        relevance = payload.get("relevance_points") or []
+        if contributions:
+            summary_parts.append("主要贡献包括：" + "；".join(str(item) for item in contributions[:4]) + "。")
+        if limitations:
+            summary_parts.append("需要注意的边界包括：" + "；".join(str(item) for item in limitations[:3]) + "。")
+        if relevance:
+            summary_parts.append("与用户画像的关系：" + "；".join(str(item) for item in relevance[:3]) + "。")
+        paper_summary = "\n\n".join(part for part in summary_parts if part) or "当前信息不足，建议回到原文摘要、引言、方法和结论串联主线。"
+
+    _append_template_qa_block(lines, "Q1", "这篇论文试图解决什么问题？", problem_analysis)
+    _append_template_qa_block(lines, "Q2", "有哪些相关研究？", related_work)
+    _append_template_qa_block(lines, "Q3", "论文如何解决这个问题？", solution_approach)
+    _append_template_qa_block(lines, "Q4", "论文做了哪些实验？", experiments)
+    _append_template_qa_block(lines, "Q5", "有什么可以进一步探索的点？", future_directions)
+    _append_template_qa_block(lines, "Q6", "总结一下论文的主要内容", paper_summary)
 
     if report_evidence_anchors:
         bucket_labels = {
@@ -3521,7 +3596,10 @@ def create_reading_report(
         )
 
         try:
-            enriched_paper, parsed_pdf, pdf_error = enrich_paper_for_reading_report(raw_paper, user_id=user_id)
+            enriched_paper, parsed_pdf, pdf_error = _enrich_paper_for_reading_report_compat(
+                raw_paper,
+                user_id=user_id,
+            )
             heuristic_payload = build_heuristic_report_payload(
                 enriched_paper,
                 profile,

@@ -11,7 +11,7 @@ import math
 import re
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, List, Dict, Optional, Set
+from typing import Any, Callable, List, Dict, Optional, Set
 from dataclasses import dataclass
 from collections import defaultdict
 
@@ -31,6 +31,8 @@ import importlib
 # 导入多个数据源
 arxiv_fetcher = importlib.import_module("skills.arxiv-fetcher.scripts.fetch_arxiv")
 arxiv_fetch_by_date = arxiv_fetcher.fetch_by_date
+arxiv_fetch_latest = getattr(arxiv_fetcher, "fetch_latest", None)
+arxiv_fetch_recent_list_page = getattr(arxiv_fetcher, "fetch_recent_list_page", None)
 
 openreview_fetcher = importlib.import_module("skills.openreview-fetcher.scripts.fetch_openreview")
 openreview_fetch_by_date = openreview_fetcher.fetch_by_date
@@ -82,6 +84,7 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(_
 
 EMPTY_PUSH_FALLBACK_DAYS = 7
 EMPTY_PUSH_FALLBACK_TOP_K = 7
+DEFAULT_LIMIT_PER_SOURCE = 100
 
 
 def _wiki_ingest_enabled() -> bool:
@@ -806,7 +809,8 @@ def fetch_and_process_papers(
     arxiv_categories: List[str] = None,
     conferences: List[str] = None,
     journals: List[str] = None,
-    limit_per_source: int = 30
+    limit_per_source: int = DEFAULT_LIMIT_PER_SOURCE,
+    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> List[Dict]:
     """
     从多个数据源抓取并处理论文
@@ -830,24 +834,61 @@ def fetch_and_process_papers(
     if journals is None:
         journals = load_default_journals()
 
+    def emit(event: Dict[str, Any]) -> None:
+        if not callable(progress_callback):
+            return
+        try:
+            progress_callback(event)
+        except Exception as exc:
+            print(f"  Progress callback error: {exc}")
+
+    def emit_fetched(source: str, papers: List[Dict]) -> None:
+        for paper in papers:
+            emit({"phase": "fetched", "source": source, "paper": paper})
+
     today = datetime.now()
     end_date = today.strftime("%Y%m%d")
 
     def fetch_arxiv_papers(fetch_days: int) -> List[Dict]:
+        if not arxiv_categories:
+            print("Skipping arXiv fetch: no categories selected")
+            return []
         start_date = (today - timedelta(days=fetch_days)).strftime("%Y%m%d")
-        print(f"Fetching from arXiv ({start_date} to {end_date})...")
-        papers = arxiv_fetch_by_date(
-            start_date=start_date,
-            end_date=end_date,
-            categories=arxiv_categories,
-            limit=limit_per_source
-        )
+        papers: List[Dict] = []
+        per_category_limit = max(1, int(math.ceil(limit_per_source / max(1, len(arxiv_categories)))))
+        for category in arxiv_categories:
+            print(f"Fetching from arXiv {category} ({start_date} to {end_date})...")
+            category_papers = arxiv_fetch_by_date(
+                start_date=start_date,
+                end_date=end_date,
+                categories=[category],
+                limit=per_category_limit,
+            ) or []
+            if not category_papers and callable(arxiv_fetch_latest):
+                print(f"  Date-bounded arXiv fetch returned 0 papers for {category}; fetching latest via API...")
+                category_papers = arxiv_fetch_latest(
+                    categories=[category],
+                    limit=per_category_limit,
+                ) or []
+            if not category_papers and callable(arxiv_fetch_recent_list_page):
+                print(f"  arXiv API returned 0 papers for {category}; fetching recent list page...")
+                category_papers = arxiv_fetch_recent_list_page(
+                    category=category,
+                    limit=per_category_limit,
+                ) or []
+            papers.extend(category_papers)
+            if category_papers:
+                emit_fetched("arxiv", [{**paper, "source": "arxiv"} for paper in category_papers])
         for paper in papers:
             paper["source"] = "arxiv"
         print(f"  Fetched {len(papers)} papers from arXiv")
+        emit({"phase": "source_complete", "source": "arxiv", "count": len(papers)})
         return papers
 
     def fetch_openreview_papers(fetch_days: int) -> List[Dict]:
+        if not conferences:
+            print("Skipping OpenReview fetch: no conferences selected")
+            return []
         start_date = (today - timedelta(days=fetch_days)).strftime("%Y%m%d")
         print(f"Fetching from OpenReview (conferences: {conferences})...")
         papers = openreview_fetch_by_date(
@@ -855,23 +896,63 @@ def fetch_and_process_papers(
             end_date=end_date,
             conferences=conferences,
             limit=limit_per_source
-        )
+        ) or []
         for paper in papers:
             paper["source"] = "openreview"
         print(f"  Fetched {len(papers)} papers from OpenReview")
+        emit({"phase": "source_complete", "source": "openreview", "count": len(papers)})
+        emit_fetched("openreview", papers)
         return papers
 
     def fetch_journal_papers(fetch_days: int) -> List[Dict]:
+        if not journals:
+            print("Skipping journal fetch: no journals selected")
+            return []
         print(f"Fetching from journals ({journals}) in the last {fetch_days} days...")
         papers = journal_fetch_recent(
             journals=journals,
             days=fetch_days,
             limit_per_journal=limit_per_source
-        )
+        ) or []
         for paper in papers:
             paper["source"] = "journal"
         print(f"  Fetched {len(papers)} papers from journals")
+        emit({"phase": "source_complete", "source": "journal", "count": len(papers)})
+        emit_fetched("journal", papers)
         return papers
+
+    def fetch_cached_arxiv_papers() -> List[Dict]:
+        if not arxiv_categories:
+            return []
+        try:
+            conn = db_ops.get_connection()
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT * FROM papers
+                WHERE arxiv_id IS NOT NULL AND TRIM(arxiv_id) != ''
+                ORDER BY fetched_at DESC, id DESC
+                LIMIT ?
+                """,
+                (max(1, int(limit_per_source)),),
+            )
+            rows = cursor.fetchall()
+            conn.close()
+            cached = []
+            for row in rows:
+                paper = db_ops._build_paper_dict(row)
+                paper["source"] = "arxiv"
+                paper["category"] = "cached"
+                paper.setdefault("metadata", {})["remote_fetch_failed"] = True
+                cached.append(paper)
+            if cached:
+                print(f"  Using {len(cached)} cached arXiv papers because remote fetch returned 0.")
+                emit({"phase": "source_complete", "source": "arxiv_cache", "count": len(cached)})
+                emit_fetched("arxiv", cached)
+            return cached
+        except Exception as exc:
+            print(f"  Cached arXiv fallback failed: {exc}")
+            return []
 
     all_papers = []
     arxiv_papers = []
@@ -899,9 +980,12 @@ def fetch_and_process_papers(
     except Exception as e:
         print(f"  Journal fetch error: {e}")
 
+    if not all_papers:
+        all_papers.extend(fetch_cached_arxiv_papers())
+
     fallback_days = max(days, 7)
     min_candidate_pool = max(10, limit_per_source // 2)
-    if days < fallback_days and len(all_papers) < min_candidate_pool:
+    if days < fallback_days and not all_papers:
         print(
             f"Candidate pool too small ({len(all_papers)} papers); "
             f"widening sparse sources to {fallback_days} days..."
@@ -932,6 +1016,7 @@ def fetch_and_process_papers(
             unique_papers.append(paper)
 
     print(f"Total unique papers after deduplication: {len(unique_papers)}")
+    emit({"phase": "deduplicated", "count": len(unique_papers)})
 
     return prepare_paper_features(unique_papers)
 
@@ -939,7 +1024,8 @@ def fetch_and_process_papers(
 def sort_and_categorize(
     papers: List[Dict],
     profile: Dict,
-    weights: Dict
+    weights: Dict,
+    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> List[PaperWithScore]:
     """
     排序并分类论文
@@ -952,6 +1038,14 @@ def sort_and_categorize(
     Returns:
         带分类的论文列表
     """
+    def emit(event: Dict[str, Any]) -> None:
+        if not callable(progress_callback):
+            return
+        try:
+            progress_callback(event)
+        except Exception as exc:
+            print(f"  Progress callback error: {exc}")
+
     result = []
     for paper in papers:
         score = calculate_paper_score(paper, profile, weights)
@@ -973,6 +1067,8 @@ def sort_and_categorize(
             )
         )
 
+    emit({"phase": "scored", "count": len(result)})
+
     # 先按分数粗排，再按分类结果做硬优先级重排
     result.sort(key=lambda x: x.score, reverse=True)
 
@@ -981,6 +1077,8 @@ def sort_and_categorize(
     result = apply_source_diversity_quota(result, weights)
     result = apply_push_count_limit(result, weights)
     result.sort(key=_hard_priority_tuple, reverse=True)
+    for rank, item in enumerate(result, start=1):
+        emit({"phase": "ranked", "rank": rank, "paper": item.paper, "score": item.score, "category": item.category})
 
     return result
 
@@ -1212,10 +1310,11 @@ def daily_push(
     arxiv_categories: List[str] = None,
     conferences: List[str] = None,
     journals: List[str] = None,
-    limit_per_source: int = 30,
+    limit_per_source: int = DEFAULT_LIMIT_PER_SOURCE,
     output_file: str = None,
     send_to_feishu: bool = False,
-    feishu_chat_id: str = None  # 飞书群 ID（可选，用于多角色）
+    feishu_chat_id: str = None,  # 飞书群 ID（可选，用于多角色）
+    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
 ):
     """
     执行每日推送
@@ -1270,7 +1369,8 @@ def daily_push(
         arxiv_categories=arxiv_categories,
         conferences=conferences,
         journals=journals,
-        limit_per_source=limit_per_source
+        limit_per_source=limit_per_source,
+        progress_callback=progress_callback,
     )
     print(f"Fetched {len(papers)} papers from all sources")
 
@@ -1280,7 +1380,7 @@ def daily_push(
 
     # 4. 排序并分类
     print("Sorting and categorizing papers...")
-    scored_papers = sort_and_categorize(papers, profile, weights)
+    scored_papers = sort_and_categorize(papers, profile, weights, progress_callback=progress_callback)
     fallback_metadata: Dict[str, Any] = {
         "fallback_used": False,
         "initial_days": days,
@@ -1299,6 +1399,7 @@ def daily_push(
             conferences=[],
             journals=[],
             limit_per_source=limit_per_source,
+            progress_callback=progress_callback,
         )
         fallback_total_fetched = len(fallback_papers)
         fallback_papers, fallback_dropped = filter_user_handled_papers(user_id, fallback_papers)
@@ -1306,7 +1407,7 @@ def daily_push(
             f"Fallback pool: fetched {fallback_total_fetched}, "
             f"dropped {fallback_dropped} already handled, kept {len(fallback_papers)}"
         )
-        fallback_scored = sort_and_categorize(fallback_papers, profile, weights) if fallback_papers else []
+        fallback_scored = sort_and_categorize(fallback_papers, profile, weights, progress_callback=progress_callback) if fallback_papers else []
         relaxed_fallback_used = False
         if not fallback_scored and fallback_papers:
             print(
@@ -1509,7 +1610,7 @@ if __name__ == "__main__":
     parser.add_argument("--arxiv-categories", nargs="+", default=None, help="arXiv categories")
     parser.add_argument("--conferences", nargs="+", default=None, help="Conference names")
     parser.add_argument("--journals", nargs="+", default=None, help="Journal names")
-    parser.add_argument("--limit-per-source", type=int, default=30, help="Max papers per source")
+    parser.add_argument("--limit-per-source", type=int, default=DEFAULT_LIMIT_PER_SOURCE, help="Max papers per source")
     parser.add_argument("--output", type=str, help="Output file path")
     parser.add_argument("--send-feishu", action="store_true", help="Send to Feishu")
     parser.add_argument("--chat-id", type=str, help="Feishu chat ID (for multi-role)")

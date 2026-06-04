@@ -71,6 +71,14 @@ def _api_settings(_query_params: Dict[str, Any], _body: Dict[str, Any]) -> Dict[
     return agents.settings()
 
 
+def _api_save_settings(_query_params: Dict[str, Any], body: Dict[str, Any]) -> Dict[str, Any]:
+    return agents.save_settings(dict(body.get("values") or {}))
+
+
+def _api_source_options(_query_params: Dict[str, Any], _body: Dict[str, Any]) -> Dict[str, Any]:
+    return agents.source_options()
+
+
 def _api_provider_test(_query_params: Dict[str, Any], body: Dict[str, Any]) -> Dict[str, Any]:
     return agents.test_provider(str(body.get("kind") or ""))
 
@@ -156,7 +164,10 @@ def _api_daily(_query_params: Dict[str, Any], body: Dict[str, Any]) -> Dict[str,
     return agents.run_daily_push(
         user_id=user_id,
         days=int(body.get("days") or 1),
-        limit_per_source=int(body.get("limit_per_source") or 30),
+        limit_per_source=int(body.get("limit_per_source") or 100),
+        arxiv_categories=body.get("arxiv_categories"),
+        conferences=body.get("conferences"),
+        journals=body.get("journals"),
     )
 
 
@@ -167,7 +178,10 @@ def _api_daily_start(_query_params: Dict[str, Any], body: Dict[str, Any]) -> Dic
     return agents.start_daily_push_task(
         user_id=user_id,
         days=int(body.get("days") or 1),
-        limit_per_source=int(body.get("limit_per_source") or 30),
+        limit_per_source=int(body.get("limit_per_source") or 100),
+        arxiv_categories=body.get("arxiv_categories"),
+        conferences=body.get("conferences"),
+        journals=body.get("journals"),
     )
 
 
@@ -255,6 +269,7 @@ def _api_must_read_update(_query_params: Dict[str, Any], body: Dict[str, Any]) -
 GET_ROUTES: Dict[str, ApiHandler] = {
     "/api/health": _api_health,
     "/api/settings": _api_settings,
+    "/api/source-options": _api_source_options,
     "/api/users": _api_users,
     "/api/roles": _api_roles,
     "/api/profile": _api_profile,
@@ -268,6 +283,7 @@ GET_ROUTES: Dict[str, ApiHandler] = {
 
 POST_ROUTES: Dict[str, ApiHandler] = {
     "/api/provider-test": _api_provider_test,
+    "/api/settings": _api_save_settings,
     "/api/profile": _api_create_profile,
     "/api/roles": _api_update_roles,
     "/api/daily": _api_daily,
@@ -284,9 +300,6 @@ POST_ROUTES: Dict[str, ApiHandler] = {
 
 class PaperFlowGuiHandler(BaseHTTPRequestHandler):
     server_version = "PaperFlowGUI/0.1"
-
-    def log_message(self, fmt: str, *args: Any) -> None:
-        sys.stdout.write("[gui] " + fmt % args + "\n")
 
     def _send_json(self, payload: Dict[str, Any], status: int = 200) -> None:
         data = _json_bytes(payload)
@@ -349,6 +362,12 @@ class PaperFlowGuiHandler(BaseHTTPRequestHandler):
             self._send_json({"ok": False, "error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
             return
         self._handle_api(POST_ROUTES, body)
+
+    def log_message(self, fmt: str, *args: Any) -> None:
+        path, _query_params = _query(self.path)
+        if path == "/api/daily/status":
+            return
+        sys.stdout.write("[gui] " + fmt % args + "\n")
 
 
 def run_server(host: str = "127.0.0.1", port: int = 8765, open_browser: bool = True) -> None:
