@@ -54,6 +54,21 @@ def test_dashscope_parser_provider_aliases_to_openai(monkeypatch):
     assert llm_parser._get_llm_parser_provider() == "openai"
 
 
+def test_openai_parser_model_prefers_canonical_paperflow_env(monkeypatch):
+    monkeypatch.setenv("PAPERFLOW_LLM_MODEL", "canonical-model")
+    monkeypatch.setenv("LLM_PARSER_OPENAI_MODEL", "legacy-parser-model")
+    monkeypatch.setenv("DASHSCOPE_LLM_MODEL", "legacy-dashscope-model")
+
+    assert llm_parser._get_openai_parser_model() == "canonical-model"
+
+
+def test_openai_parser_model_accepts_legacy_parser_alias(monkeypatch):
+    monkeypatch.delenv("PAPERFLOW_LLM_MODEL", raising=False)
+    monkeypatch.setenv("LLM_PARSER_OPENAI_MODEL", "legacy-parser-model")
+
+    assert llm_parser._get_openai_parser_model() == "legacy-parser-model"
+
+
 def test_profile_updater_handles_mismatched_interest_vector_dimensions():
     updated = profile_updater.update_interest_vector(
         current_vector=[1.0, 0.0],

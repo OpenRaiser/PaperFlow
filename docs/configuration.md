@@ -64,6 +64,11 @@ The two knobs most users will touch:
 | `PAPERFLOW_EMBED_MODEL`     | per-provider default     | any model accepted by the chosen backend                    |
 | `PAPERFLOW_EMBED_DIMENSIONS`| per-provider default     | integer; controls vector size after resize                  |
 
+`PAPERFLOW_LLM_MODEL` is the canonical model knob for hosted and local LLM
+calls. Legacy parser-specific aliases such as `LLM_PARSER_OPENAI_MODEL`,
+`DASHSCOPE_LLM_MODEL`, and `HF_LLM_MODEL` are still accepted as fallbacks when
+`PAPERFLOW_LLM_MODEL` is unset.
+
 Per-provider defaults:
 
 | Provider                | Default LLM model                  | Default embedding model      | Default dim |

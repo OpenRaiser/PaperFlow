@@ -33,7 +33,7 @@ REQUIRED_FEISHU_ENV = [
 REQUIRED_MODEL_ENV = [
     "OPENAI_API_KEY",
     "OPENAI_BASE_URL",
-    "LLM_PARSER_OPENAI_MODEL",
+    "PAPERFLOW_LLM_MODEL",
 ]
 
 
@@ -134,4 +134,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

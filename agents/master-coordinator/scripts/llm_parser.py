@@ -109,6 +109,31 @@ def _get_first_env_value(*names: str) -> str:
     return ""
 
 
+def _get_openai_parser_model() -> str:
+    """Resolve the OpenAI-compatible parser model with canonical env precedence."""
+    return (
+        _get_first_env_value(
+            "PAPERFLOW_LLM_MODEL",
+            "LLM_PARSER_OPENAI_MODEL",
+            "DASHSCOPE_LLM_MODEL",
+        )
+        or "gpt-4o-mini"
+    )
+
+
+def _get_fallback_generation_model() -> str:
+    return (
+        _get_first_env_value(
+            "PAPERFLOW_LLM_MODEL",
+            "LLM_PARSER_OPENAI_MODEL",
+            "DASHSCOPE_LLM_MODEL",
+            "HF_LLM_MODEL",
+        )
+        or (_get_local_llm_model_path().name if _get_local_llm_model_path() else "")
+        or "configured-llm"
+    )
+
+
 def _should_prefer_dashscope_credentials(provider_hint: Optional[str] = None) -> bool:
     hint = str(provider_hint or "").strip().lower()
     if hint in {"dashscope", "aliyun", "bailian"}:
@@ -1164,7 +1189,7 @@ def _generate_json_with_openai(
     if client is None:
         return None
 
-    model = _get_first_env_value("LLM_PARSER_OPENAI_MODEL", "DASHSCOPE_LLM_MODEL") or "gpt-4o-mini"
+    model = _get_openai_parser_model()
     messages = [
         {
             "role": "system",
@@ -1278,7 +1303,7 @@ def _generate_json_with_configured_llm(
             if raw_provider in {"dashscope", "aliyun", "bailian"} or _should_prefer_dashscope_credentials()
             else "openai-compatible"
         )
-        model = _get_first_env_value("LLM_PARSER_OPENAI_MODEL", "DASHSCOPE_LLM_MODEL") or "gpt-4o-mini"
+        model = _get_openai_parser_model()
         return annotate(openai_result, openai_provider, model)
 
     return None
@@ -1286,11 +1311,7 @@ def _generate_json_with_configured_llm(
 
 def _fallback_generation_metadata() -> Dict[str, str]:
     provider = os.environ.get("LLM_PARSER_PROVIDER", "auto").strip() or "auto"
-    model = (
-        _get_first_env_value("LLM_PARSER_OPENAI_MODEL", "DASHSCOPE_LLM_MODEL", "HF_LLM_MODEL")
-        or (_get_local_llm_model_path().name if _get_local_llm_model_path() else "")
-        or "configured-llm"
-    )
+    model = _get_fallback_generation_model()
     return {"generation_provider": provider, "generation_model": model}
 
 
