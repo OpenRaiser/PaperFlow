@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 from pathlib import Path
 
 
@@ -19,6 +20,7 @@ monthly_export = importlib.import_module("agents.wiki-agent.export.monthly_repor
 def _use_tmp_wiki(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(db_ops, "DB_PATH", tmp_path / "paperflow.db")
     monkeypatch.setenv("PAPERFLOW_WIKI_DIR", str(tmp_path / "wiki"))
+    monkeypatch.setenv("PAPERFLOW_ROLES_PATH", str(tmp_path / "roles.json"))
     monkeypatch.setenv("PAPERFLOW_LLM_PROVIDER", "mock")
     monkeypatch.setenv("PAPERFLOW_EMBED_PROVIDER", "hash")
     db_ops.init_db()
@@ -53,6 +55,25 @@ def test_wiki_store_upserts_lists_searches_and_writes_mirror(monkeypatch, tmp_pa
     assert stats["nodes"] == 1
     assert stats["nodes_by_type"] == {"paper": 1}
     assert stats["wiki_dir"] == str(tmp_path / "wiki")
+
+
+def test_wiki_mirror_uses_user_defined_role_name(monkeypatch, tmp_path):
+    _use_tmp_wiki(monkeypatch, tmp_path)
+    (tmp_path / "roles.json").write_text(
+        json.dumps({"roles": {"gui agent lab": {"user_id": "user_alice"}}}),
+        encoding="utf-8",
+    )
+
+    node = wiki_db.upsert_node(
+        user_id="user_alice",
+        node_id="paper:2604.00002",
+        node_type="paper",
+        title="Role Scoped Wiki Mirror",
+        body="Wiki Markdown mirrors should use the user-facing role name.",
+    )
+
+    assert node["file_path"].startswith("gui-agent-lab/papers/")
+    assert (tmp_path / "wiki" / node["file_path"]).exists()
 
 
 def test_reading_report_ingest_creates_paper_sections_edges_and_citations(monkeypatch, tmp_path):
@@ -311,8 +332,13 @@ def test_monthly_export_writes_obsidian_report_and_topic_index(monkeypatch, tmp_
     report_path = Path(result["report_path"])
     topic_index_path = Path(result["topic_index_path"])
     assert result["paper_count"] == 1
-    assert report_path == output_dir / "PaperFlow Monthly Report - 2026-05.md"
-    assert topic_index_path == topic_dir / "Topic Index - 2026-05.md"
+    assert report_path == (
+        output_dir
+        / "user_alice"
+        / "monthly_reports"
+        / "PaperFlow Monthly Report - user_alice - 2026-05.md"
+    )
+    assert topic_index_path == topic_dir / "user_alice" / "Topic Index - user_alice - 2026-05.md"
     assert report_path.exists()
     assert topic_index_path.exists()
     report_text = report_path.read_text(encoding="utf-8")
@@ -343,5 +369,64 @@ def test_monthly_export_uses_configured_env_dirs(monkeypatch, tmp_path):
 
     result = monthly_export.export_monthly_report("user_alice", month="2026-05")
 
-    assert Path(result["report_path"]).parent == report_dir
-    assert Path(result["topic_index_path"]).parent == topic_dir
+    assert Path(result["report_path"]).parent == report_dir / "user_alice" / "monthly_reports"
+    assert Path(result["topic_index_path"]).parent == topic_dir / "user_alice"
+
+
+def test_monthly_export_fallback_topic_dir_does_not_duplicate_role(monkeypatch, tmp_path):
+    _use_tmp_wiki(monkeypatch, tmp_path)
+
+    wiki_db.upsert_node(
+        user_id="user_alice",
+        node_id="paper:2605.00004",
+        node_type="paper",
+        title="Fallback Topic Directory",
+        body="Fallback Topic Index output should not duplicate the role folder.",
+        metadata={"publish_date": "2026-05-20"},
+        keywords="configuration",
+    )
+
+    result = monthly_export.export_monthly_report("user_alice", month="2026-05")
+
+    assert Path(result["report_path"]).parent == tmp_path / "exports" / "user_alice" / "monthly_reports"
+    assert Path(result["topic_index_path"]).parent == tmp_path / "exports" / "user_alice" / "topic_index"
+
+
+def test_monthly_export_separates_configured_dirs_by_role_name(monkeypatch, tmp_path):
+    _use_tmp_wiki(monkeypatch, tmp_path)
+    (tmp_path / "roles.json").write_text(
+        json.dumps(
+            {
+                "roles": {
+                    "gui agent lab": {"user_id": "user_alice"},
+                    "science lab": {"user_id": "user_bob"},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    report_dir = tmp_path / "daily-note"
+    monkeypatch.setenv("PAPERFLOW_MONTHLY_REPORT_DIR", str(report_dir))
+    monkeypatch.setenv("PAPERFLOW_TOPIC_INDEX_DIR", str(report_dir / "topic-index"))
+
+    for user_id, title in (
+        ("user_alice", "GUI Paper"),
+        ("user_bob", "Science Paper"),
+    ):
+        wiki_db.upsert_node(
+            user_id=user_id,
+            node_id=f"paper:{title}",
+            node_type="paper",
+            title=title,
+            body="A role-scoped export test paper.",
+            metadata={"publish_date": "2026-05-20"},
+            keywords="configuration",
+        )
+
+    alice = monthly_export.export_monthly_report("user_alice", month="2026-05")
+    bob = monthly_export.export_monthly_report("user_bob", month="2026-05")
+
+    assert Path(alice["report_path"]).parent == report_dir / "gui-agent-lab" / "monthly_reports"
+    assert Path(bob["report_path"]).parent == report_dir / "science-lab" / "monthly_reports"
+    assert Path(alice["report_path"]).name == "PaperFlow Monthly Report - gui-agent-lab - 2026-05.md"
+    assert Path(bob["report_path"]).name == "PaperFlow Monthly Report - science-lab - 2026-05.md"

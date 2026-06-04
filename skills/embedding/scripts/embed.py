@@ -115,8 +115,11 @@ def _get_openai_timeout(provider_hint: Optional[str] = None) -> float:
 
 def _get_openai_embedding_model(provider_hint: Optional[str] = None) -> str:
     if _should_prefer_dashscope_credentials(provider_hint):
-        return _get_first_env_value("DASHSCOPE_EMBEDDING_MODEL", "EMBEDDING_MODEL") or "text-embedding-3-small"
-    return _get_first_env_value("EMBEDDING_MODEL", "DASHSCOPE_EMBEDDING_MODEL") or "text-embedding-3-small"
+        return (
+            _get_first_env_value("PAPERFLOW_EMBED_MODEL", "DASHSCOPE_EMBEDDING_MODEL", "EMBEDDING_MODEL")
+            or "text-embedding-3-small"
+        )
+    return _get_first_env_value("PAPERFLOW_EMBED_MODEL", "EMBEDDING_MODEL", "DASHSCOPE_EMBEDDING_MODEL") or "text-embedding-3-small"
 
 
 def _is_placeholder_hf_token(api_key: Optional[str]) -> bool:
@@ -238,8 +241,16 @@ class EmbeddingService:
         dimensions: Optional[int] = None,
         cache_dir: Optional[Path] = None,
     ):
-        requested_provider = (provider or os.environ.get("EMBEDDING_PROVIDER") or "hash").strip().lower()
-        self.dimensions = int(dimensions or os.environ.get("EMBEDDING_DIMENSIONS", "768"))
+        requested_provider = (
+            provider
+            or _get_first_env_value("PAPERFLOW_EMBED_PROVIDER", "EMBEDDING_PROVIDER")
+            or "hash"
+        ).strip().lower()
+        self.dimensions = int(
+            dimensions
+            or _get_first_env_value("PAPERFLOW_EMBED_DIMENSIONS", "EMBEDDING_DIMENSIONS")
+            or "768"
+        )
         self.cache_dir = Path(cache_dir or DEFAULT_CACHE_DIR)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
@@ -287,7 +298,7 @@ class EmbeddingService:
                 self.model = "hash"
         elif requested_provider in {"hf_api", "huggingface", "huggingface_api", "hf-inference"}:
             self.provider = "hf_api"
-            self.model = model or os.environ.get("HF_EMBEDDING_MODEL") or "Qwen/Qwen3-Embedding-8B"
+            self.model = model or _get_first_env_value("PAPERFLOW_EMBED_MODEL", "HF_EMBEDDING_MODEL") or "Qwen/Qwen3-Embedding-8B"
             api_key = os.environ.get("HF_TOKEN") or os.environ.get("HF_API_KEY") or ""
             if _is_placeholder_hf_token(api_key):
                 api_key = ""
@@ -316,7 +327,11 @@ class EmbeddingService:
         elif requested_provider in {"local", "sentence-transformers", "sentence_transformers"}:
             self.provider = "local"
             local_model_path = _resolve_local_model_path()
-            default_model = model or os.environ.get("LOCAL_EMBEDDING_MODEL") or "sentence-transformers/all-mpnet-base-v2"
+            default_model = (
+                model
+                or _get_first_env_value("PAPERFLOW_EMBED_MODEL", "LOCAL_EMBEDDING_MODEL", "EMBEDDING_MODEL")
+                or "sentence-transformers/all-mpnet-base-v2"
+            )
             self.model_source = str(local_model_path) if local_model_path and local_model_path.exists() else default_model
             self.model = local_model_path.name if local_model_path and local_model_path.exists() else default_model
             if SENTENCE_TRANSFORMERS_AVAILABLE:

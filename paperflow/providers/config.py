@@ -80,12 +80,12 @@ def _normalize_llm_provider(raw: Optional[str]) -> str:
 def _normalize_embed_provider(raw: Optional[str]) -> str:
     value = (raw or "").strip().lower()
     if value in {"", "auto"}:
-        return "sentence_transformers"
+        return "hash"
     if value in {"openai", "ollama", "hash"}:
         return value
     if value in {"sentence_transformers", "sentence-transformers", "local", "st"}:
         return "sentence_transformers"
-    return "sentence_transformers"
+    return "hash"
 
 
 def _first_env(*names: str) -> str:

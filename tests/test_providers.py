@@ -47,9 +47,9 @@ def test_load_provider_config_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     config = load_provider_config()
     assert config.llm_provider == "openai"
     assert config.llm_model == "gpt-4o-mini"
-    assert config.embed_provider == "sentence_transformers"
-    assert config.embed_model == "BAAI/bge-m3"
-    assert config.embed_dimensions == 1024
+    assert config.embed_provider == "hash"
+    assert config.embed_model == "hash"
+    assert config.embed_dimensions == 768
 
 
 @pytest.mark.unit
@@ -67,7 +67,7 @@ def test_load_provider_config_unknown_falls_back(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setenv("PAPERFLOW_EMBED_PROVIDER", "made-up-backend")
     config = load_provider_config()
     assert config.llm_provider == "openai"
-    assert config.embed_provider == "sentence_transformers"
+    assert config.embed_provider == "hash"
 
 
 @pytest.mark.unit

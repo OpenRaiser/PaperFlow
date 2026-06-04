@@ -10,6 +10,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from paperflow import roles as role_utils
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
@@ -57,6 +59,8 @@ def _resolve_dir(
     env_name: str,
     *,
     fallback: Path,
+    user_id: str,
+    category: str = "",
 ) -> Path:
     raw = _clean_text(explicit) or os.environ.get(env_name, "").strip()
     if raw:
@@ -65,8 +69,19 @@ def _resolve_dir(
             path = PROJECT_ROOT / path
     else:
         path = fallback
+    path = role_utils.apply_output_scope(
+        path,
+        user_id,
+        category=category,
+        project_root=PROJECT_ROOT,
+    )
     path.mkdir(parents=True, exist_ok=True)
     return path.resolve()
+
+
+def _export_filename(prefix: str, user_id: str, month: str) -> str:
+    role_label = role_utils.storage_label_for_user_id(user_id, project_root=PROJECT_ROOT)
+    return f"{prefix} - {role_label} - {month}.md"
 
 
 def _parse_date(value: Any) -> Optional[datetime]:
@@ -326,12 +341,20 @@ def export_monthly_report(
     month_value = _parse_month(month)
     wiki_db.init_wiki_schema()
 
-    fallback_dir = Path(wiki_db.stats(user_id)["wiki_dir"]) / user_id / "monthly"
-    report_dir = _resolve_dir(output_dir, "PAPERFLOW_MONTHLY_REPORT_DIR", fallback=fallback_dir)
+    fallback_dir = Path(wiki_db.stats(user_id)["wiki_dir"]).parent / "exports"
+    report_dir = _resolve_dir(
+        output_dir,
+        "PAPERFLOW_MONTHLY_REPORT_DIR",
+        fallback=fallback_dir,
+        user_id=user_id,
+        category="monthly_reports",
+    )
     topic_dir = _resolve_dir(
         topic_index_dir,
         "PAPERFLOW_TOPIC_INDEX_DIR",
-        fallback=report_dir,
+        fallback=fallback_dir,
+        user_id=user_id,
+        category="topic_index",
     )
 
     papers = [
@@ -341,12 +364,12 @@ def export_monthly_report(
     ]
     rows = _paper_rows(papers, month_value)
 
-    report_path = report_dir / f"PaperFlow Monthly Report - {month_value}.md"
+    report_path = report_dir / _export_filename("PaperFlow Monthly Report", user_id, month_value)
     report_path.write_text(_render_monthly_report(user_id, month_value, rows), encoding="utf-8")
 
     topic_index_path: Optional[Path] = None
     if write_topic_index:
-        topic_index_path = topic_dir / f"Topic Index - {month_value}.md"
+        topic_index_path = topic_dir / _export_filename("Topic Index", user_id, month_value)
         topic_index_path.write_text(_render_topic_index(user_id, month_value, rows), encoding="utf-8")
 
     return {

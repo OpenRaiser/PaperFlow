@@ -6,13 +6,61 @@ guided walkthrough, see [quickstart.md](quickstart.md).
 
 ## Provider selection
 
+The canonical variables are the `PAPERFLOW_*` names. Some older internal
+scripts still accept legacy aliases such as `EMBEDDING_PROVIDER`, but new
+configuration examples should use `PAPERFLOW_LLM_PROVIDER` and
+`PAPERFLOW_EMBED_PROVIDER`.
+
+Configuration order:
+
+1. Copy `.env.example` to `.env`.
+2. Choose one provider recipe below.
+3. Run `paperflow doctor` and check the resolved provider line.
+4. Run `paperflow demo` only for install smoke tests; it intentionally forces
+   mock/hash providers and does not validate production API credentials.
+
+### Recommended recipes
+
+Production API setup:
+
+```env
+PAPERFLOW_LLM_PROVIDER=openai
+PAPERFLOW_LLM_MODEL=gpt-4o-mini
+PAPERFLOW_EMBED_PROVIDER=openai
+PAPERFLOW_EMBED_MODEL=text-embedding-3-small
+
+OPENAI_API_KEY=sk-...
+# OPENAI_BASE_URL=https://your-openai-compatible-gateway/v1
+```
+
+No-download smoke-test setup:
+
+```env
+PAPERFLOW_LLM_PROVIDER=mock
+PAPERFLOW_EMBED_PROVIDER=hash
+```
+
+Local semantic embedding setup:
+
+```env
+PAPERFLOW_EMBED_PROVIDER=sentence_transformers
+PAPERFLOW_EMBED_MODEL=BAAI/bge-m3
+PAPERFLOW_EMBED_DIMENSIONS=1024
+```
+
+`hash` is the default embedding provider because it avoids hidden downloads
+during first-run demos. It is deterministic but not semantic. Use `openai`,
+`ollama`, or `sentence_transformers` for real recommendation quality.
+`BAAI/bge-m3` is a high-quality local option, but downloads about 2.3GB on
+first use.
+
 The two knobs most users will touch:
 
 | Variable                    | Default                  | Allowed values                                              |
 |-----------------------------|--------------------------|-------------------------------------------------------------|
 | `PAPERFLOW_LLM_PROVIDER`    | `openai`                 | `openai` \| `anthropic` \| `ollama` \| `mock`               |
 | `PAPERFLOW_LLM_MODEL`       | per-provider default     | any model accepted by the chosen backend                    |
-| `PAPERFLOW_EMBED_PROVIDER`  | `sentence_transformers`  | `openai` \| `sentence_transformers` \| `ollama` \| `hash`   |
+| `PAPERFLOW_EMBED_PROVIDER`  | `hash`                   | `openai` \| `sentence_transformers` \| `ollama` \| `hash`   |
 | `PAPERFLOW_EMBED_MODEL`     | per-provider default     | any model accepted by the chosen backend                    |
 | `PAPERFLOW_EMBED_DIMENSIONS`| per-provider default     | integer; controls vector size after resize                  |
 
@@ -28,7 +76,9 @@ Per-provider defaults:
 
 If credentials for the configured provider are missing or look like
 placeholders (`your-...`, `xxxxx`, etc.), PaperFlow falls back to the
-deterministic mock/hash backend so the pipeline still runs end-to-end.
+deterministic mock/hash backend where possible so the pipeline still runs
+end-to-end. Treat that fallback as a development convenience, not as a signal
+that production providers are configured correctly.
 
 ## OpenAI-compatible API
 
@@ -78,60 +128,76 @@ Used when `PAPERFLOW_LLM_PROVIDER=ollama` or `PAPERFLOW_EMBED_PROVIDER=ollama`.
 | `LOG_LEVEL`                                | `INFO`                   | Python logging level                     |
 | `PAPERFLOW_SUPPRESS_HTTP_RETRY_WARNINGS`   | `true`                   | Hide noisy retry warnings                |
 | `PAPERFLOW_ALLOW_MOCK_PAPERS`              | `false`                  | Allow mock papers in real pipelines      |
-| `PAPERFLOW_PDF_DIR`                        | `./data/papers`          | Persistent PDF save directory            |
-| `PAPERFLOW_READING_REPORTS_DIR`            | `./data/reading_reports` | Persistent reading-report Markdown directory |
-| `PAPERFLOW_STORAGE_MONTHLY_SUBDIR`         | `false`                  | Append `arXiv - May 2026` style subfolders |
+| `PAPERFLOW_PDF_DIR`                        | `./data/exports`         | Upper-level export directory for PDFs    |
+| `PAPERFLOW_READING_REPORTS_DIR`            | `./data/exports`         | Upper-level export directory for reading-report Markdown |
+| `PAPERFLOW_STORAGE_ROLE_SUBDIR`            | `true`                   | Group exported local files by role name / user id |
+| `PAPERFLOW_STORAGE_CATEGORY_SUBDIR`        | `true`                   | Group exported local files by output category |
+| `PAPERFLOW_STORAGE_MONTHLY_SUBDIR`         | `true`                   | Append `arXiv - May 2026` style subfolders for PDFs and reading reports |
 | `PAPERFLOW_WRITE_FEISHU`                   | `false`                  | Let local GUI reading reports also create Feishu docs |
 | `PAPERFLOW_WIKI_INGEST`                    | `true`                   | Mirror runtime events into the local wiki |
 | `PAPERFLOW_WIKI_DIR`                       | `./data/wiki`            | Markdown mirror directory for wiki nodes |
-| `PAPERFLOW_MONTHLY_REPORT_DIR`             | `./data/wiki/monthly_reports` | Obsidian-friendly monthly report output directory |
-| `PAPERFLOW_TOPIC_INDEX_DIR`                | empty                    | Optional separate Topic Index output directory |
+| `PAPERFLOW_MONTHLY_REPORT_DIR`             | `./data/exports`         | Upper-level export directory for monthly reports |
+| `PAPERFLOW_TOPIC_INDEX_DIR`                | `./data/exports`         | Upper-level export directory for Topic Index files |
 
 ## Obsidian-style local storage
 
-Set the PDF and reading-report directories to any local folder. For example,
-both can point to the same monthly Obsidian folder:
-
-```env
-PAPERFLOW_PDF_DIR=/Users/mario/Documents/Obsidian Vault/Daily Note/Daily Note 2026/arXiv - May 2026
-PAPERFLOW_READING_REPORTS_DIR=/Users/mario/Documents/Obsidian Vault/Daily Note/Daily Note 2026/arXiv - May 2026
-```
-
-If you prefer to configure only the year-level root and let PaperFlow create
-month folders, enable:
+Set the four local export directories to the same upper-level folder when you
+want an Obsidian-style layout:
 
 ```env
 PAPERFLOW_PDF_DIR=/Users/mario/Documents/Obsidian Vault/Daily Note/Daily Note 2026
 PAPERFLOW_READING_REPORTS_DIR=/Users/mario/Documents/Obsidian Vault/Daily Note/Daily Note 2026
+PAPERFLOW_MONTHLY_REPORT_DIR=/Users/mario/Documents/Obsidian Vault/Daily Note/Daily Note 2026
+PAPERFLOW_TOPIC_INDEX_DIR=/Users/mario/Documents/Obsidian Vault/Daily Note/Daily Note 2026
+PAPERFLOW_STORAGE_ROLE_SUBDIR=true
+PAPERFLOW_STORAGE_CATEGORY_SUBDIR=true
 PAPERFLOW_STORAGE_MONTHLY_SUBDIR=true
 ```
 
-With monthly subfolders enabled, PaperFlow writes files under names like
-`arXiv - May 2026`, based on the paper publish date when available.
+If `data/roles.json` maps `role1` to `user_role1`, then `--user-id user_role1`
+writes to:
 
-To export an Obsidian-friendly monthly reading summary and topic index into a
-Daily Note folder, set:
+- `Daily Note 2026/role1/pdf/arXiv - May 2026/`
+- `Daily Note 2026/role1/reading_reports/arXiv - May 2026/`
+- `Daily Note 2026/role1/monthly_reports/PaperFlow Monthly Report - role1 - 2026-05.md`
+- `Daily Note 2026/role1/topic_index/Topic Index - role1 - 2026-05.md`
+
+If no role name exists, PaperFlow falls back to the raw `user_id`. Set
+`PAPERFLOW_STORAGE_ROLE_SUBDIR=false` only if you intentionally want no role
+directory. Set `PAPERFLOW_STORAGE_CATEGORY_SUBDIR=false` only if you
+intentionally want files directly under the role directory.
+
+If you do not want PDF and reading-report files grouped by paper month, disable:
 
 ```env
-PAPERFLOW_MONTHLY_REPORT_DIR=/Users/mario/Documents/Obsidian Vault/Daily Note/Daily Note 2026
-PAPERFLOW_TOPIC_INDEX_DIR=/Users/mario/Documents/Obsidian Vault/Daily Note/Daily Note 2026/topic index
+PAPERFLOW_STORAGE_MONTHLY_SUBDIR=false
 ```
 
-Then run:
+With monthly subfolders enabled, PDF and reading-report folders use the paper
+publish month when available, falling back to the current month. Monthly report
+and Topic Index files are not placed in an extra month folder because their
+filenames already include `YYYY-MM`.
+
+To export an Obsidian-friendly monthly reading summary and topic index for the
+current calendar month, run:
 
 ```bash
-paperflow wiki monthly --user-id user_alice --month 2026-05
+paperflow wiki monthly --user-id user_alice
 ```
 
-This writes `PaperFlow Monthly Report - 2026-05.md` and `Topic Index -
-2026-05.md`. You can override the configured directories for one run:
+This writes role-scoped files such as
+`role1/monthly_reports/PaperFlow Monthly Report - role1 - 2026-05.md` and
+`role1/topic_index/Topic Index - role1 - 2026-05.md`, with the `YYYY-MM`
+portion chosen from the export month. Pass `--month YYYY-MM` only when you
+intentionally want to regenerate a historical month. You can override the
+configured upper-level directories for one run:
 
 ```bash
 paperflow wiki monthly \
   --user-id user_alice \
   --month 2026-05 \
   --output-dir "/Users/mario/Documents/Obsidian Vault/Daily Note/Daily Note 2026" \
-  --topic-index-dir "/Users/mario/Documents/Obsidian Vault/Daily Note/Daily Note 2026/topic index"
+  --topic-index-dir "/Users/mario/Documents/Obsidian Vault/Daily Note/Daily Note 2026"
 ```
 
 The GUI uses the same variables. In the GUI, the arXiv/PDF fields are input

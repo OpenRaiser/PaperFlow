@@ -72,6 +72,7 @@ get_recent_created_report_by_source = getattr(
 profile_updater = importlib.import_module("skills.profile-updater.scripts.update_profile")
 ensure_profile_schema = profile_updater.ensure_profile_schema
 update_profile_with_reading_signal = profile_updater.update_profile_with_reading_signal
+role_utils = importlib.import_module("paperflow.roles")
 try:
     wiki_reading_ingest = importlib.import_module("agents.wiki-agent.ingest.from_reading_report")
 except Exception:
@@ -120,12 +121,25 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return raw.strip().lower() not in {"0", "false", "off", "no", ""}
 
 
-def _resolve_configured_dir(env_name: str, default_relative: str, paper: Optional[Dict[str, Any]] = None) -> Path:
+def _resolve_configured_dir(
+    env_name: str,
+    default_relative: str,
+    paper: Optional[Dict[str, Any]] = None,
+    user_id: Optional[str] = None,
+    category: str = "",
+) -> Path:
     configured = os.environ.get(env_name, "").strip()
     base_dir = Path(configured).expanduser() if configured else PROJECT_ROOT / default_relative
     if not base_dir.is_absolute():
         base_dir = PROJECT_ROOT / base_dir
-    if _env_flag("PAPERFLOW_STORAGE_MONTHLY_SUBDIR", default=False):
+    if user_id:
+        base_dir = role_utils.apply_output_scope(
+            base_dir,
+            user_id,
+            category=category,
+            project_root=PROJECT_ROOT,
+        )
+    if _env_flag("PAPERFLOW_STORAGE_MONTHLY_SUBDIR", default=True):
         base_dir = base_dir / _month_folder_name(paper or {})
     base_dir.mkdir(parents=True, exist_ok=True)
     return base_dir.resolve()
@@ -1718,11 +1732,22 @@ def _download_pdf(pdf_url: str, title: str, referer: Optional[str] = None) -> st
         return temp_file.name
 
 
-def _persist_pdf_file(source_pdf_path: str, paper: Dict[str, Any], pdf_url: str = "") -> Optional[str]:
+def _persist_pdf_file(
+    source_pdf_path: str,
+    paper: Dict[str, Any],
+    pdf_url: str = "",
+    user_id: Optional[str] = None,
+) -> Optional[str]:
     source_path = Path(source_pdf_path).expanduser()
     if not source_path.exists():
         return None
-    target_dir = _resolve_configured_dir("PAPERFLOW_PDF_DIR", "data/papers", paper)
+    target_dir = _resolve_configured_dir(
+        "PAPERFLOW_PDF_DIR",
+        "data/exports",
+        paper,
+        user_id=user_id,
+        category="pdf",
+    )
     target_path = target_dir / f"{_paper_file_stem(paper)}.pdf"
     if source_path.resolve() != target_path.resolve():
         target_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1740,7 +1765,13 @@ def _save_reading_report_markdown(
     doc_url: Optional[str] = None,
     doc_token: Optional[str] = None,
 ) -> str:
-    target_dir = _resolve_configured_dir("PAPERFLOW_READING_REPORTS_DIR", "data/reading_reports", paper)
+    target_dir = _resolve_configured_dir(
+        "PAPERFLOW_READING_REPORTS_DIR",
+        "data/exports",
+        paper,
+        user_id=user_id,
+        category="reading_reports",
+    )
     report_path = target_dir / f"{_paper_file_stem(paper)} - reading-report.md"
     metadata = {
         "user_id": user_id,
@@ -1780,7 +1811,10 @@ def _parse_pdf_for_report(pdf_path: str) -> Dict[str, Any]:
     }
 
 
-def enrich_paper_for_reading_report(paper: Dict[str, Any]) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]], Optional[str]]:
+def enrich_paper_for_reading_report(
+    paper: Dict[str, Any],
+    user_id: Optional[str] = None,
+) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]], Optional[str]]:
     """
     Enrich paper data for reading report generation.
 
@@ -1806,7 +1840,12 @@ def enrich_paper_for_reading_report(paper: Dict[str, Any]) -> Tuple[Dict[str, An
             print(f"  Parsing local PDF: {local_pdf_path}")
             parsed_pdf = _parse_pdf_for_report(local_pdf_path)
             parsed_pdf["source_kind"] = "pdf"
-            stored_pdf_path = _persist_pdf_file(local_pdf_path, enriched, _clean_text(enriched.get("pdf_url")))
+            stored_pdf_path = _persist_pdf_file(
+                local_pdf_path,
+                enriched,
+                _clean_text(enriched.get("pdf_url")),
+                user_id=user_id,
+            )
             if stored_pdf_path:
                 enriched["pdf_path"] = stored_pdf_path
             print("  Local PDF parsed successfully")
@@ -1869,7 +1908,12 @@ def enrich_paper_for_reading_report(paper: Dict[str, Any]) -> Tuple[Dict[str, An
                     parsed_pdf = _parse_pdf_for_report(temp_pdf_path)
                     parsed_pdf["source_kind"] = "pdf"
                     enriched["pdf_url"] = download_candidate
-                    stored_pdf_path = _persist_pdf_file(temp_pdf_path, enriched, download_candidate)
+                    stored_pdf_path = _persist_pdf_file(
+                        temp_pdf_path,
+                        enriched,
+                        download_candidate,
+                        user_id=user_id,
+                    )
                     if stored_pdf_path:
                         enriched["pdf_path"] = stored_pdf_path
                     pdf_error = None
@@ -3477,7 +3521,7 @@ def create_reading_report(
         )
 
         try:
-            enriched_paper, parsed_pdf, pdf_error = enrich_paper_for_reading_report(raw_paper)
+            enriched_paper, parsed_pdf, pdf_error = enrich_paper_for_reading_report(raw_paper, user_id=user_id)
             heuristic_payload = build_heuristic_report_payload(
                 enriched_paper,
                 profile,

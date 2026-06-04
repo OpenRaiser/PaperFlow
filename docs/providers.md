@@ -21,8 +21,12 @@ knobs:
 
 ```env
 PAPERFLOW_LLM_PROVIDER=openai
-PAPERFLOW_EMBED_PROVIDER=sentence_transformers
+PAPERFLOW_EMBED_PROVIDER=hash
 ```
+
+`PAPERFLOW_*` variables are the canonical names for public configuration.
+Legacy aliases such as `EMBEDDING_PROVIDER` remain accepted by older agent
+paths, but new `.env` files should use `PAPERFLOW_*` consistently.
 
 Each backend reads its own credentials. See
 [configuration.md](configuration.md) for the full table.
@@ -33,6 +37,18 @@ Quick check:
 paperflow doctor          # prints the resolved provider config
 paperflow demo            # exercises both providers with deterministic input
 ```
+
+Provider choice should follow the intended run mode:
+
+| Run mode | LLM provider | Embedding provider | Notes |
+| --- | --- | --- | --- |
+| Install / GUI preview | `mock` | `hash` | No API calls and no model downloads |
+| Normal API usage | `openai` or `anthropic` | `openai` | Recommended first production setup |
+| Fully local usage | `ollama` | `ollama` or `sentence_transformers` | Requires local services or model weights |
+| High-quality local embedding | any | `sentence_transformers` | `BAAI/bge-m3` downloads about 2.3GB first time |
+
+`hash` is intentionally the no-download default. It keeps setup predictable,
+but it is not a semantic embedding model.
 
 ## LLM backends
 
@@ -88,17 +104,18 @@ pipeline executes end-to-end.
 
 ## Embedding backends
 
-### sentence-transformers (`PAPERFLOW_EMBED_PROVIDER=sentence_transformers`)
+### Hash (`PAPERFLOW_EMBED_PROVIDER=hash`)
 
 ```env
-PAPERFLOW_EMBED_PROVIDER=sentence_transformers
-PAPERFLOW_EMBED_MODEL=BAAI/bge-m3                 # default
-PAPERFLOW_EMBED_DIMENSIONS=1024
+PAPERFLOW_EMBED_PROVIDER=hash
+PAPERFLOW_EMBED_DIMENSIONS=768
 ```
 
-Default for new installs. Multilingual, runs locally, no API key needed.
-Models from the Qwen and BAAI families are loaded with
-`trust_remote_code=True` so custom model classes work.
+Default for first-run demos and offline reproduction. It is a deterministic
+SHA256-derived bit-pattern, unit-normalized to the configured dimension. It
+does not download model weights and does not require credentials. It is not
+semantically meaningful, so use OpenAI/Ollama/sentence-transformers for real
+ranking quality.
 
 ### OpenAI (`PAPERFLOW_EMBED_PROVIDER=openai`)
 
@@ -121,11 +138,19 @@ PAPERFLOW_EMBED_DIMENSIONS=768
 OLLAMA_BASE_URL=http://localhost:11434
 ```
 
-### Hash (`PAPERFLOW_EMBED_PROVIDER=hash`)
+### sentence-transformers (`PAPERFLOW_EMBED_PROVIDER=sentence_transformers`)
 
-Deterministic SHA256-derived bit-pattern, unit-normalized to the configured
-dimension. Used for tests and offline reproduction. Not semantically
-meaningful — vectors are stable across runs but encode no real similarity.
+```env
+PAPERFLOW_EMBED_PROVIDER=sentence_transformers
+PAPERFLOW_EMBED_MODEL=BAAI/bge-m3                 # high-quality local option
+PAPERFLOW_EMBED_DIMENSIONS=1024
+```
+
+Multilingual, runs locally, and needs no embedding API key. This mode downloads
+model weights the first time it is used. `BAAI/bge-m3` is about 2.3GB, so it is
+better suited to stable local workstations than quick demos. Models from the
+Qwen and BAAI families are loaded with `trust_remote_code=True` so custom model
+classes work.
 
 ## Vector resizing
 
@@ -151,7 +176,7 @@ from paperflow.providers import (
 
 config = load_provider_config()
 print(config.describe())
-# llm=openai:gpt-4o-mini embed=sentence_transformers:BAAI/bge-m3(1024)
+# llm=openai:gpt-4o-mini embed=hash:hash(768)
 
 llm = build_llm_provider(config)
 embed = build_embedding_provider(config)

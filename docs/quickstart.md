@@ -39,11 +39,18 @@ needed, no network calls. If this works, the install is good.
 cp .env.example .env
 ```
 
-The minimum useful configuration:
+Pick one configuration path.
+
+### Production API path
+
+Use an OpenAI-compatible gateway for both the LLM and embeddings:
 
 ```env
 PAPERFLOW_LLM_PROVIDER=openai
-PAPERFLOW_EMBED_PROVIDER=sentence_transformers
+PAPERFLOW_LLM_MODEL=gpt-4o-mini
+
+PAPERFLOW_EMBED_PROVIDER=openai
+PAPERFLOW_EMBED_MODEL=text-embedding-3-small
 
 OPENAI_API_KEY=sk-...
 # OPENAI_BASE_URL=https://your-openai-compatible-gateway/v1
@@ -53,8 +60,30 @@ Any OpenAI-compatible gateway works (DashScope, Azure OpenAI, vLLM, etc.) by
 setting `OPENAI_BASE_URL`. See [configuration.md](configuration.md) for the
 full reference.
 
-If a credential is missing, providers transparently fall back to mock/hash so
-the pipeline still runs end-to-end.
+### No-download smoke-test path
+
+Use this for install checks and GUI previews:
+
+```env
+PAPERFLOW_LLM_PROVIDER=mock
+PAPERFLOW_EMBED_PROVIDER=hash
+```
+
+This avoids credentials, API calls, and local model downloads. It is not a
+semantic embedding setup, so do not use it to judge recommendation quality.
+
+### Local embedding path
+
+If you want local semantic embeddings and the machine can cache model weights:
+
+```env
+PAPERFLOW_EMBED_PROVIDER=sentence_transformers
+PAPERFLOW_EMBED_MODEL=BAAI/bge-m3
+PAPERFLOW_EMBED_DIMENSIONS=1024
+```
+
+`BAAI/bge-m3` downloads about 2.3GB on first use. Choose this deliberately; it
+should not be the first-run classroom/demo configuration.
 
 ## 4. Verify the environment
 
@@ -77,8 +106,7 @@ This creates:
 data/
 data/paperflow.db
 data/embeddings_cache/
-data/papers/
-data/reading_reports/
+data/exports/
 data/wiki/
 models/
 ```
@@ -169,21 +197,39 @@ paperflow wiki search "literature mining" --user-id user_alice
 paperflow wiki ask "What have I read about literature mining?" --user-id user_alice
 ```
 
-To save PDFs and reading-report Markdown directly into an Obsidian monthly
-folder, set:
+To save PDFs, reading-report Markdown, monthly reports, and Topic Index files
+directly into an Obsidian vault, point all four export variables at the same
+upper-level folder:
 
 ```env
-PAPERFLOW_PDF_DIR=/Users/mario/Documents/Obsidian Vault/Daily Note/Daily Note 2026/arXiv - May 2026
-PAPERFLOW_READING_REPORTS_DIR=/Users/mario/Documents/Obsidian Vault/Daily Note/Daily Note 2026/arXiv - May 2026
+PAPERFLOW_PDF_DIR=/Users/mario/Documents/Obsidian Vault/Daily Note/Daily Note 2026
+PAPERFLOW_READING_REPORTS_DIR=/Users/mario/Documents/Obsidian Vault/Daily Note/Daily Note 2026
 PAPERFLOW_MONTHLY_REPORT_DIR=/Users/mario/Documents/Obsidian Vault/Daily Note/Daily Note 2026
-PAPERFLOW_TOPIC_INDEX_DIR=/Users/mario/Documents/Obsidian Vault/Daily Note/Daily Note 2026/topic index
+PAPERFLOW_TOPIC_INDEX_DIR=/Users/mario/Documents/Obsidian Vault/Daily Note/Daily Note 2026
+PAPERFLOW_STORAGE_ROLE_SUBDIR=true
+PAPERFLOW_STORAGE_CATEGORY_SUBDIR=true
+PAPERFLOW_STORAGE_MONTHLY_SUBDIR=true
 ```
+
+Local exports are role-scoped by default. If `data/roles.json` maps `role1` to
+`user_role1`, then `--user-id user_role1` writes under
+`role1/pdf/arXiv - May 2026/`, `role1/reading_reports/arXiv - May 2026/`,
+`role1/monthly_reports/`, and `role1/topic_index/`. Monthly report and Topic
+Index filenames also include the target month, for example
+`Topic Index - role1 - 2026-05.md`. If no role name exists, PaperFlow falls
+back to the raw `user_id`.
+Set `PAPERFLOW_STORAGE_ROLE_SUBDIR=false` or
+`PAPERFLOW_STORAGE_CATEGORY_SUBDIR=false` only if you intentionally want a
+flatter layout.
 
 Generate the Obsidian monthly summary and Topic Index from local wiki data:
 
 ```bash
-paperflow wiki monthly --user-id user_alice --month 2026-05
+paperflow wiki monthly --user-id user_alice
 ```
+
+Without `--month`, PaperFlow exports the current calendar month. Pass
+`--month 2026-05` only to regenerate a historical month.
 
 For the local GUI, keep `PAPERFLOW_WRITE_FEISHU=false` unless you explicitly
 want reading reports to also create Feishu docs.

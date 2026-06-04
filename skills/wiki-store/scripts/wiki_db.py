@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 import numpy as np
+from paperflow import roles as role_utils
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -54,9 +55,15 @@ def _json_loads(value: Any) -> Dict[str, Any]:
 
 
 def _slug(value: str, *, max_len: int = 96) -> str:
-    text = re.sub(r"[^\w.\-]+", "-", str(value or "").strip(), flags=re.UNICODE)
-    text = re.sub(r"-{2,}", "-", text).strip("-._")
-    return (text or "node")[:max_len]
+    return role_utils.slug(value, max_len=max_len)
+
+
+def role_name_for_user_id(user_id: str) -> str:
+    return role_utils.role_name_for_user_id(user_id, project_root=PROJECT_ROOT)
+
+
+def storage_label_for_user_id(user_id: str) -> str:
+    return role_utils.storage_label_for_user_id(user_id, project_root=PROJECT_ROOT)
 
 
 def _node_folder(node_type: str) -> str:
@@ -69,7 +76,7 @@ def _node_folder(node_type: str) -> str:
 
 
 def _relative_file_path(user_id: str, node_type: str, node_id: str) -> str:
-    return str(Path(_slug(user_id)) / _node_folder(node_type) / f"{_slug(node_id)}.md")
+    return (Path(storage_label_for_user_id(user_id)) / _node_folder(node_type) / f"{_slug(node_id)}.md").as_posix()
 
 
 def _row_to_node(row: sqlite3.Row) -> Dict[str, Any]:

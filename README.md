@@ -96,9 +96,9 @@ git clone https://github.com/OpenRaiser/PaperFlow.git
 cd PaperFlow
 pip install -e ".[all]"          # full install (or `pip install -e .` for the minimal CLI)
 
-# 2. Configure providers (OpenAI / Anthropic / Ollama / Dashscope ... see below)
+# 2. Configure providers (start with no-download settings; see below)
 cp .env.example .env
-# edit .env to set PAPERFLOW_LLM_PROVIDER + the matching API key
+# edit .env to set PAPERFLOW_LLM_PROVIDER and, for production, an embedding backend
 
 # 3. Initialize runtime + create your user profile (REQUIRED)
 paperflow init
@@ -142,31 +142,68 @@ Copy the environment template:
 cp .env.example .env
 ```
 
-Minimum useful configuration:
+Use the `PAPERFLOW_*` variables as the canonical configuration surface. A
+fresh install defaults to no-download embeddings so `paperflow demo` and setup
+checks are quick, but real recommendation quality needs a semantic embedding
+backend.
+
+### Option A: recommended production setup
+
+Use one OpenAI-compatible gateway for both generation and embeddings:
 
 ```env
 PAPERFLOW_LLM_PROVIDER=openai
 PAPERFLOW_LLM_MODEL=gpt-4o-mini
 
-PAPERFLOW_EMBED_PROVIDER=sentence_transformers
-PAPERFLOW_EMBED_MODEL=BAAI/bge-m3
+PAPERFLOW_EMBED_PROVIDER=openai
+PAPERFLOW_EMBED_MODEL=text-embedding-3-small
 
 OPENAI_API_KEY=sk-...
 # OPENAI_BASE_URL=https://your-openai-compatible-gateway/v1
 ```
 
-OpenAI-compatible gateways are supported through `OPENAI_BASE_URL`. If provider
-credentials are missing, PaperFlow falls back to mock/hash providers where
-possible so local workflows remain testable.
+OpenAI-compatible gateways are supported through `OPENAI_BASE_URL`, including
+OpenAI, DashScope, Azure OpenAI, vLLM, and similar services. If credentials are
+missing or still look like placeholders, PaperFlow falls back to mock/hash
+providers where possible so local workflows remain testable.
 
-Initialize runtime files:
+### Option B: no-download smoke test
+
+Use this for install checks, GUI demos, or classrooms where downloading model
+weights is not acceptable:
+
+```env
+PAPERFLOW_LLM_PROVIDER=mock
+PAPERFLOW_EMBED_PROVIDER=hash
+```
+
+This mode is deterministic and fast, but the hash vectors do not encode real
+semantic similarity. It is not the recommended setting for evaluating
+recommendation quality.
+
+### Option C: high-quality local embeddings
+
+Use this only when the machine is allowed to download and cache local model
+weights:
+
+```env
+PAPERFLOW_EMBED_PROVIDER=sentence_transformers
+PAPERFLOW_EMBED_MODEL=BAAI/bge-m3
+PAPERFLOW_EMBED_DIMENSIONS=1024
+```
+
+This local mode needs no embedding API key, but the first run downloads the
+model weights. `BAAI/bge-m3` is about 2.3GB, so do not use it for quick
+classroom demos or first-run installation checks.
+
+After changing providers, run:
 
 ```bash
-paperflow init
 paperflow doctor
 ```
 
-Runtime data is stored under `data/` and is ignored by Git.
+`paperflow doctor` prints the resolved provider configuration. Runtime data is
+stored under `data/` and is ignored by Git.
 
 ## Initialize a User Profile
 
@@ -291,20 +328,39 @@ paperflow wiki search "graph rag" --user-id user_role1
 paperflow wiki ask "What have I read about graph RAG?" --user-id user_role1
 ```
 
-PDFs and reading-report Markdown can be saved directly into an Obsidian vault:
+PDFs, reading-report Markdown, monthly reports, and Topic Index files can be
+saved directly into an Obsidian vault. Point all four export variables at the
+same upper-level folder:
 
 ```env
-PAPERFLOW_PDF_DIR=/Users/mario/Documents/Obsidian Vault/Daily Note/Daily Note 2026/arXiv - May 2026
-PAPERFLOW_READING_REPORTS_DIR=/Users/mario/Documents/Obsidian Vault/Daily Note/Daily Note 2026/arXiv - May 2026
+PAPERFLOW_PDF_DIR=/Users/mario/Documents/Obsidian Vault/Daily Note/Daily Note 2026
+PAPERFLOW_READING_REPORTS_DIR=/Users/mario/Documents/Obsidian Vault/Daily Note/Daily Note 2026
 PAPERFLOW_MONTHLY_REPORT_DIR=/Users/mario/Documents/Obsidian Vault/Daily Note/Daily Note 2026
-PAPERFLOW_TOPIC_INDEX_DIR=/Users/mario/Documents/Obsidian Vault/Daily Note/Daily Note 2026/topic index
+PAPERFLOW_TOPIC_INDEX_DIR=/Users/mario/Documents/Obsidian Vault/Daily Note/Daily Note 2026
+PAPERFLOW_STORAGE_ROLE_SUBDIR=true
+PAPERFLOW_STORAGE_CATEGORY_SUBDIR=true
+PAPERFLOW_STORAGE_MONTHLY_SUBDIR=true
 ```
+
+Local exports are role-scoped by default. If `data/roles.json` maps `role1` to
+`user_role1`, then `--user-id user_role1` writes these folders:
+`role1/pdf/arXiv - May 2026/`, `role1/reading_reports/arXiv - May 2026/`,
+`role1/monthly_reports/`, and `role1/topic_index/`. Monthly report and Topic
+Index filenames also include the target month, for example
+`PaperFlow Monthly Report - role1 - 2026-05.md`.
+Set `PAPERFLOW_STORAGE_ROLE_SUBDIR=false` or
+`PAPERFLOW_STORAGE_CATEGORY_SUBDIR=false` only if you want a flatter legacy
+layout.
 
 Export a monthly reading summary and Topic Index for Obsidian:
 
 ```bash
-paperflow wiki monthly --user-id user_role1 --month 2026-05
+paperflow wiki monthly --user-id user_role1
 ```
+
+Without `--month`, PaperFlow exports the current calendar month. Use
+`--month 2026-05` only when you intentionally want to regenerate an older
+month.
 
 Feishu/Lark document export is optional and separate from the GUI and CLI core.
 Configuration is in [docs/feishu-doc-export.md](docs/feishu-doc-export.md).
