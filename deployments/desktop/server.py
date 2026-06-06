@@ -127,6 +127,20 @@ def _api_activity(query_params: Dict[str, Any], _body: Dict[str, Any]) -> Dict[s
     )
 
 
+def _api_reports(query_params: Dict[str, Any], _body: Dict[str, Any]) -> Dict[str, Any]:
+    return agents.list_reports(
+        user_id=str(query_params.get("user_id") or "").strip(),
+        query=str(query_params.get("q") or ""),
+        days=int(query_params.get("days") or 30),
+        limit=int(query_params.get("limit") or 80),
+        exact_date=str(query_params.get("date") or "").strip(),
+    )
+
+
+def _api_report_content(query_params: Dict[str, Any], _body: Dict[str, Any]) -> Dict[str, Any]:
+    return agents.get_report_content(str(query_params.get("report_id") or "").strip())
+
+
 def _api_must_read(query_params: Dict[str, Any], _body: Dict[str, Any]) -> Dict[str, Any]:
     return agents.list_must_read(_required_user(query_params))
 
@@ -278,6 +292,8 @@ GET_ROUTES: Dict[str, ApiHandler] = {
     "/api/wiki/stats": _api_wiki_stats,
     "/api/wiki/search": _api_wiki_search,
     "/api/activity": _api_activity,
+    "/api/reports": _api_reports,
+    "/api/reports/content": _api_report_content,
     "/api/must-read": _api_must_read,
 }
 

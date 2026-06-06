@@ -6,6 +6,7 @@
     <title>PaperFlow 本地工作台</title>
     <link rel="icon" href="favicon.svg" type="image/svg+xml">
     <link rel="stylesheet" href="styles.css">
+    <link rel="stylesheet" href="reports.css">
   </head>
   <body>
     <div class="shell">
@@ -28,6 +29,7 @@
           <button class="nav-item active" data-view="dashboard">仪表盘</button>
           <button class="nav-item" data-view="push">每日推送</button>
           <button class="nav-item" data-view="reading">精读论文</button>
+          <button class="nav-item" data-view="reports">报告阅读</button>
           <button class="nav-item" data-view="wiki">本地知识库</button>
           <button class="nav-item" data-view="mustread">必读规则</button>
           <button class="nav-item" data-view="roles">角色管理</button>
@@ -244,6 +246,61 @@
           </div>
         </section>
 
+        <section id="reports" class="view">
+          <div class="panel">
+            <div class="panel-head">
+              <div>
+                <h3>报告阅读</h3>
+                <p>在 GUI 中浏览和阅读本地 Markdown 精读报告。</p>
+              </div>
+              <div class="actions">
+                <select id="reportDays" title="时间范围">
+                  <option value="7">最近 7 天</option>
+                  <option value="30" selected>最近 30 天</option>
+                  <option value="90">最近 90 天</option>
+                  <option value="365">全部</option>
+                </select>
+                <button id="reportTodayBtn" type="button">今天</button>
+                <button id="refreshReportsBtn" type="button">刷新</button>
+              </div>
+            </div>
+
+            <div class="reports-toolbar">
+              <input id="reportQuery" placeholder="搜索标题、arXiv ID 或路径">
+              <input id="reportDate" type="date" aria-label="精确日期筛选">
+              <label class="checkline subtle-check">
+                <input id="reportsCurrentOnly" type="checkbox" checked>
+                仅看当前用户
+              </label>
+            </div>
+
+            <div id="reportSources" class="meta-line">报告目录尚未加载。</div>
+
+            <div class="reports-layout">
+              <div id="reportsList" class="result-list empty">尚未加载报告列表。</div>
+
+              <div class="report-viewer">
+                <div class="report-viewer-head">
+                  <div>
+                    <h3 id="reportViewerTitle">选择一篇报告</h3>
+                    <p id="reportViewerMeta" class="meta-line">从左侧列表打开一篇报告后，这里显示正文内容。</p>
+                  </div>
+                  <div class="actions">
+                    <button id="openReportAbsBtn" type="button" disabled>原文</button>
+                    <button id="openReportPdfBtn" type="button" disabled>PDF</button>
+                    <button id="openReportDocBtn" type="button" disabled>飞书</button>
+                    <button id="copyReportPathBtn" type="button" disabled>复制路径</button>
+                  </div>
+                </div>
+
+                <div class="report-viewer-layout">
+                  <article id="reportViewerBody" class="markdown-body empty">尚未选择报告。</article>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+
         <section id="wiki" class="view">
           <div class="panel">
             <div class="panel-head">
@@ -455,5 +512,6 @@
     </div>
 
     <script src="app.js"></script>
+    <script src="reports.js"></script>
   </body>
 </html>

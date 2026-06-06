@@ -67,6 +67,11 @@ output.txt
 test_push.txt
 test_push_output.txt
 webhook.log
+tmp_edge_profile*/
+tmp_edge_stdout_*.log
+tmp_edge_stderr_*.log
+tmp_reports_*.png
+tmp_reports_automation*.log
 
 # Runtime data
 data/*

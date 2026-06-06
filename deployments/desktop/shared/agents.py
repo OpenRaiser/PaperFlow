@@ -8,6 +8,7 @@ server and future GUI stacks do not need to know about those details.
 from __future__ import annotations
 
 import importlib
+import hashlib
 import json
 import os
 import re
@@ -17,8 +18,10 @@ from copy import deepcopy
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Set
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 from uuid import uuid4
+
+import yaml
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -315,6 +318,145 @@ def _configured_path(env_name: str, default_relative: str) -> str:
             path = PROJECT_ROOT / path
         return str(path)
     return str(PROJECT_ROOT / default_relative)
+
+
+def _display_path(path: Path) -> str:
+    resolved = path.resolve()
+    try:
+        return str(resolved.relative_to(PROJECT_ROOT.resolve())).replace("\\", "/")
+    except ValueError:
+        return str(resolved)
+
+
+def _reading_report_dirs() -> List[Path]:
+    configured = Path(_configured_path("PAPERFLOW_READING_REPORTS_DIR", "data/exports")).resolve()
+    fallback = (PROJECT_ROOT / "data" / "reading_reports").resolve()
+    ordered = [configured, fallback]
+    results: List[Path] = []
+    seen: Set[str] = set()
+    for candidate in ordered:
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        if candidate.exists() and candidate.is_dir():
+            results.append(candidate)
+    if not results:
+        results.append(configured)
+    return results
+
+
+def _report_id(path: Path) -> str:
+    return hashlib.sha1(str(path.resolve()).encode("utf-8")).hexdigest()[:20]
+
+
+def _extract_frontmatter(raw: str) -> Tuple[Dict[str, Any], str]:
+    if not raw.startswith("---"):
+        return {}, raw
+    lines = raw.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return {}, raw
+    end_index = None
+    for index in range(1, len(lines)):
+        if lines[index].strip() == "---":
+            end_index = index
+            break
+    if end_index is None:
+        return {}, raw
+    frontmatter_text = "\n".join(lines[1:end_index]).strip()
+    body = "\n".join(lines[end_index + 1 :]).lstrip()
+    if not frontmatter_text:
+        return {}, body
+    try:
+        parsed = yaml.safe_load(frontmatter_text) or {}
+    except yaml.YAMLError:
+        parsed = {}
+    return parsed if isinstance(parsed, dict) else {}, body
+
+
+def _report_title(body: str, path: Path) -> str:
+    for line in body.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            return stripped.lstrip("#").strip() or path.stem
+    return path.stem
+
+
+def _first_matching_url(text: str, needle: str) -> str:
+    pattern = re.compile(r"https?://[^\s)>\]]+", flags=re.IGNORECASE)
+    for match in pattern.findall(text or ""):
+        if needle.lower() in match.lower():
+            return match.rstrip(".,")
+    return ""
+
+
+def _report_snippet(body: str) -> str:
+    for raw_line in body.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("#"):
+            continue
+        line = re.sub(r"^>+\s*", "", line)
+        line = re.sub(r"^[-*]\s+", "", line)
+        line = re.sub(r"`([^`]*)`", r"\1", line)
+        if not line:
+            continue
+        return line[:240]
+    return ""
+
+
+def _report_record(path: Path) -> Dict[str, Any]:
+    raw = path.read_text(encoding="utf-8", errors="replace")
+    metadata, body = _extract_frontmatter(raw)
+    stat = path.stat()
+    title = str(metadata.get("title") or _report_title(body, path))
+    saved_at = str(
+        metadata.get("saved_at")
+        or metadata.get("updated_at")
+        or datetime.fromtimestamp(stat.st_mtime).replace(microsecond=0).isoformat()
+    )
+    updated_at = datetime.fromtimestamp(stat.st_mtime).replace(microsecond=0).isoformat()
+    doc_url = str(metadata.get("doc_url") or "")
+    pdf_url = str(metadata.get("pdf_url") or _first_matching_url(body, "/pdf/"))
+    abs_url = str(metadata.get("abs_url") or _first_matching_url(body, "/abs/"))
+    return {
+        "report_id": _report_id(path),
+        "title": title,
+        "user_id": str(metadata.get("user_id") or "").strip(),
+        "paper_id": metadata.get("paper_id"),
+        "arxiv_id": str(metadata.get("arxiv_id") or "").strip(),
+        "saved_at": saved_at,
+        "updated_at": updated_at,
+        "report_path": _display_path(path),
+        "doc_url": doc_url,
+        "doc_token": str(metadata.get("doc_token") or "").strip(),
+        "pdf_url": pdf_url,
+        "abs_url": abs_url,
+        "report_version": str(metadata.get("report_version") or "").strip(),
+        "generation_provider": str(metadata.get("generation_provider") or "").strip(),
+        "generation_model": str(metadata.get("generation_model") or "").strip(),
+        "snippet": _report_snippet(body),
+        "metadata": metadata,
+        "markdown": body,
+        "_sort_ts": stat.st_mtime,
+    }
+
+
+def _all_report_records() -> List[Dict[str, Any]]:
+    reports: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+    for root in _reading_report_dirs():
+        for path in root.rglob("*.md"):
+            if not path.is_file():
+                continue
+            resolved_key = str(path.resolve())
+            if resolved_key in seen:
+                continue
+            seen.add(resolved_key)
+            reports.append(_report_record(path))
+    reports.sort(key=lambda item: item["_sort_ts"], reverse=True)
+    return reports
 
 
 def _safe_env() -> Dict[str, str]:
@@ -1193,6 +1335,15 @@ def _doc_payloads(docs: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "url": doc.get("url"),
             "doc_token": doc.get("doc_token"),
             "report_path": doc.get("report_path"),
+            "report_id": (
+                _report_id(
+                    Path(doc["report_path"])
+                    if Path(doc["report_path"]).is_absolute()
+                    else (PROJECT_ROOT / str(doc["report_path"]))
+                )
+                if doc.get("report_path")
+                else ""
+            ),
             "pdf_path": doc.get("pdf_path"),
             "paper": _paper_card(doc.get("paper") or {}, index + 1),
             "reused": bool(doc.get("reused")),
@@ -1227,6 +1378,91 @@ def _reports_payload(docs: Iterable[Dict[str, Any]], *, write_feishu_requested: 
         "write_feishu_requested": write_feishu_requested,
         "feishu_warning": feishu_warning,
     }
+
+
+def _report_summary_payload(report: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "report_id": report["report_id"],
+        "title": report["title"],
+        "user_id": report["user_id"],
+        "paper_id": report["paper_id"],
+        "arxiv_id": report["arxiv_id"],
+        "saved_at": report["saved_at"],
+        "updated_at": report["updated_at"],
+        "report_path": report["report_path"],
+        "doc_url": report["doc_url"],
+        "doc_token": report["doc_token"],
+        "pdf_url": report["pdf_url"],
+        "abs_url": report["abs_url"],
+        "report_version": report["report_version"],
+        "generation_provider": report["generation_provider"],
+        "generation_model": report["generation_model"],
+        "snippet": report["snippet"],
+    }
+
+
+def list_reports(
+    user_id: str = "",
+    query: str = "",
+    days: int = 30,
+    limit: int = 80,
+    exact_date: str = "",
+) -> Dict[str, Any]:
+    normalized_user = str(user_id or "").strip()
+    normalized_query = str(query or "").strip().lower()
+    normalized_date = str(exact_date or "").strip()
+    max_age_days = max(1, int(days or 30))
+    max_items = max(1, int(limit or 80))
+    cutoff = datetime.now() - timedelta(days=max_age_days)
+
+    reports = []
+    for report in _all_report_records():
+        report_dt = datetime.fromtimestamp(report["_sort_ts"])
+        if normalized_date:
+            report_date = str(report.get("saved_at") or report.get("updated_at") or "")[:10]
+            if report_date != normalized_date:
+                continue
+        elif report_dt < cutoff:
+            continue
+        if normalized_user and report["user_id"] != normalized_user:
+            continue
+        haystack = " ".join(
+            [
+                str(report.get("title") or ""),
+                str(report.get("user_id") or ""),
+                str(report.get("arxiv_id") or ""),
+                str(report.get("snippet") or ""),
+                str(report.get("report_path") or ""),
+            ]
+        ).lower()
+        if normalized_query and normalized_query not in haystack:
+            continue
+        reports.append(_report_summary_payload(report))
+        if len(reports) >= max_items:
+            break
+
+    return {
+        "reports": reports,
+        "count": len(reports),
+        "source_dirs": [_display_path(path) for path in _reading_report_dirs()],
+    }
+
+
+def get_report_content(report_id: str) -> Dict[str, Any]:
+    normalized_id = str(report_id or "").strip()
+    if not normalized_id:
+        raise ValueError("report_id is required")
+    for report in _all_report_records():
+        if report["report_id"] != normalized_id:
+            continue
+        return {
+            "report": {
+                **_report_summary_payload(report),
+                "metadata": report["metadata"],
+                "markdown": report["markdown"],
+            }
+        }
+    raise ValueError(f"Report not found: {normalized_id}")
 
 
 def submit_and_read(
