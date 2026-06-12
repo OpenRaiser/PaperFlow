@@ -538,11 +538,11 @@ follow-ups are:
 If you use PaperFlow or PaperFlow-Bench in academic work, please cite:
 
 ```bibtex
-@misc{paperflow2026,
-  title  = {PaperFlow: Personalized Scientific-Paper Recommendation, Reading, and Reporting},
-  author = {PaperFlow Contributors},
-  year   = {2026},
-  url    = {https://github.com/OpenRaiser/PaperFlow}
+@article{wang2026paperflow,
+  title={PaperFlow: Profiling, Recommending, and Adapting Across Daily Paper Streams},
+  author={Wang, Fuqiang and Tan, Song and Guo, Zheng and Fu, Jiaohao and Xu, Xinglong and Yu, Bihui and Dong, Jie and Sun, Zheng and Li, Siyuan and Wei, Jingxuan and others},
+  journal={arXiv preprint arXiv:2606.07454},
+  year={2026}
 }
 ```
 
