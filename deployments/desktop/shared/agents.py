@@ -13,6 +13,7 @@ import json
 import os
 import re
 import threading
+import zipfile
 import yaml
 from copy import deepcopy
 from contextlib import contextmanager
@@ -65,6 +66,26 @@ EDITABLE_ENV_KEYS = [
     "PAPERFLOW_WIKI_DIR",
     "PAPERFLOW_WIKI_INGEST",
     "PAPERFLOW_WRITE_FEISHU",
+    "PAPERFLOW_DEFAULT_ARXIV_CATEGORIES",
+    "PAPERFLOW_DEFAULT_CONFERENCES",
+    "PAPERFLOW_DEFAULT_JOURNALS",
+    "PAPERFLOW_CUSTOM_RSS_URLS",
+    "PAPERFLOW_ENABLE_ARXIV",
+    "PAPERFLOW_ENABLE_SEMANTIC_SCHOLAR",
+    "PAPERFLOW_ENABLE_OPENREVIEW",
+    "PAPERFLOW_ENABLE_CUSTOM_RSS",
+    "PAPERFLOW_CONFERENCE_ACCESS_MODE",
+    "PAPERFLOW_CONFERENCE_COOKIE_FILE",
+    "SEMANTIC_SCHOLAR_API_KEY",
+    "OPENREVIEW_USERNAME",
+    "OPENREVIEW_TOKEN",
+    "OPENREVIEW_COOKIE_FILE",
+    "PAPERFLOW_REPORT_STYLE",
+    "PAPERFLOW_DAILY_LIMIT",
+    "PAPERFLOW_RELEVANCE_THRESHOLD",
+    "PAPERFLOW_MAX_CONCURRENCY",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
     "FEISHU_APP_ID",
     "FEISHU_APP_SECRET",
     "FEISHU_BOT_NAME",
@@ -328,6 +349,51 @@ def _display_path(path: Path) -> str:
         return str(resolved)
 
 
+def _directory_size_bytes(path: Path, max_files: int = 5000) -> int:
+    if not path.exists() or not path.is_dir():
+        return 0
+    total = 0
+    count = 0
+    for item in path.rglob("*"):
+        if count >= max_files:
+            break
+        try:
+            if item.is_file():
+                total += item.stat().st_size
+                count += 1
+        except OSError:
+            continue
+    return total
+
+
+def _format_bytes(value: int) -> str:
+    size = float(max(0, int(value or 0)))
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024 or unit == "TB":
+            if unit == "B":
+                return f"{int(size)}B"
+            return f"{size:.1f}{unit}"
+        size /= 1024
+    return "0B"
+
+
+def _storage_stats(paths: Dict[str, Any]) -> Dict[str, Any]:
+    tracked = [
+        paths.get("pdf_dir"),
+        paths.get("reading_reports_dir"),
+        paths.get("wiki_dir"),
+    ]
+    total = 0
+    for raw_path in tracked:
+        if not raw_path:
+            continue
+        total += _directory_size_bytes(Path(str(raw_path)).expanduser())
+    return {
+        "cache_bytes": total,
+        "cache_display": _format_bytes(total),
+    }
+
+
 def _reading_report_dirs() -> List[Path]:
     configured = Path(_configured_path("PAPERFLOW_READING_REPORTS_DIR", "data/exports")).resolve()
     fallback = (PROJECT_ROOT / "data" / "reading_reports").resolve()
@@ -460,7 +526,19 @@ def _all_report_records() -> List[Dict[str, Any]]:
 
 
 def _safe_env() -> Dict[str, str]:
-    prefixes = ("PAPERFLOW_", "OPENAI_", "ANTHROPIC_", "OLLAMA_", "DASHSCOPE_", "FEISHU_", "NGROK_")
+    prefixes = (
+        "PAPERFLOW_",
+        "OPENAI_",
+        "ANTHROPIC_",
+        "OLLAMA_",
+        "DASHSCOPE_",
+        "FEISHU_",
+        "NGROK_",
+        "SEMANTIC_SCHOLAR_",
+        "OPENREVIEW_",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+    )
     sensitive = ("KEY", "TOKEN", "SECRET", "PASSWORD")
     result: Dict[str, str] = {}
     for key, value in sorted(os.environ.items()):
@@ -508,6 +586,21 @@ def _serialize_env_value(value: Any) -> str:
         escaped = text.replace("\\", "\\\\").replace('"', '\\"')
         return f'"{escaped}"'
     return text
+
+
+def _env_text(name: str, default: str = "") -> str:
+    file_values = _read_env_file()
+    return str(file_values.get(name, os.environ.get(name, default)) or default).strip()
+
+
+def _env_list(name: str, default: Optional[List[str]] = None) -> List[str]:
+    raw = _env_text(name)
+    if not raw:
+        return list(default or [])
+    parsed = _load_json(raw, None)
+    if isinstance(parsed, list):
+        return [str(item).strip() for item in parsed if str(item).strip()]
+    return [item.strip() for item in re.split(r"[,;\n]", raw) if item.strip()]
 
 
 def _merge_env_file(updates: Dict[str, str]) -> None:
@@ -574,6 +667,10 @@ def source_options() -> Dict[str, Any]:
                     "id": name,
                     "label": name,
                     "group": str(item.get("venue_type") or ""),
+                    "source": str(item.get("source") or ""),
+                    "venue_id": str(item.get("venue_id") or ""),
+                    "acceptance_timeline": str(item.get("acceptance_timeline") or ""),
+                    "conference_date": str(item.get("conference_date") or ""),
                     "enabled": bool(item.get("enabled", True)),
                 }
             )
@@ -640,22 +737,55 @@ def health() -> Dict[str, Any]:
 
 
 def settings() -> Dict[str, Any]:
+    source_preferences = {
+        "enable_arxiv": _env_text("PAPERFLOW_ENABLE_ARXIV", "true").lower() not in {"0", "false", "no", "off"},
+        "enable_semantic_scholar": _env_text("PAPERFLOW_ENABLE_SEMANTIC_SCHOLAR", "true").lower() not in {"0", "false", "no", "off"},
+        "enable_openreview": _env_text("PAPERFLOW_ENABLE_OPENREVIEW", "true").lower() not in {"0", "false", "no", "off"},
+        "enable_custom_rss": _env_text("PAPERFLOW_ENABLE_CUSTOM_RSS", "false").lower() in {"1", "true", "yes", "on"},
+        "arxiv_categories": _env_list("PAPERFLOW_DEFAULT_ARXIV_CATEGORIES", ["cs.CL", "cs.AI", "cs.IR", "cs.LG"]),
+        "conferences": _env_list("PAPERFLOW_DEFAULT_CONFERENCES", ["ICLR", "NeurIPS", "ACL", "SIGIR"]),
+        "journals": _env_list("PAPERFLOW_DEFAULT_JOURNALS", []),
+        "custom_rss_urls": _env_list("PAPERFLOW_CUSTOM_RSS_URLS", ["https://arxiv.org/rss/cs.CL"]),
+        "conference_access_mode": _env_text("PAPERFLOW_CONFERENCE_ACCESS_MODE", "public") or "public",
+        "auth_status": {
+            "semantic_scholar_api_key": bool(_env_text("SEMANTIC_SCHOLAR_API_KEY")),
+            "openreview_username": bool(_env_text("OPENREVIEW_USERNAME")),
+            "openreview_token": bool(_env_text("OPENREVIEW_TOKEN")),
+            "openreview_cookie_file": bool(_env_text("OPENREVIEW_COOKIE_FILE")),
+            "conference_cookie_file": bool(_env_text("PAPERFLOW_CONFERENCE_COOKIE_FILE")),
+        },
+    }
+    report_preferences = {
+        "style": _env_text("PAPERFLOW_REPORT_STYLE", "standard") or "standard",
+        "write_feishu": _env_bool("PAPERFLOW_WRITE_FEISHU", default=False),
+        "wiki_ingest": _env_bool("PAPERFLOW_WIKI_INGEST", default=True),
+    }
+    advanced = {
+        "daily_limit": int(_to_float(_env_text("PAPERFLOW_DAILY_LIMIT", "30"), 30)),
+        "relevance_threshold": int(_to_float(_env_text("PAPERFLOW_RELEVANCE_THRESHOLD", "60"), 60)),
+        "http_proxy": _env_text("HTTP_PROXY", _env_text("HTTPS_PROXY", "")),
+    }
+    paths = {
+        "pdf_dir": _configured_path("PAPERFLOW_PDF_DIR", "data/exports"),
+        "reading_reports_dir": _configured_path("PAPERFLOW_READING_REPORTS_DIR", "data/exports"),
+        "wiki_dir": _configured_path("PAPERFLOW_WIKI_DIR", "data/wiki"),
+        "monthly_report_dir": _configured_path("PAPERFLOW_MONTHLY_REPORT_DIR", "data/exports"),
+        "topic_index_dir": _configured_path("PAPERFLOW_TOPIC_INDEX_DIR", "data/exports"),
+        "role_subdir": _env_bool("PAPERFLOW_STORAGE_ROLE_SUBDIR", default=True),
+        "category_subdir": _env_bool("PAPERFLOW_STORAGE_CATEGORY_SUBDIR", default=True),
+        "monthly_subdir": _env_bool("PAPERFLOW_STORAGE_MONTHLY_SUBDIR", default=True),
+        "wiki_ingest": _env_bool("PAPERFLOW_WIKI_INGEST", default=True),
+        "write_feishu": _env_bool("PAPERFLOW_WRITE_FEISHU", default=False),
+    }
     return {
         "project_root": str(PROJECT_ROOT),
         "env_path": str(ENV_PATH),
         "database": str(db_ops.DB_PATH),
-        "paths": {
-            "pdf_dir": _configured_path("PAPERFLOW_PDF_DIR", "data/exports"),
-            "reading_reports_dir": _configured_path("PAPERFLOW_READING_REPORTS_DIR", "data/exports"),
-            "wiki_dir": _configured_path("PAPERFLOW_WIKI_DIR", "data/wiki"),
-            "monthly_report_dir": _configured_path("PAPERFLOW_MONTHLY_REPORT_DIR", "data/exports"),
-            "topic_index_dir": _configured_path("PAPERFLOW_TOPIC_INDEX_DIR", "data/exports"),
-            "role_subdir": _env_bool("PAPERFLOW_STORAGE_ROLE_SUBDIR", default=True),
-            "category_subdir": _env_bool("PAPERFLOW_STORAGE_CATEGORY_SUBDIR", default=True),
-            "monthly_subdir": _env_bool("PAPERFLOW_STORAGE_MONTHLY_SUBDIR", default=True),
-            "wiki_ingest": _env_bool("PAPERFLOW_WIKI_INGEST", default=True),
-            "write_feishu": _env_bool("PAPERFLOW_WRITE_FEISHU", default=False),
-        },
+        "paths": paths,
+        "storage_stats": _storage_stats(paths),
+        "source_preferences": source_preferences,
+        "report_preferences": report_preferences,
+        "advanced": advanced,
         "env": _safe_env(),
         "editable_env": _env_edit_payload(),
     }
@@ -696,6 +826,90 @@ def test_provider(kind: str) -> Dict[str, Any]:
             "dimensions": len(vector),
         }
     raise ValueError("kind must be 'llm' or 'embedding'")
+
+
+def _export_root() -> Path:
+    root = PROJECT_ROOT / "data" / "desktop_exports"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _export_sources() -> List[Tuple[str, Path]]:
+    return [
+        ("papers", Path(_configured_path("PAPERFLOW_PDF_DIR", "data/exports")).resolve()),
+        ("reading_reports", Path(_configured_path("PAPERFLOW_READING_REPORTS_DIR", "data/exports")).resolve()),
+        ("wiki", Path(_configured_path("PAPERFLOW_WIKI_DIR", "data/wiki")).resolve()),
+    ]
+
+
+def export_data(user_id: str, export_format: str = "markdown") -> Dict[str, Any]:
+    normalized = str(export_format or "markdown").strip().lower()
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    root = _export_root()
+
+    if normalized in {"markdown", "md"}:
+        output = root / f"paperflow_{user_id or 'all'}_{timestamp}.md"
+        reports = list_reports(user_id=user_id, days=3650, limit=200).get("reports") or []
+        wiki_nodes = wiki_db.list_nodes(user_id, limit=200) if user_id else []
+        lines = [
+            f"# PaperFlow Export - {user_id or 'all'}",
+            "",
+            f"- Exported at: {datetime.now().isoformat(sep=' ', timespec='seconds')}",
+            f"- Reports: {len(reports)}",
+            f"- Wiki nodes: {len(wiki_nodes)}",
+            "",
+            "## Reading Reports",
+            "",
+        ]
+        for report in reports:
+            lines.extend(
+                [
+                    f"### {report.get('title') or 'Untitled Report'}",
+                    "",
+                    f"- Path: {report.get('report_path') or ''}",
+                    f"- Saved: {report.get('saved_at') or ''}",
+                    "",
+                    str(report.get("snippet") or "").strip(),
+                    "",
+                ]
+            )
+        lines.extend(["## Wiki Nodes", ""])
+        for node in wiki_nodes:
+            lines.extend(
+                [
+                    f"### {node.get('title') or node.get('node_id')}",
+                    "",
+                    f"- Type: {node.get('node_type') or ''}",
+                    f"- Path: {node.get('file_path') or ''}",
+                    "",
+                    str(node.get("body") or "")[:1200],
+                    "",
+                ]
+            )
+        output.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+        return {"format": "markdown", "path": str(output), "display_path": _display_path(output), "count": len(reports) + len(wiki_nodes)}
+
+    if normalized == "zip":
+        output = root / f"paperflow_{user_id or 'all'}_{timestamp}.zip"
+        count = 0
+        with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for label, path in _export_sources():
+                if not path.exists():
+                    continue
+                if path.is_file():
+                    archive.write(path, arcname=f"{label}/{path.name}")
+                    count += 1
+                    continue
+                for file_path in path.rglob("*"):
+                    if not file_path.is_file():
+                        continue
+                    if file_path.name.startswith("."):
+                        continue
+                    archive.write(file_path, arcname=f"{label}/{file_path.relative_to(path)}")
+                    count += 1
+        return {"format": "zip", "path": str(output), "display_path": _display_path(output), "count": count}
+
+    raise ValueError("export_format must be markdown or zip")
 
 
 def list_users() -> Dict[str, Any]:
@@ -1143,6 +1357,7 @@ def submit_gui_feedback(
     push_id: str,
     selected_numbers: Iterable[Any],
     skipped_numbers: Iterable[Any],
+    later_numbers: Iterable[Any] = (),
 ) -> Dict[str, Any]:
     push = db_ops.get_push_papers(push_id)
     if not push or not push.get("papers"):
@@ -1151,6 +1366,7 @@ def submit_gui_feedback(
     papers = list(push["papers"])
     selected = set(_unique_ints(selected_numbers, maximum=len(papers)))
     skipped = set(_unique_ints(skipped_numbers, maximum=len(papers))) - selected
+    later = (set(_unique_ints(later_numbers, maximum=len(papers))) - selected) - skipped
 
     current_timestamp = datetime.now()
     previously_selected = feedback_agent.get_existing_selected_numbers(user_id, push_id, papers)
@@ -1180,9 +1396,21 @@ def submit_gui_feedback(
             category=paper.get("category", "unknown"),
         )
 
+    for paper_number in sorted(later):
+        paper = papers[paper_number - 1]
+        _log_feedback_event(
+            user_id=user_id,
+            push_id=push_id,
+            paper_number=paper_number,
+            paper=paper,
+            action="later",
+            action_type="gui_later",
+            category=paper.get("category", "unknown"),
+        )
+
     profile_before = db_ops.get_profile(user_id) or {}
     updated_profile: Dict[str, Any] = profile_before
-    if selected or skipped:
+    if selected or skipped or later:
         history_before_update = db_ops.get_recent_selected_papers(
             user_id,
             limit=60,
@@ -1199,7 +1427,7 @@ def submit_gui_feedback(
             current_timestamp=current_timestamp,
             feedback_strength_multiplier=strength,
         )
-        evidence_numbers = sorted(selected | skipped)
+        evidence_numbers = sorted(selected | skipped | later)
         evidence_papers = [papers[number - 1] for number in evidence_numbers if 1 <= number <= len(papers)]
         feedback_agent.ingest_profile_drift_to_wiki(
             user_id=user_id,
@@ -1215,8 +1443,57 @@ def submit_gui_feedback(
         "selected_numbers": sorted(selected),
         "newly_selected_numbers": sorted(new_selected),
         "skipped_numbers": sorted(skipped),
+        "later_numbers": sorted(later),
         "profile": _profile_summary(updated_profile),
     }
+
+
+def _resolve_project_path(value: Any) -> Optional[Path]:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    return path
+
+
+def _backfill_docs_to_wiki(user_id: str, docs: Iterable[Dict[str, Any]]) -> int:
+    """Best-effort Wiki ingest for reused reading reports returned by the GUI."""
+    ingest = getattr(reading_agent, "ingest_reading_report_to_wiki", None)
+    if ingest is None:
+        return 0
+
+    backfilled = 0
+    for doc in docs or []:
+        if doc.get("wiki_ingest"):
+            continue
+        report_path = _resolve_project_path(doc.get("report_path"))
+        if not report_path or not report_path.exists() or not report_path.is_file():
+            continue
+        try:
+            raw = report_path.read_text(encoding="utf-8")
+            metadata, body = _extract_frontmatter(raw)
+            paper = dict(doc.get("paper") or {})
+            for key in ("paper_id", "arxiv_id", "doi", "title", "pdf_path", "pdf_url", "publish_date"):
+                if metadata.get(key) not in (None, "", [], {}) and paper.get(key) in (None, "", [], {}):
+                    paper[key] = metadata.get(key)
+            result = ingest(
+                user_id=user_id,
+                paper=paper,
+                report_content=body or raw,
+                report_payload=doc.get("report_payload") or {},
+                report_path=str(report_path),
+                doc_url=doc.get("url") or metadata.get("doc_url"),
+                doc_token=doc.get("doc_token") or metadata.get("doc_token"),
+            )
+        except Exception as exc:
+            doc["wiki_ingest_error"] = str(exc)
+            continue
+        if result:
+            doc["wiki_ingest"] = result
+            backfilled += 1
+    return backfilled
 
 
 def create_reading_reports(
@@ -1244,7 +1521,10 @@ def create_reading_reports(
             request_metadata={"selection_push_id": push_id, "report_source_type": "desktop_gui"},
         )
 
-    return _reports_payload(docs, write_feishu_requested=should_write_feishu)
+    wiki_backfilled = _backfill_docs_to_wiki(user_id, docs)
+    payload = _reports_payload(docs, write_feishu_requested=should_write_feishu)
+    payload["wiki_backfilled"] = wiki_backfilled
+    return payload
 
 
 def _normalize_arxiv_id(value: str) -> str:
@@ -1289,7 +1569,10 @@ def read_arxiv(user_id: str, arxiv_id: str, write_feishu: Optional[bool] = None)
                 "report_source_name": normalized_arxiv_id,
             },
         )
-    return _reports_payload(docs, write_feishu_requested=should_write_feishu)
+    wiki_backfilled = _backfill_docs_to_wiki(user_id, docs)
+    payload = _reports_payload(docs, write_feishu_requested=should_write_feishu)
+    payload["wiki_backfilled"] = wiki_backfilled
+    return payload
 
 
 def read_local_pdf(
@@ -1325,7 +1608,10 @@ def read_local_pdf(
                 "report_source_name": path.name,
             },
         )
-    return _reports_payload(docs, write_feishu_requested=should_write_feishu)
+    wiki_backfilled = _backfill_docs_to_wiki(user_id, docs)
+    payload = _reports_payload(docs, write_feishu_requested=should_write_feishu)
+    payload["wiki_backfilled"] = wiki_backfilled
+    return payload
 
 
 def _doc_payloads(docs: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -1471,6 +1757,7 @@ def submit_and_read(
     push_id: str,
     selected_numbers: Iterable[Any],
     skipped_numbers: Iterable[Any],
+    later_numbers: Iterable[Any] = (),
     generate_reports: bool = True,
     write_feishu: Optional[bool] = None,
 ) -> Dict[str, Any]:
@@ -1479,6 +1766,7 @@ def submit_and_read(
         push_id=push_id,
         selected_numbers=selected_numbers,
         skipped_numbers=skipped_numbers,
+        later_numbers=later_numbers,
     )
     reports = {"created_docs": [], "count": 0}
     if generate_reports and feedback["selected_numbers"]:
@@ -1515,8 +1803,209 @@ def wiki_search(user_id: str, query: str = "", node_type: Optional[str] = None, 
     }
 
 
-def wiki_ask(user_id: str, question: str, limit: int = 8) -> Dict[str, Any]:
-    return wiki_answer.answer_question(user_id, question, limit=limit)
+def _wiki_node_payload(node: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "node_id": node.get("node_id"),
+        "node_type": node.get("node_type"),
+        "title": node.get("title"),
+        "body": str(node.get("body") or "")[:800],
+        "keywords": node.get("keywords"),
+        "file_path": node.get("file_path"),
+        "metadata": node.get("metadata") or {},
+        "score": node.get("score"),
+        "updated_at": node.get("updated_at"),
+    }
+
+
+def wiki_graph(user_id: str, query: str = "", limit: int = 24) -> Dict[str, Any]:
+    """Return user-scoped wiki nodes and edges for the desktop graph view."""
+    safe_limit = max(4, min(80, int(limit or 24)))
+    query = str(query or "").strip()
+    user_node_id = f"user:{user_id}"
+
+    def row_to_node(row: Any) -> Dict[str, Any]:
+        node = dict(row)
+        try:
+            node["metadata"] = json.loads(node.pop("metadata_json", None) or "{}")
+        except (TypeError, json.JSONDecodeError):
+            node["metadata"] = {}
+        return node
+
+    conn = db_ops.get_connection()
+
+    def remember_nodes(nodes: Iterable[Dict[str, Any]], node_by_id: Dict[str, Dict[str, Any]]) -> None:
+        for node in nodes or []:
+            node_id = str(node.get("node_id") or "").strip()
+            if node_id:
+                node_by_id.setdefault(node_id, node)
+
+    def fetch_nodes_by_ids(candidate_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+        cleaned_ids = []
+        for node_id in candidate_ids:
+            normalized = str(node_id or "").strip()
+            if normalized and normalized != user_node_id and normalized not in cleaned_ids:
+                cleaned_ids.append(normalized)
+        if not cleaned_ids:
+            return {}
+        placeholders = ",".join("?" for _ in cleaned_ids)
+        rows = conn.execute(
+            f"""
+            SELECT *
+            FROM wiki_nodes
+            WHERE user_id = ?
+              AND node_id IN ({placeholders})
+            """,
+            [user_id, *cleaned_ids],
+        ).fetchall()
+        node_by_id: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            node = row_to_node(row)
+            node_id = str(node.get("node_id") or "").strip()
+            if node_id:
+                node_by_id[node_id] = node
+        return node_by_id
+
+    def fetch_top_edges() -> List[Any]:
+        return conn.execute(
+            """
+            SELECT src_id, dst_id, relation, weight, metadata_json, created_at
+            FROM wiki_edges
+            WHERE user_id = ?
+            ORDER BY weight DESC, created_at DESC
+            LIMIT ?
+            """,
+            (user_id, safe_limit * 4),
+        ).fetchall()
+
+    def fetch_edges_for_ids(candidate_ids: List[str]) -> List[Any]:
+        if not candidate_ids:
+            return []
+        candidate_placeholders = ",".join("?" for _ in candidate_ids)
+        return conn.execute(
+            f"""
+            SELECT src_id, dst_id, relation, weight, metadata_json, created_at
+            FROM wiki_edges
+            WHERE user_id = ?
+              AND (
+                (src_id IN ({candidate_placeholders}) AND dst_id IN ({candidate_placeholders}))
+                OR (src_id = ? AND dst_id IN ({candidate_placeholders}))
+              )
+            ORDER BY weight DESC, created_at DESC
+            LIMIT ?
+            """,
+            [user_id, *candidate_ids, *candidate_ids, user_node_id, *candidate_ids, safe_limit * 4],
+        ).fetchall()
+
+    node_by_id: Dict[str, Dict[str, Any]] = {}
+    if query:
+        remember_nodes(wiki_db.search_nodes(user_id, query, limit=safe_limit), node_by_id)
+        rows = fetch_edges_for_ids(list(node_by_id))
+        edge_node_ids: List[str] = []
+        for row in rows:
+            for endpoint in (str(row["src_id"] or ""), str(row["dst_id"] or "")):
+                if endpoint and endpoint != user_node_id and endpoint not in node_by_id and endpoint not in edge_node_ids:
+                    edge_node_ids.append(endpoint)
+        remaining_slots = max(0, safe_limit - len(node_by_id))
+        node_by_id.update(fetch_nodes_by_ids(edge_node_ids[:remaining_slots]))
+    else:
+        rows = fetch_top_edges()
+        edge_node_ids = []
+        for row in rows:
+            for endpoint in (str(row["src_id"] or ""), str(row["dst_id"] or "")):
+                if endpoint and endpoint != user_node_id and endpoint not in edge_node_ids:
+                    edge_node_ids.append(endpoint)
+        node_by_id.update(fetch_nodes_by_ids(edge_node_ids[:safe_limit]))
+        if len(node_by_id) < safe_limit:
+            remember_nodes(wiki_db.list_nodes(user_id, limit=safe_limit), node_by_id)
+
+    rows = rows or fetch_edges_for_ids(list(node_by_id))
+    conn.close()
+
+    if not node_by_id:
+        return {"nodes": [], "edges": [], "source": "wiki_db", "query": query}
+
+    edges = []
+    include_user_node = False
+    for row in rows:
+        src_id = str(row["src_id"] or "")
+        dst_id = str(row["dst_id"] or "")
+        if src_id == user_node_id or dst_id == user_node_id:
+            include_user_node = True
+        if src_id not in node_by_id and src_id != user_node_id:
+            continue
+        if dst_id not in node_by_id and dst_id != user_node_id:
+            continue
+        try:
+            metadata = json.loads(row["metadata_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            metadata = {}
+        edges.append(
+            {
+                "src_id": src_id,
+                "dst_id": dst_id,
+                "relation": row["relation"],
+                "weight": float(row["weight"] or 1.0),
+                "metadata": metadata,
+            }
+        )
+
+    degree: Dict[str, float] = {}
+    for edge in edges:
+        weight = float(edge.get("weight") or 1.0)
+        degree[edge["src_id"]] = degree.get(edge["src_id"], 0.0) + weight
+        degree[edge["dst_id"]] = degree.get(edge["dst_id"], 0.0) + weight
+    ordered_node_ids = sorted(node_by_id, key=lambda node_id: degree.get(node_id, 0.0), reverse=True)
+    graph_nodes = [_wiki_node_payload(node_by_id[node_id]) for node_id in ordered_node_ids]
+    if include_user_node:
+        graph_nodes.insert(
+            0,
+            {
+                "node_id": user_node_id,
+                "node_type": "trajectory",
+                "title": "当前用户画像",
+                "body": "用户反馈、精读和跳过记录形成的本地研究状态。",
+                "keywords": user_id,
+                "file_path": "",
+                "metadata": {"user_id": user_id},
+                "score": 1.0,
+                "updated_at": None,
+            },
+        )
+    return {"nodes": graph_nodes, "edges": edges, "source": "wiki_db", "query": query}
+
+
+def update_wiki_node(user_id: str, node_id: str, title: str = "", body: str = "") -> Dict[str, Any]:
+    cleaned_node_id = str(node_id or "").strip()
+    if not user_id or not cleaned_node_id:
+        raise ValueError("user_id and node_id are required")
+    existing = wiki_db.get_node(user_id, cleaned_node_id)
+    if not existing:
+        raise ValueError(f"Wiki node not found: {cleaned_node_id}")
+    updated = wiki_db.upsert_node(
+        user_id=user_id,
+        node_id=cleaned_node_id,
+        node_type=str(existing.get("node_type") or "topic"),
+        title=str(title or existing.get("title") or cleaned_node_id),
+        body=str(body or ""),
+        metadata=existing.get("metadata") or {},
+        keywords=str(existing.get("keywords") or ""),
+        source_type=existing.get("source_type"),
+        source_ref=existing.get("source_ref"),
+        file_path=existing.get("file_path"),
+        write_mirror=True,
+    )
+    return {"node": _wiki_node_payload(updated)}
+
+
+def wiki_ask(user_id: str, question: str, limit: int = 8, scope: str = "all") -> Dict[str, Any]:
+    normalized_scope = str(scope or "all").strip().lower()
+    scope_hint = {
+        "recent": " Prioritize recently updated wiki nodes and recent reading reports.",
+        "profile": " Prioritize profile, trajectory, preference, and research-direction wiki nodes.",
+    }.get(normalized_scope, "")
+    result = wiki_answer.answer_question(user_id, f"{question}{scope_hint}", limit=limit)
+    result["scope"] = normalized_scope if normalized_scope in {"all", "recent", "profile"} else "all"
+    return result
 
 
 def recent_activity(user_id: str, days: int = 14, limit: int = 80) -> Dict[str, Any]:

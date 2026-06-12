@@ -9,6 +9,7 @@ import sys
 import threading
 import urllib.parse
 import webbrowser
+from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -61,6 +62,21 @@ def _required_user(params: Dict[str, Any]) -> str:
     if not user_id:
         raise ValueError("user_id is required")
     return user_id
+
+
+def _daily_days_from_body(body: Dict[str, Any]) -> int:
+    raw_days = int(body.get("days") or 1)
+    target_date = str(body.get("target_date") or "").strip()
+    if not target_date:
+        return max(1, min(14, raw_days))
+    try:
+        selected = datetime.strptime(target_date, "%Y-%m-%d").date()
+    except ValueError:
+        return max(1, min(14, raw_days))
+    today = datetime.now().date()
+    if selected > today:
+        return 1
+    return max(1, min(14, (today - selected).days + 1))
 
 
 def _api_health(_query_params: Dict[str, Any], _body: Dict[str, Any]) -> Dict[str, Any]:
@@ -116,6 +132,14 @@ def _api_wiki_search(query_params: Dict[str, Any], _body: Dict[str, Any]) -> Dic
         query=str(query_params.get("q") or ""),
         node_type=str(query_params.get("type") or "").strip() or None,
         limit=int(query_params.get("limit") or 12),
+    )
+
+
+def _api_wiki_graph(query_params: Dict[str, Any], _body: Dict[str, Any]) -> Dict[str, Any]:
+    return agents.wiki_graph(
+        _required_user(query_params),
+        query=str(query_params.get("q") or ""),
+        limit=int(query_params.get("limit") or 24),
     )
 
 
@@ -177,7 +201,7 @@ def _api_daily(_query_params: Dict[str, Any], body: Dict[str, Any]) -> Dict[str,
         raise ValueError("user_id is required")
     return agents.run_daily_push(
         user_id=user_id,
-        days=int(body.get("days") or 1),
+        days=_daily_days_from_body(body),
         limit_per_source=int(body.get("limit_per_source") or 100),
         arxiv_categories=body.get("arxiv_categories"),
         conferences=body.get("conferences"),
@@ -191,7 +215,7 @@ def _api_daily_start(_query_params: Dict[str, Any], body: Dict[str, Any]) -> Dic
         raise ValueError("user_id is required")
     return agents.start_daily_push_task(
         user_id=user_id,
-        days=int(body.get("days") or 1),
+        days=_daily_days_from_body(body),
         limit_per_source=int(body.get("limit_per_source") or 100),
         arxiv_categories=body.get("arxiv_categories"),
         conferences=body.get("conferences"),
@@ -209,6 +233,7 @@ def _api_feedback(_query_params: Dict[str, Any], body: Dict[str, Any]) -> Dict[s
         push_id=push_id,
         selected_numbers=body.get("selected_numbers") or [],
         skipped_numbers=body.get("skipped_numbers") or [],
+        later_numbers=body.get("later_numbers") or [],
     )
 
 
@@ -258,6 +283,7 @@ def _api_submit(_query_params: Dict[str, Any], body: Dict[str, Any]) -> Dict[str
         push_id=push_id,
         selected_numbers=body.get("selected_numbers") or [],
         skipped_numbers=body.get("skipped_numbers") or [],
+        later_numbers=body.get("later_numbers") or [],
         generate_reports=bool(body.get("generate_reports", True)),
         write_feishu=body.get("write_feishu"),
     )
@@ -267,7 +293,24 @@ def _api_wiki_ask(_query_params: Dict[str, Any], body: Dict[str, Any]) -> Dict[s
     return agents.wiki_ask(
         user_id=str(body.get("user_id") or "").strip(),
         question=str(body.get("question") or "").strip(),
+        scope=str(body.get("scope") or "all").strip(),
         limit=int(body.get("limit") or 8),
+    )
+
+
+def _api_wiki_node(_query_params: Dict[str, Any], body: Dict[str, Any]) -> Dict[str, Any]:
+    return agents.update_wiki_node(
+        user_id=str(body.get("user_id") or "").strip(),
+        node_id=str(body.get("node_id") or "").strip(),
+        title=str(body.get("title") or "").strip(),
+        body=str(body.get("body") or ""),
+    )
+
+
+def _api_export(_query_params: Dict[str, Any], body: Dict[str, Any]) -> Dict[str, Any]:
+    return agents.export_data(
+        user_id=str(body.get("user_id") or "").strip(),
+        export_format=str(body.get("format") or "markdown").strip(),
     )
 
 
@@ -291,6 +334,7 @@ GET_ROUTES: Dict[str, ApiHandler] = {
     "/api/daily/status": _api_daily_status,
     "/api/wiki/stats": _api_wiki_stats,
     "/api/wiki/search": _api_wiki_search,
+    "/api/wiki/graph": _api_wiki_graph,
     "/api/activity": _api_activity,
     "/api/reports": _api_reports,
     "/api/reports/content": _api_report_content,
@@ -310,6 +354,8 @@ POST_ROUTES: Dict[str, ApiHandler] = {
     "/api/read/pdf": _api_read_pdf,
     "/api/submit": _api_submit,
     "/api/wiki/ask": _api_wiki_ask,
+    "/api/wiki/node": _api_wiki_node,
+    "/api/export": _api_export,
     "/api/must-read": _api_must_read_update,
 }
 
