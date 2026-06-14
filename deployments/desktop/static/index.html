@@ -266,7 +266,7 @@
                 <div class="message assistant">
                   <div class="avatar">AI</div>
                   <div class="bubble">
-                    <p>可以围绕最近论文、精读报告和 Wiki 条目提问；回答会显示引用来源。</p>
+                    <p>可以围绕最近论文、精读报告和 Wiki 条目提问；回答会列出参考文献。</p>
                   </div>
                 </div>
               </div>
@@ -275,14 +275,16 @@
                 <button data-prompt="对比这两篇论文的方法差异" type="button">对比两篇方法</button>
                 <button data-prompt="找出可加入 Wiki 的关键概念" type="button">找相关概念</button>
               </div>
+              <div id="chatMentionChips" class="mention-chips" hidden></div>
+              <div id="mentionSuggestions" class="mention-suggestions" hidden></div>
               <div class="chat-composer">
-                <textarea id="chatInput" rows="3" placeholder="输入问题，支持基于论文与 Wiki 的联合问答"></textarea>
+                <textarea id="chatInput" rows="3" placeholder="输入问题，使用 @ 选择论文或 Wiki 节点"></textarea>
                 <button id="wikiAskBtn" class="primary" type="button">发送</button>
               </div>
             </div>
 
             <aside class="source-pane">
-              <h2>引用来源</h2>
+              <h2>参考文献</h2>
               <div id="chatSources" class="source-list"></div>
               <h2>对话范围</h2>
               <label class="radio-card"><input name="chatScope" type="radio" value="all" checked> 全部知识库</label>
@@ -362,15 +364,14 @@
               <div class="setting-card-head">
                 <span>6</span>
                 <h2>研究画像</h2>
+                <small id="profileSyncStatus">选择用户后自动加载画像</small>
               </div>
               <input id="profileUserId" placeholder="user_alice">
               <input id="scholarUrl" placeholder="Google Scholar URL">
               <input id="homepageUrl" placeholder="个人主页 URL">
               <input id="pdfPaths" placeholder="PDF 路径，用分号分隔">
+              <div id="profileInfoGrid" class="profile-info-grid" aria-live="polite"></div>
               <textarea id="naturalLanguage" rows="4" placeholder="研究方向描述"></textarea>
-              <div class="profile-tag-grid">
-                <span>retrieval</span><span>agent</span><span>memory</span><span>evaluation</span>
-              </div>
               <label class="checkline"><input id="resetProfile" type="checkbox"> 重置已有画像</label>
               <button id="saveProfileBtn" class="primary" type="button">保存画像</button>
             </section>

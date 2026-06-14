@@ -20,7 +20,7 @@ and adapt tomorrow's recommendations.
 ![Interest Drift](https://img.shields.io/badge/interest-drift-00897B.svg)
 ![Feishu/Lark](https://img.shields.io/badge/Feishu%2FLark-bot-00A1E9.svg)
 
-[Quick Start](#quick-start) | [Local GUI](#local-gui) |
+[Quick Start](#quick-start) | [Desktop Preview](#desktop-preview) | [Local GUI](#local-gui) |
 [GUI Preview](https://openraiser.github.io/PaperFlow/deployments/desktop/static/index.html?demo=1) |
 [CLI Usage](#cli-usage) |
 [Feedback Loop](docs/feedback-loop.md) |
@@ -59,6 +59,67 @@ webhook server alive for scheduled chat pushes.
   </tr>
 </table>
 
+## Desktop Preview
+
+PaperFlow now ships with an offline-first desktop browser GUI. It uses the same
+local SQLite state and backend workflows as the CLI, so the UI is not a static
+mock: paper pulls, feedback, reading reports, Wiki graph updates, and settings
+all route through the local backend.
+
+<div align="center">
+  <a href="docs/assets/readme/paperflow-desktop-demo.mp4">
+    <img src="docs/assets/readme/paperflow-desktop-demo.gif" alt="PaperFlow offline desktop workflow demo" width="92%">
+  </a>
+  <br>
+  <sub>
+    Desktop demo: daily paper stream -> Wiki graph -> cited Q&A -> reading reports -> local settings.
+    <br>
+    <a href="docs/assets/readme/paperflow-desktop-demo.mp4">Watch / download MP4</a>
+  </sub>
+</div>
+
+<br>
+
+<details>
+<summary>View desktop screenshots</summary>
+
+<table>
+  <tr>
+    <td width="50%">
+      <img src="docs/assets/readme/paperflow-desktop-papers.png" alt="PaperFlow daily paper recommendation stream">
+      <br><b>Daily paper stream</b><br>
+      Date-aware pulls, source filters, candidate metrics, paper actions, and backend task state.
+    </td>
+    <td width="50%">
+      <img src="docs/assets/readme/paperflow-desktop-wiki.png" alt="PaperFlow knowledge Wiki graph">
+      <br><b>Knowledge Wiki graph</b><br>
+      Backend-derived paper, topic, method, profile, and citation relationships.
+    </td>
+  </tr>
+  <tr>
+    <td width="50%">
+      <img src="docs/assets/readme/paperflow-desktop-chat.png" alt="PaperFlow cited local Wiki question answering">
+      <br><b>Cited Wiki Q&A</b><br>
+      Streamed answers with clickable reference markers and source cards.
+    </td>
+    <td width="50%">
+      <img src="docs/assets/readme/paperflow-desktop-settings.png" alt="PaperFlow local settings and source configuration">
+      <br><b>Local settings</b><br>
+      Provider keys, storage paths, paper-source modes, conference access, and export controls.
+    </td>
+  </tr>
+</table>
+
+</details>
+
+### Product Framework
+
+<img src="docs/assets/readme/paperflow-product-framework.png" alt="PaperFlow product framework diagram" width="100%">
+
+The desktop loop is intentionally local: profile state, paper pushes, feedback,
+reading reports, and Wiki nodes stay on disk unless you explicitly enable
+external providers or Feishu/Lark export.
+
 ## Why PaperFlow
 
 Scientific-paper recommendation is not a one-shot ranking problem. Real
@@ -81,6 +142,9 @@ the system adapt tomorrow?**
 | Daily recommendation | Fetches arXiv, OpenReview, and journal papers, then ranks a personalized daily digest |
 | Reading reports | Generates personalized paper reports from metadata and PDF content |
 | Feedback learning | Updates the same profile from CLI, GUI, Feishu/Lark, selected, skipped, read, and natural-language feedback |
+| Local research Wiki | Ingests paper pushes, reports, citations, feedback, and profile signals into a queryable local graph |
+| Cited Wiki Q&A | Answers with local evidence when retrieval is needed, supports clickable citations and explicit `@`-style references |
+| Offline desktop GUI | Provides a local UI for daily pulls, feedback, report reading, Wiki graph inspection, Q&A, and settings |
 | Drift adaptation | Tracks short-window vs long-window interest movement across days |
 | Feishu/Lark bot | Sends daily pushes and weekly reports; routes chat feedback and PDF requests |
 | Benchmark tooling | Packages, downloads, predicts, and evaluates PaperFlow-Bench submissions |
@@ -258,12 +322,20 @@ mock-data preview:
 [PaperFlow GUI Preview](https://openraiser.github.io/PaperFlow/deployments/desktop/static/index.html?demo=1).
 
 The GUI uses the same local SQLite database as the CLI. It is designed for the
-real daily workflow: select a user profile, run or load the latest daily push,
-mark papers for reading, mark explicit negative feedback, generate local
-Markdown reading reports, manage must-read anchors, read an arXiv ID or local
-PDF directly, manage local research roles, filter feedback history, and search
-the PaperFlow Wiki. It does not run background schedules; scheduled
-Feishu/Lark delivery still uses `deployments/feishu/`.
+real daily workflow, not a standalone mock:
+
+- select a user profile and inspect the profile-derived direction summary
+- pull papers for today's date, or intentionally fetch a previous date window
+- keep long-running daily pulls in backend task state while the UI polls status
+- mark papers as precision-read, not interested, or later
+- submit feedback and update the local profile/Wiki signal path
+- generate or reopen reading reports from paper cards
+- inspect the backend-derived Wiki graph and search local knowledge nodes
+- ask questions over the local Wiki with clickable references
+- configure providers, source modes, storage paths, and export behavior
+
+The desktop GUI does not run background schedules. Scheduled Feishu/Lark
+delivery still uses `deployments/feishu/`.
 
 Useful options:
 

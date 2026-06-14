@@ -1,6 +1,6 @@
 """LLM provider abstraction.
 
-The :class:`LLMProvider` protocol exposes a single ``generate`` entry point.
+The :class:`LLMProvider` protocol exposes synchronous and streaming generation.
 Concrete implementations target OpenAI-compatible APIs, Anthropic's API, a
 local Ollama server, and a deterministic mock for offline tests.
 """
@@ -11,7 +11,7 @@ import hashlib
 import json
 import os
 from dataclasses import dataclass
-from typing import Iterable, Optional, Protocol
+from typing import Iterator, Optional, Protocol
 
 import requests
 
@@ -41,6 +41,27 @@ class LLMProvider(Protocol):
         temperature: float = 0.0,
         max_tokens: int = 1024,
     ) -> LLMResponse: ...
+
+    def stream_generate(
+        self,
+        prompt: str,
+        *,
+        system: Optional[str] = None,
+        temperature: float = 0.0,
+        max_tokens: int = 1024,
+    ) -> Iterator[str]: ...
+
+
+def _chunk_text(text: str, size: int = 24) -> Iterator[str]:
+    content = str(text or "")
+    for index in range(0, len(content), max(1, int(size))):
+        yield content[index : index + size]
+
+
+def _field(value: object, name: str, default: object = None) -> object:
+    if isinstance(value, dict):
+        return value.get(name, default)
+    return getattr(value, name, default)
 
 
 class OpenAILLM:
@@ -80,6 +101,35 @@ class OpenAILLM:
             prompt_tokens=getattr(usage, "prompt_tokens", 0) or 0,
             completion_tokens=getattr(usage, "completion_tokens", 0) or 0,
         )
+
+    def stream_generate(
+        self,
+        prompt: str,
+        *,
+        system: Optional[str] = None,
+        temperature: float = 0.0,
+        max_tokens: int = 1024,
+    ) -> Iterator[str]:
+        messages: list[dict[str, str]] = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+
+        stream = self._client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            stream=True,
+        )
+        for chunk in stream:
+            choices = _field(chunk, "choices", []) or []
+            if not choices:
+                continue
+            delta = _field(choices[0], "delta", None)
+            text = _field(delta, "content", None) if delta is not None else None
+            if text:
+                yield str(text)
 
 
 class AnthropicLLM:
@@ -122,6 +172,28 @@ class AnthropicLLM:
             completion_tokens=getattr(response.usage, "output_tokens", 0) or 0,
         )
 
+    def stream_generate(
+        self,
+        prompt: str,
+        *,
+        system: Optional[str] = None,
+        temperature: float = 0.0,
+        max_tokens: int = 1024,
+    ) -> Iterator[str]:
+        kwargs = {
+            "model": self.model,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        if system:
+            kwargs["system"] = system
+
+        with self._client.messages.stream(**kwargs) as stream:
+            for text in stream.text_stream:
+                if text:
+                    yield text
+
 
 class OllamaLLM:
     name = "ollama"
@@ -163,6 +235,40 @@ class OllamaLLM:
             completion_tokens=int(data.get("eval_count") or 0),
         )
 
+    def stream_generate(
+        self,
+        prompt: str,
+        *,
+        system: Optional[str] = None,
+        temperature: float = 0.0,
+        max_tokens: int = 1024,
+    ) -> Iterator[str]:
+        payload: dict[str, object] = {
+            "model": self.model,
+            "prompt": prompt,
+            "stream": True,
+            "options": {"temperature": temperature, "num_predict": max_tokens},
+        }
+        if system:
+            payload["system"] = system
+
+        with requests.post(
+            f"{self._base_url}/api/generate",
+            json=payload,
+            timeout=self._timeout,
+            stream=True,
+        ) as response:
+            response.raise_for_status()
+            for line in response.iter_lines(decode_unicode=True):
+                if not line:
+                    continue
+                data = json.loads(line)
+                text = str(data.get("response") or "")
+                if text:
+                    yield text
+                if data.get("done"):
+                    break
+
 
 class MockLLM:
     """Deterministic offline backend used when no credentials are available.
@@ -188,6 +294,16 @@ class MockLLM:
         digest = hashlib.sha256((system or "").encode("utf-8") + b"||" + prompt.encode("utf-8")).hexdigest()
         text = f"[mock-llm:{digest[:12]}] {prompt[:120]}"
         return LLMResponse(text=text, model=self.model, provider=self.name)
+
+    def stream_generate(
+        self,
+        prompt: str,
+        *,
+        system: Optional[str] = None,
+        temperature: float = 0.0,
+        max_tokens: int = 1024,
+    ) -> Iterator[str]:
+        yield from _chunk_text(self.generate(prompt, system=system, temperature=temperature, max_tokens=max_tokens).text)
 
 
 def _is_placeholder(value: Optional[str]) -> bool:

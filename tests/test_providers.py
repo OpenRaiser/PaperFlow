@@ -24,6 +24,7 @@ from paperflow.providers.llm import (
     LLMResponse,
     OllamaLLM,
     OpenAILLM,
+    _field,
 )
 
 
@@ -127,6 +128,27 @@ def test_mock_llm_is_deterministic() -> None:
     assert a.text != c.text
     assert a.provider == "mock"
     assert a.model == "mock-llm"
+
+
+@pytest.mark.unit
+def test_mock_llm_stream_matches_sync_text() -> None:
+    llm = MockLLM()
+    prompt = "hello " * 20
+    sync = llm.generate(prompt, system="sys")
+    chunks = list(llm.stream_generate(prompt, system="sys"))
+
+    assert chunks
+    assert "".join(chunks) == sync.text
+
+
+@pytest.mark.unit
+def test_openai_stream_field_helper_accepts_dict_and_objects() -> None:
+    class Obj:
+        content = "object-content"
+
+    assert _field({"content": "dict-content"}, "content") == "dict-content"
+    assert _field(Obj(), "content") == "object-content"
+    assert _field({}, "missing", "fallback") == "fallback"
 
 
 @pytest.mark.unit

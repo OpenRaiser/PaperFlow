@@ -32,6 +32,18 @@ def _json_bytes(payload: Dict[str, Any]) -> bytes:
     return json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
 
 
+def _sse_bytes(event: str, payload: Dict[str, Any]) -> bytes:
+    data = json.dumps(payload, ensure_ascii=False)
+    return f"event: {event}\ndata: {data}\n\n".encode("utf-8")
+
+
+def _stream_chunks(text: str, size: int = 18) -> list[str]:
+    content = str(text or "")
+    if not content:
+        return [""]
+    return [content[index : index + size] for index in range(0, len(content), size)]
+
+
 def _read_json(handler: BaseHTTPRequestHandler) -> Dict[str, Any]:
     length = int(handler.headers.get("Content-Length") or 0)
     if length <= 0:
@@ -295,6 +307,7 @@ def _api_wiki_ask(_query_params: Dict[str, Any], body: Dict[str, Any]) -> Dict[s
         question=str(body.get("question") or "").strip(),
         scope=str(body.get("scope") or "all").strip(),
         limit=int(body.get("limit") or 8),
+        mentions=body.get("mentions") or [],
     )
 
 
@@ -354,6 +367,7 @@ POST_ROUTES: Dict[str, ApiHandler] = {
     "/api/read/pdf": _api_read_pdf,
     "/api/submit": _api_submit,
     "/api/wiki/ask": _api_wiki_ask,
+    "/api/wiki/ask/stream": _api_wiki_ask,
     "/api/wiki/node": _api_wiki_node,
     "/api/export": _api_export,
     "/api/must-read": _api_must_read_update,
@@ -398,6 +412,29 @@ class PaperFlowGuiHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             self._send_json({"ok": False, "error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
 
+    def _send_sse_event(self, event: str, payload: Dict[str, Any]) -> None:
+        self.wfile.write(_sse_bytes(event, payload))
+        self.wfile.flush()
+
+    def _handle_wiki_ask_stream(self, body: Dict[str, Any]) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        try:
+            self._send_sse_event("status", {"text": "正在检索本地 Wiki 与引用来源"})
+            for event in agents.wiki_ask_stream(
+                user_id=str(body.get("user_id") or "").strip(),
+                question=str(body.get("question") or "").strip(),
+                scope=str(body.get("scope") or "all").strip(),
+                limit=int(body.get("limit") or 8),
+                mentions=body.get("mentions") or [],
+            ):
+                self._send_sse_event(str(event.get("event") or "message"), {"ok": True, **(event.get("data") or {})})
+        except Exception as exc:
+            self._send_sse_event("error", {"ok": False, "error": str(exc)})
+
     def do_GET(self) -> None:  # noqa: N802 - stdlib hook
         path, _query_params = _query(self.path)
         if path.startswith("/api/"):
@@ -422,6 +459,10 @@ class PaperFlowGuiHandler(BaseHTTPRequestHandler):
             body = _read_json(self)
         except ValueError as exc:
             self._send_json({"ok": False, "error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
+        path, _query_params = _query(self.path)
+        if path == "/api/wiki/ask/stream":
+            self._handle_wiki_ask_stream(body)
             return
         self._handle_api(POST_ROUTES, body)
 

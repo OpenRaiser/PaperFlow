@@ -21,7 +21,16 @@
     wikiMap: null,
     currentWikiNodeId: "",
     currentWikiEditNodeId: "",
-    wikiView: "graph"
+    wikiView: "graph",
+    currentProfile: null,
+    profileLoadToken: 0,
+    chatMentions: [],
+    mentionSearchTimer: null,
+    mentionSearchToken: 0,
+    dailyTaskId: "",
+    dailyTaskUserId: "",
+    dailyPollToken: 0,
+    dailyPolling: false
   };
 
   const demoPapers = [
@@ -178,11 +187,86 @@
   ].map(([src_id, dst_id]) => ({ src_id, dst_id, relation: "related", weight: 1 }));
 
   const demoSources = [
-    { title: "Efficient Test-Time Scaling for Reasoning Agents", meta: "精读报告 · 高度相关" },
-    { title: "Multi-Modal RAG with Structured Memory", meta: "精读报告 · 高度相关" },
-    { title: "Wiki: 结构化记忆", meta: "知识节点 · 中等相关" },
-    { title: "OpenReview Signals for Personalized Recommendation", meta: "候选论文 · 中等相关" }
+    {
+      index: 1,
+      node_id: "paper:reasoning-agents",
+      node_type: "paper",
+      title: "Efficient Test-Time Scaling for Reasoning Agents",
+      meta: "精读报告 · 高度相关",
+      excerpt: "围绕 test-time scaling、uncertainty routing 与 benchmark 提升展开。"
+    },
+    {
+      index: 2,
+      node_id: "paper:structured-memory",
+      node_type: "paper",
+      title: "Multi-Modal RAG with Structured Memory",
+      meta: "精读报告 · 高度相关",
+      excerpt: "把多模态检索和结构化记忆合并到长上下文 QA。"
+    },
+    {
+      index: 3,
+      node_id: "paper:citation-feedback",
+      node_type: "paper",
+      title: "Learning to Summarize Scientific Papers with Citation-Aware Feedback",
+      meta: "精读报告 · 中等相关",
+      excerpt: "跨论文沉淀的 memory slot、引用关系和上下文片段。"
+    },
+    {
+      index: 4,
+      node_id: "paper:openreview-signals",
+      node_type: "paper",
+      title: "OpenReview Signals for Personalized Recommendation",
+      meta: "候选论文 · 中等相关",
+      excerpt: "结合 peer-review signals 改进个性化论文推荐。"
+    }
   ];
+
+  const demoProfiles = {
+    user_demo: {
+      user_id: "user_demo",
+      version: "0.2",
+      updated_at: "2026-06-10",
+      description: "关注科研阅读 agent、结构化记忆、个性化论文推荐和可追溯精读报告。",
+      scholar_url: "https://scholar.google.com/citations?user=demo",
+      homepage_url: "https://paperflow.local/demo",
+      pdf_paths: ["data/papers/demo-profile.pdf"],
+      core_directions: {
+        "scientific reading agents": 0.92,
+        "structured memory": 0.86,
+        "personalized recommendation": 0.8
+      },
+      topic_weights: {
+        "RAG": 0.78,
+        "agent evaluation": 0.74,
+        "citation grounding": 0.69
+      },
+      must_read: { authors: ["Yoshua Bengio"], institutions: ["Stanford"], keywords: ["agent memory", "scientific discovery"] }
+    },
+    user_lab: {
+      user_id: "user_lab",
+      version: "0.1",
+      updated_at: "2026-06-09",
+      description: "实验室视角，偏向多模态科研工作流、评测基准和论文到知识库的自动归档。",
+      core_directions: {
+        "multimodal research workflow": 0.84,
+        "benchmark evaluation": 0.78,
+        "knowledge ingestion": 0.73
+      },
+      topic_weights: { "workflow automation": 0.82, "offline wiki": 0.76 }
+    },
+    user_founder: {
+      user_id: "user_founder",
+      version: "0.1",
+      updated_at: "2026-06-08",
+      description: "产品和方向判断视角，关注用户反馈、研究机会发现和高价值论文筛选。",
+      core_directions: {
+        "product-led research": 0.82,
+        "user feedback learning": 0.77,
+        "opportunity discovery": 0.74
+      },
+      topic_weights: { "paper triage": 0.8, "research strategy": 0.72 }
+    }
+  };
 
   const $ = (id) => document.getElementById(id);
 
@@ -214,11 +298,24 @@
     const daysInput = $("daysInput");
     const runButton = $("runDailyBtn");
     if (!dateInput || !daysInput || !runButton) return;
+    if (state.dailyPolling) {
+      runButton.disabled = true;
+      runButton.textContent = "后台运行中";
+      return;
+    }
     const today = todayDateValue();
     if (!dateInput.value) dateInput.value = today;
     if (dateInput.value > today) dateInput.value = today;
     daysInput.value = String(selectedDateFetchDays());
+    runButton.disabled = false;
     runButton.textContent = dateInput.value === today ? "拉取今日论文" : "拉取所选日期论文";
+  }
+
+  function setDailyTaskState(taskId = "", userId = "", polling = false) {
+    state.dailyTaskId = taskId || "";
+    state.dailyTaskUserId = userId || "";
+    state.dailyPolling = Boolean(polling && taskId);
+    syncDateControls();
   }
 
   function escapeHtml(value) {
@@ -406,17 +503,23 @@
       return {
         ok: true,
         nodes: [
-          { title: "结构化记忆", node_type: "topic", body: "跨论文沉淀的 memory slot、引用关系和上下文片段。", score: 0.91 },
-          { title: "RAG 评估", node_type: "method", body: "检索召回、引用准确率与回答可追溯性。", score: 0.84 },
-          { title: "Agent Memory", node_type: "frontier", body: "用于长期研究助手的个人化记忆机制。", score: 0.78 }
+          { node_id: "topic:structured-memory", title: "结构化记忆", node_type: "topic", body: "跨论文沉淀的 memory slot、引用关系和上下文片段。", score: 0.91 },
+          { node_id: "method:rag-eval", title: "RAG 评估", node_type: "method", body: "检索召回、引用准确率与回答可追溯性。", score: 0.84 },
+          { node_id: "frontier:agent-memory", title: "Agent Memory", node_type: "frontier", body: "用于长期研究助手的个人化记忆机制。", score: 0.78 }
         ]
       };
     }
     if (route === "/api/wiki/ask") {
       return {
         ok: true,
-        text: "基于最近的 5 篇论文和 3 个 Wiki 条目，RAG 方向的重点正在从单纯检索转向结构化记忆、引用可追溯和多模态证据融合。建议优先精读 test-time scaling 与 structured memory 两条线索。",
-        sources: demoSources
+        text: "基于最近的 5 篇论文和 3 个 Wiki 条目，RAG 方向的重点正在从单纯检索转向结构化记忆、引用可追溯和多模态证据融合。[1][2] 建议优先精读 test-time scaling 与 structured memory 两条线索。[3]",
+        mode: "wiki",
+        retrieval_required: true,
+        routing_reason: body.mentions?.length ? "explicit_mention" : "local_research_context",
+        citations: demoSources,
+        sources: demoSources,
+        mentions: body.mentions || [],
+        streaming: { provider: false, transport: "desktop-progressive" }
       };
     }
     if (route === "/api/wiki/node") {
@@ -455,7 +558,34 @@
       return { ok: true, format: body.format || "markdown", display_path: `data/desktop_exports/demo.${body.format === "zip" ? "zip" : "md"}`, count: 12 };
     }
     if (route === "/api/profile") {
-      return { ok: true, profile: { user_id: body.user_id || state.currentUser } };
+      const userId = body.user_id || url.searchParams.get("user_id") || state.currentUser;
+      const submitted = (options.method || "GET").toUpperCase() === "POST";
+      const raw = submitted
+        ? {
+            ...(demoProfiles[userId] || {}),
+            user_id: userId,
+            description: body.natural_language || demoProfiles[userId]?.description || "",
+            scholar_url: body.scholar_url || demoProfiles[userId]?.scholar_url || "",
+            homepage_url: body.homepage_url || demoProfiles[userId]?.homepage_url || "",
+            pdf_paths: body.pdf_paths || demoProfiles[userId]?.pdf_paths || []
+          }
+        : (demoProfiles[userId] || { user_id: userId, description: "" });
+      const topDirections = Object.entries(raw.core_directions || {}).sort((a, b) => Number(b[1]) - Number(a[1])).slice(0, 8);
+      const topTopics = Object.entries(raw.topic_weights || {}).sort((a, b) => Number(b[1]) - Number(a[1])).slice(0, 8);
+      return {
+        ok: true,
+        profile: {
+          user_id: raw.user_id,
+          version: raw.version,
+          updated_at: raw.updated_at,
+          core_directions: raw.core_directions || {},
+          top_directions: topDirections,
+          top_topics: topTopics,
+          must_read: raw.must_read || {},
+          drift_state: raw.drift_state || {}
+        },
+        raw
+      };
     }
     return { ok: false, error: `Unknown demo API route: ${route}` };
   }
@@ -473,8 +603,13 @@
     }
     window.scrollTo({ top: 0, left: 0 });
     if (name === "reports" && !options.skipLoad) runAction(() => refreshReports({ keepSelection: true }), "加载报告");
-    if (name === "wiki") runAction(loadWiki, "加载 Wiki");
+    if (name === "wiki" && !options.skipLoad) runAction(loadWiki, "加载 Wiki");
     if (name === "settings") runAction(loadSettings, "加载设置");
+    if (name === "papers") {
+      resumeDailyTask().catch((error) => {
+        console.error(error);
+      });
+    }
   }
 
   function currentUser() {
@@ -483,7 +618,7 @@
 
   function normalizeUser(raw) {
     if (typeof raw === "string") {
-      return { user_id: raw, label: raw, is_current: false };
+      return { user_id: raw, label: raw, is_current: false, description: "", affiliation: "", has_profile: false, updated_at: "" };
     }
     const userId = raw?.user_id || raw?.id || raw?.name || "";
     const role = raw?.role_name ? `${raw.role_name} · ` : "";
@@ -491,6 +626,11 @@
     return {
       user_id: userId || label,
       label,
+      role_name: raw?.role_name || "",
+      description: raw?.description || "",
+      affiliation: raw?.affiliation || raw?.institution || raw?.organization || "",
+      has_profile: Boolean(raw?.has_profile),
+      updated_at: raw?.updated_at || "",
       is_current: Boolean(raw?.is_current)
     };
   }
@@ -503,6 +643,7 @@
     if (!ids.includes(state.currentUser)) state.currentUser = current.user_id;
     $("userSelect").innerHTML = state.users.map((user) => `<option value="${escapeHtml(user.user_id)}">${escapeHtml(user.label)}</option>`).join("");
     $("userSelect").value = state.currentUser;
+    if ($("profileUserId")) $("profileUserId").value = state.currentUser;
   }
 
   async function loadHealth() {
@@ -603,22 +744,31 @@
 
   async function runDaily() {
     syncDateControls();
+    if (state.dailyPolling && state.dailyTaskId) {
+      showFeedbackToast("success", "论文拉取仍在后台运行", `任务 ${state.dailyTaskId} 会在完成后自动刷新论文流。`);
+      return;
+    }
     const days = selectedDateFetchDays();
     $("daysInput").value = String(days);
     const options = collectDailyOptions();
+    const userId = currentUser();
     const runButton = $("runDailyBtn");
     runButton.disabled = true;
     runButton.textContent = "后台运行中";
+    const pollToken = ++state.dailyPollToken;
     try {
       const data = await api("/api/daily/start", {
         method: "POST",
-        body: JSON.stringify({ user_id: currentUser(), days, target_date: $("paperDate").value, limit_per_source: 100, ...options })
+        body: JSON.stringify({ user_id: userId, days, target_date: $("paperDate").value, limit_per_source: 100, ...options })
       });
+      const taskId = data.task?.task_id || "";
+      if (taskId) setDailyTaskState(taskId, userId, true);
       if (data.task) renderDailyTaskStatus(data.task);
-      await pollDailyTask(data.task?.task_id, data.push);
+      await pollDailyTask(taskId, data.push, userId, pollToken);
     } finally {
-      runButton.disabled = false;
-      syncDateControls();
+      if (pollToken === state.dailyPollToken) {
+        setDailyTaskState("", "", false);
+      }
     }
   }
 
@@ -644,14 +794,16 @@
     updateSelectionSummary();
   }
 
-  async function pollDailyTask(taskId, immediatePush = null) {
+  async function pollDailyTask(taskId, immediatePush = null, userId = currentUser(), pollToken = state.dailyPollToken) {
     if (!taskId) {
       renderPush(immediatePush || { papers: [], metadata: { total_fetched: 0, paper_count: 0 } });
       await loadWiki();
       return;
     }
-    for (let attempt = 0; attempt < 80; attempt += 1) {
-      const data = await api(`/api/daily/status?task_id=${encodeURIComponent(taskId)}&user_id=${encodeURIComponent(currentUser())}`);
+    setDailyTaskState(taskId, userId, true);
+    while (pollToken === state.dailyPollToken) {
+      const data = await api(`/api/daily/status?task_id=${encodeURIComponent(taskId)}&user_id=${encodeURIComponent(userId)}`);
+      if (pollToken !== state.dailyPollToken || currentUser() !== userId) return;
       const task = data.task;
       if (!task) break;
       if (task.status === "completed") {
@@ -665,8 +817,24 @@
       renderDailyTaskStatus(task);
       await new Promise((resolve) => window.setTimeout(resolve, 900));
     }
-    await loadLatestPush();
-    await loadWiki();
+  }
+
+  async function resumeDailyTask() {
+    if (state.dailyPolling) return;
+    const userId = currentUser();
+    const data = await api(`/api/daily/status?user_id=${encodeURIComponent(userId)}`);
+    const task = data.task;
+    if (!task || !["queued", "running"].includes(task.status)) return;
+    const pollToken = ++state.dailyPollToken;
+    setDailyTaskState(task.task_id, userId, true);
+    renderDailyTaskStatus(task);
+    pollDailyTask(task.task_id, null, userId, pollToken).catch((error) => {
+      if (pollToken !== state.dailyPollToken) return;
+      setDailyTaskState("", "", false);
+      showFeedbackToast("error", "论文拉取失败", error.message || String(error));
+    }).finally(() => {
+      if (pollToken === state.dailyPollToken) setDailyTaskState("", "", false);
+    });
   }
 
   function updateSelectionSummary() {
@@ -1706,48 +1874,374 @@
     if (state.wikiView === "list") renderWikiList();
   }
 
-  function renderChatSources(sources = DEMO_MODE ? demoSources : []) {
-    const items = Array.isArray(sources) ? sources : [];
-    $("chatSources").className = items.length ? "source-list" : "source-list empty";
-    $("chatSources").innerHTML = items.length ? items.map((source) => `
-      <div class="source-card">
-        <h3>${escapeHtml(source.title)}</h3>
-        <p>${escapeHtml(source.meta || source.snippet || "")}</p>
+  function normalizeCitationSource(source, index = 0) {
+    const metadata = source?.metadata || {};
+    const citationIndex = Number(source?.index || index + 1);
+    const nodeType = source?.node_type || source?.type || "";
+    const sourceType = source?.source_type || "";
+    const sourceId = source?.source_id || "";
+    const meta = source?.meta || [sourceType, sourceId].filter(Boolean).join(" · ") || "参考文献";
+    const title = String(source?.title || source?.node_id || `参考文献 ${citationIndex}`).replace(/^Wiki:\s*/i, "").replace(/^Q\d+[\s:-]*/i, "");
+    return {
+      index: citationIndex,
+      node_id: source?.node_id || source?.id || "",
+      node_type: nodeType,
+      title,
+      meta,
+      snippet: source?.snippet || source?.excerpt || source?.body || "",
+      source_type: sourceType,
+      source_id: sourceId,
+      anchor: source?.anchor || "",
+      url: source?.url || metadata.url || metadata.abs_url || metadata.pdf_url || "",
+      metadata
+    };
+  }
+
+  function normalizeCitations(data) {
+    const raw = Array.isArray(data?.citations) && data.citations.length ? data.citations : data?.sources;
+    const items = Array.isArray(raw) ? raw : DEMO_MODE ? demoSources : [];
+    return items.map((source, index) => normalizeCitationSource(source, index));
+  }
+
+  function renderAnswerWithCitations(text, citations = []) {
+    const refs = new Map(citations.map((citation) => [String(citation.index), citation]));
+    const escaped = escapeHtml(text || "");
+    if (!escaped) return "<p>正在生成回答...</p>";
+    const linked = escaped.replace(/\[(\d{1,3})\]/g, (match, index) => {
+      if (!refs.has(String(index))) return match;
+      const citation = refs.get(String(index));
+      return `<button type="button" class="citation-ref" data-citation-index="${index}" title="${escapeHtml(citation.title)}">[${index}]</button>`;
+    });
+    return linked
+      .split(/\n{2,}/)
+      .map((block) => `<p>${block.replace(/\n/g, "<br>")}</p>`)
+      .join("");
+  }
+
+  function routingLabel(reason) {
+    return {
+      explicit_mention: "@ 指定来源",
+      local_research_context: "本地证据",
+      scope_recent: "最近 7 天",
+      scope_profile: "当前方向",
+      general_question: "通用问题",
+      no_local_context_signal: "直接回答"
+    }[reason] || reason || "";
+  }
+
+  function renderAnswerMeta(data = {}, citations = []) {
+    const wikiMode = data.retrieval_required !== false && data.mode !== "direct";
+    const modeText = wikiMode ? `参考文献 · ${citations.length} 条` : "直接回答";
+    const route = wikiMode ? "" : routingLabel(data.routing_reason);
+    return `
+      <div class="answer-meta">
+        <span class="${wikiMode ? "wiki" : "direct"}">${escapeHtml(modeText)}</span>
+        ${route ? `<span>${escapeHtml(route)}</span>` : ""}
+        <span>流式输出</span>
       </div>
-    `).join("") : "暂无后端引用来源。";
+    `;
+  }
+
+  function renderChatSources(sources = DEMO_MODE ? demoSources : []) {
+    const items = Array.isArray(sources) ? sources.map((source, index) => normalizeCitationSource(source, index)) : [];
+    $("chatSources").className = items.length ? "source-list" : "source-list empty";
+    $("chatSources").innerHTML = items.length ? items.map((source) => {
+      const openControl = source.url
+        ? `<a href="${escapeHtml(source.url)}" target="_blank" rel="noreferrer">打开原文</a>`
+        : `<button type="button" data-open-citation-source data-node-id="${escapeHtml(source.node_id)}" data-title="${escapeHtml(source.title)}">查看来源</button>`;
+      return `
+        <div class="source-card citation-card" tabindex="0" data-citation-index="${escapeHtml(source.index)}" data-node-id="${escapeHtml(source.node_id)}" data-title="${escapeHtml(source.title)}">
+          <h3>[${escapeHtml(source.index)}] ${escapeHtml(source.title)}</h3>
+          <p>${escapeHtml(source.meta)}</p>
+          ${source.snippet ? `<p>${escapeHtml(source.snippet)}</p>` : ""}
+          ${openControl}
+        </div>
+      `;
+    }).join("") : "暂无参考文献。";
+  }
+
+  function focusCitationSource(index) {
+    const card = document.querySelector(`#chatSources [data-citation-index="${CSS.escape(String(index))}"]`);
+    if (!card) return;
+    document.querySelectorAll("#chatSources .source-card.active").forEach((item) => item.classList.remove("active"));
+    card.classList.add("active");
+    card.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    window.setTimeout(() => card.classList.remove("active"), 2600);
+  }
+
+  async function openCitationSource(nodeId, title) {
+    setView("wiki", true, { skipLoad: true });
+    $("wikiQuery").value = title || nodeId || "";
+    await searchWiki();
+  }
+
+  function chunkText(text) {
+    const content = String(text || "");
+    if (!content) return [""];
+    const chunks = [];
+    for (let index = 0; index < content.length; index += 12) {
+      chunks.push(content.slice(index, index + 12));
+    }
+    return chunks;
+  }
+
+  async function streamAnswerText(target, text, citations) {
+    target.classList.remove("loading");
+    let partial = "";
+    for (const chunk of chunkText(text)) {
+      partial += chunk;
+      target.innerHTML = renderAnswerWithCitations(partial, citations);
+      $("chatThread").scrollTop = $("chatThread").scrollHeight;
+      await new Promise((resolve) => window.setTimeout(resolve, 12));
+    }
+  }
+
+  function parseSseFrame(frame) {
+    const lines = frame.split(/\r?\n/);
+    let event = "message";
+    const dataLines = [];
+    lines.forEach((line) => {
+      if (line.startsWith("event:")) event = line.slice(6).trim();
+      if (line.startsWith("data:")) dataLines.push(line.slice(5).trimStart());
+    });
+    if (!dataLines.length) return null;
+    return { event, data: JSON.parse(dataLines.join("\n")) };
+  }
+
+  async function streamWikiAsk(payload, answerTarget, message) {
+    const response = await fetch("/api/wiki/ask/stream", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+    if (!response.ok || !response.body) throw new Error("流式问答接口不可用");
+
+    const decoder = new TextDecoder();
+    const reader = response.body.getReader();
+    let buffer = "";
+    let text = "";
+    let result = {};
+    let citations = [];
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const frames = buffer.split(/\n\n/);
+      buffer = frames.pop() || "";
+      for (const frame of frames) {
+        if (!frame.trim()) continue;
+        const parsed = parseSseFrame(frame);
+        if (!parsed) continue;
+        if (parsed.event === "error") throw new Error(parsed.data.error || "流式问答失败");
+        if (parsed.event === "status") {
+          answerTarget.innerHTML = `<p>${escapeHtml(parsed.data.text || "正在生成回答")}</p>`;
+        }
+        if (parsed.event === "meta") {
+          result = { ...result, ...parsed.data };
+          citations = normalizeCitations(parsed.data);
+          const metaTarget = message.querySelector(".answer-meta");
+          if (metaTarget) metaTarget.outerHTML = renderAnswerMeta(parsed.data, citations);
+          renderChatSources(citations);
+        }
+        if (parsed.event === "chunk") {
+          text += parsed.data.text || "";
+          answerTarget.classList.remove("loading");
+          answerTarget.innerHTML = renderAnswerWithCitations(text, citations);
+          $("chatThread").scrollTop = $("chatThread").scrollHeight;
+        }
+        if (parsed.event === "done") {
+          result = { ...result, ...parsed.data };
+          text = parsed.data.text || text;
+          citations = normalizeCitations(parsed.data);
+          const metaTarget = message.querySelector(".answer-meta");
+          if (metaTarget) metaTarget.outerHTML = renderAnswerMeta(parsed.data, citations);
+          answerTarget.classList.remove("loading");
+          answerTarget.innerHTML = renderAnswerWithCitations(text, citations);
+          renderChatSources(citations);
+        }
+      }
+    }
+    return { ...result, text, citations };
+  }
+
+  function mentionQueryAtCursor() {
+    const input = $("chatInput");
+    const cursor = input.selectionStart ?? input.value.length;
+    const before = input.value.slice(0, cursor);
+    const match = before.match(/@([^\s@\]\)（），。；;、,]*)$/);
+    if (!match) return null;
+    return {
+      query: match[1] || "",
+      start: cursor - match[0].length,
+      end: cursor
+    };
+  }
+
+  function renderChatMentionChips() {
+    const target = $("chatMentionChips");
+    const mentions = state.chatMentions || [];
+    target.hidden = !mentions.length;
+    target.innerHTML = mentions.map((mention) => `
+      <span class="mention-chip" data-node-id="${escapeHtml(mention.node_id)}">
+        @${escapeHtml(mention.title)}
+        <button type="button" data-remove-mention="${escapeHtml(mention.node_id)}" aria-label="移除 ${escapeHtml(mention.title)}">×</button>
+      </span>
+    `).join("");
+  }
+
+  function renderMentionSuggestions(nodes = []) {
+    const panel = $("mentionSuggestions");
+    const items = Array.isArray(nodes) ? nodes.slice(0, 6) : [];
+    panel.hidden = !items.length;
+    panel.innerHTML = items.map((node) => {
+      const nodeId = node.node_id || node.id || node.title || "";
+      const title = node.title || nodeId || "未命名节点";
+      const meta = [node.node_type || node.type || "Wiki", node.score ? `匹配 ${Math.round(Number(node.score) * 100)}%` : ""].filter(Boolean).join(" · ");
+      const body = node.body || node.snippet || "";
+      return `
+        <button type="button" data-mention-node-id="${escapeHtml(nodeId)}" data-title="${escapeHtml(title)}" data-node-type="${escapeHtml(node.node_type || node.type || "")}">
+          <strong>@${escapeHtml(title)}</strong>
+          <span>${escapeHtml(meta)}${body ? ` · ${escapeHtml(String(body).slice(0, 70))}` : ""}</span>
+        </button>
+      `;
+    }).join("");
+  }
+
+  async function searchMentionSuggestions() {
+    const context = mentionQueryAtCursor();
+    if (!context) {
+      $("mentionSuggestions").hidden = true;
+      return;
+    }
+    const token = ++state.mentionSearchToken;
+    const data = await api(`/api/wiki/search?user_id=${encodeURIComponent(currentUser())}&q=${encodeURIComponent(context.query)}&limit=6`);
+    if (token !== state.mentionSearchToken) return;
+    renderMentionSuggestions(data.nodes || []);
+  }
+
+  function scheduleMentionSearch() {
+    window.clearTimeout(state.mentionSearchTimer);
+    state.mentionSearchTimer = window.setTimeout(() => {
+      searchMentionSuggestions().catch((error) => console.warn("Mention search failed.", error));
+    }, 160);
+  }
+
+  function insertMention(node) {
+    const input = $("chatInput");
+    const context = mentionQueryAtCursor();
+    const title = node.title || node.node_id || "Wiki";
+    const nodeId = node.node_id || node.id || title;
+    const mentionText = `@[${title}](${nodeId})`;
+    const start = context?.start ?? input.selectionStart ?? input.value.length;
+    const end = context?.end ?? input.selectionEnd ?? input.value.length;
+    input.value = `${input.value.slice(0, start)}${mentionText} ${input.value.slice(end)}`;
+    const cursor = start + mentionText.length + 1;
+    input.setSelectionRange(cursor, cursor);
+    if (!state.chatMentions.some((mention) => mention.node_id === nodeId)) {
+      state.chatMentions.push({
+        node_id: nodeId,
+        title,
+        node_type: node.node_type || node.type || ""
+      });
+    }
+    renderChatMentionChips();
+    window.clearTimeout(state.mentionSearchTimer);
+    state.mentionSearchToken += 1;
+    $("mentionSuggestions").hidden = true;
+    input.focus();
+  }
+
+  function activeMentionsForQuestion(question) {
+    const selected = state.chatMentions.filter((mention) => {
+      const nodeId = mention.node_id || "";
+      const title = mention.title || "";
+      return (nodeId && question.includes(nodeId)) || (title && question.includes(title));
+    });
+    return selected.map((mention) => ({
+      node_id: mention.node_id,
+      title: mention.title,
+      node_type: mention.node_type
+    }));
+  }
+
+  function clearChatMentions() {
+    state.chatMentions = [];
+    renderChatMentionChips();
   }
 
   async function askWiki() {
-    const question = $("chatInput").value.trim();
+    const input = $("chatInput");
+    const button = $("wikiAskBtn");
+    const question = input.value.trim();
     if (!question) return;
+    const payload = {
+      user_id: currentUser(),
+      question,
+      scope: document.querySelector("input[name='chatScope']:checked")?.value || "all",
+      limit: 8,
+      mentions: activeMentionsForQuestion(question)
+    };
     $("chatThread").insertAdjacentHTML("beforeend", `
       <div class="message user">
         <div class="avatar">我</div>
         <div class="bubble"><p>${escapeHtml(question)}</p></div>
       </div>
     `);
-    $("chatInput").value = "";
-    const data = await api("/api/wiki/ask", {
-      method: "POST",
-      body: JSON.stringify({
-        user_id: currentUser(),
-        question,
-        scope: document.querySelector("input[name='chatScope']:checked")?.value || "all",
-        limit: 8
-      })
-    });
-    const sources = Array.isArray(data.sources) ? data.sources : DEMO_MODE ? demoSources : [];
+    input.value = "";
+    clearChatMentions();
+    window.clearTimeout(state.mentionSearchTimer);
+    state.mentionSearchToken += 1;
+    $("mentionSuggestions").hidden = true;
+
+    const messageId = `assistant-${Date.now()}`;
     $("chatThread").insertAdjacentHTML("beforeend", `
-      <div class="message assistant">
+      <div class="message assistant" id="${messageId}">
         <div class="avatar">AI</div>
         <div class="bubble">
-          <p>${escapeHtml(data.text || "")}</p>
-          ${sources.length ? `<div class="citation-row">${sources.slice(0, 4).map((source) => `<span>${escapeHtml(source.title)}</span>`).join("")}</div>` : ""}
+          <div class="answer-meta"><span>准备回答</span></div>
+          <div class="answer-text loading"><p>正在生成回答...</p></div>
         </div>
       </div>
     `);
-    renderChatSources(sources);
-    $("chatThread").scrollTop = $("chatThread").scrollHeight;
+    const message = $(messageId);
+    const metaTarget = message.querySelector(".answer-meta");
+    const answerTarget = message.querySelector(".answer-text");
+    const previousText = button.textContent;
+    button.disabled = true;
+    button.textContent = "生成中";
+
+    try {
+      let data;
+      if (DEMO_MODE) {
+        data = await api("/api/wiki/ask", { method: "POST", body: JSON.stringify(payload) });
+        const citations = normalizeCitations(data);
+        metaTarget.outerHTML = renderAnswerMeta(data, citations);
+        await streamAnswerText(answerTarget, data.text || "", citations);
+        renderChatSources(citations);
+      } else {
+        try {
+          data = await streamWikiAsk(payload, answerTarget, message);
+        } catch (streamError) {
+          console.warn("Streaming Wiki ask failed, falling back to JSON.", streamError);
+          data = await api("/api/wiki/ask", { method: "POST", body: JSON.stringify(payload) });
+          const citations = normalizeCitations(data);
+          const currentMeta = message.querySelector(".answer-meta");
+          if (currentMeta) currentMeta.outerHTML = renderAnswerMeta(data, citations);
+          await streamAnswerText(answerTarget, data.text || "", citations);
+          renderChatSources(citations);
+        }
+        const citations = normalizeCitations(data);
+      }
+      $("chatThread").scrollTop = $("chatThread").scrollHeight;
+    } catch (error) {
+      answerTarget.classList.remove("loading");
+      answerTarget.innerHTML = `<p>生成失败：${escapeHtml(error.message || String(error))}</p>`;
+      throw error;
+    } finally {
+      button.disabled = false;
+      button.textContent = previousText;
+    }
   }
 
   function envMap(data) {
@@ -1868,6 +2362,143 @@
     target.innerHTML = items.length
       ? items.map((item) => `<span>${escapeHtml(item)}</span>`).join("")
       : `<span>未配置</span>`;
+  }
+
+  function selectedUserInfo(userId = currentUser()) {
+    return state.users.find((user) => user.user_id === userId) || normalizeUser(userId);
+  }
+
+  function firstText(...values) {
+    for (const value of values) {
+      if (Array.isArray(value)) {
+        const joined = splitListValue(value).join("; ");
+        if (joined) return joined;
+      } else if (value && typeof value === "object") {
+        const text = value.url || value.href || value.path || value.value || "";
+        if (String(text).trim()) return String(text).trim();
+      } else if (String(value || "").trim()) {
+        return String(value).trim();
+      }
+    }
+    return "";
+  }
+
+  function pairLabel(item) {
+    if (Array.isArray(item)) return String(item[0] || "").trim();
+    if (item && typeof item === "object") return String(item.label || item.name || item.key || item.title || "").trim();
+    return String(item || "").trim();
+  }
+
+  function sortedProfilePairs(profile, raw, summaryKey, rawKey) {
+    const summaryItems = Array.isArray(profile?.[summaryKey]) ? profile[summaryKey] : [];
+    if (summaryItems.length) return summaryItems.map(pairLabel).filter(Boolean);
+    return Object.entries(raw?.[rawKey] || profile?.[rawKey] || {})
+      .sort((a, b) => Number(b[1]) - Number(a[1]))
+      .map(([key]) => key)
+      .filter(Boolean);
+  }
+
+  function profileMustReadValues(profile, raw) {
+    const mustRead = raw?.must_read || profile?.must_read || {};
+    return {
+      authors: splitListValue(mustRead.authors || []),
+      institutions: splitListValue(mustRead.institutions || []),
+      keywords: splitListValue(mustRead.keywords || [])
+    };
+  }
+
+  function listText(items, limit = 8) {
+    const values = splitListValue(items).slice(0, limit);
+    return values.length ? values.join("、") : "未记录";
+  }
+
+  function profileEditableDescription(raw, userInfo) {
+    return firstText(
+      raw?.description,
+      raw?.natural_language,
+      raw?.research_description,
+      raw?.summary,
+      userInfo?.description
+    );
+  }
+
+  function profileAffiliation(raw, userInfo) {
+    return firstText(
+      raw?.affiliation,
+      raw?.affiliations,
+      raw?.organization,
+      raw?.organizations,
+      raw?.institution,
+      raw?.user_info?.affiliation,
+      raw?.user_info?.organization,
+      raw?.metadata?.affiliation,
+      raw?.metadata?.organization,
+      userInfo?.affiliation
+    );
+  }
+
+  function profileInfoItem(label, value, variant = "") {
+    const normalized = firstText(value) || "未记录";
+    const emptyClass = normalized === "未记录" ? " empty" : "";
+    const variantClass = variant ? ` ${variant}` : "";
+    return `<div class="profile-info-item${variantClass}${emptyClass}"><span>${escapeHtml(label)}</span><strong>${escapeHtml(normalized)}</strong></div>`;
+  }
+
+  function renderProfileInfoGrid(profile, raw, userInfo, details) {
+    const target = $("profileInfoGrid");
+    if (!target) return;
+    const mustRead = profileMustReadValues(profile, raw);
+    const drift = profile?.drift_state || raw?.drift_state || {};
+    const updatedAt = firstText(profile?.updated_at, raw?.updated_at, userInfo?.updated_at);
+    target.innerHTML = [
+      profileInfoItem("用户", details.userId),
+      profileInfoItem("角色", userInfo?.role_name || userInfo?.label || ""),
+      profileInfoItem("版本", firstText(profile?.version, raw?.version)),
+      profileInfoItem("更新时间", updatedAt),
+      profileInfoItem("所属机构", profileAffiliation(raw, userInfo), "wide"),
+      profileInfoItem("方向", listText(details.directions, 8), "wide"),
+      profileInfoItem("关键词", listText(mustRead.keywords, 10), "wide"),
+      profileInfoItem("作者", listText(mustRead.authors, 8), "wide"),
+      profileInfoItem("关注机构", listText(mustRead.institutions, 8), "wide"),
+      profileInfoItem("主题", listText(details.topics, 10), "wide"),
+      profileInfoItem("漂移状态", firstText(drift.status, raw?.drift_status), "wide")
+    ].join("");
+  }
+
+  function setProfileSyncStatus(message) {
+    const target = $("profileSyncStatus");
+    if (target) target.textContent = message;
+  }
+
+  function renderProfileForm(data = {}) {
+    const profile = data.profile || {};
+    const raw = data.raw || {};
+    const userId = firstText(raw.user_id, profile.user_id, currentUser()) || "user_demo";
+    const userInfo = selectedUserInfo(userId);
+    const directions = sortedProfilePairs(profile, raw, "top_directions", "core_directions");
+    const topics = sortedProfilePairs(profile, raw, "top_topics", "topic_weights");
+
+    state.currentProfile = { profile, raw };
+    $("profileUserId").value = userId;
+    $("scholarUrl").value = firstText(raw.scholar_url, raw.scholar_profile?.url, raw.source_inputs?.scholar_url);
+    $("homepageUrl").value = firstText(raw.homepage_url, raw.homepage_profile?.url, raw.source_inputs?.homepage_url);
+    $("pdfPaths").value = firstText(raw.pdf_paths, raw.source_pdfs, raw.source_inputs?.pdf_paths);
+    renderProfileInfoGrid(profile, raw, userInfo, { userId, directions, topics });
+    $("naturalLanguage").value = profileEditableDescription(raw, userInfo);
+    $("resetProfile").checked = false;
+
+    const updatedAt = firstText(profile.updated_at, raw.updated_at, userInfo.updated_at);
+    setProfileSyncStatus(updatedAt ? `画像已加载 · ${updatedAt}` : (userInfo.has_profile ? "画像已加载" : "尚未生成画像，可在此补充"));
+  }
+
+  async function loadCurrentProfile() {
+    const userId = currentUser();
+    if (!userId) return;
+    const token = ++state.profileLoadToken;
+    setProfileSyncStatus("正在加载画像...");
+    const data = await api(`/api/profile?user_id=${encodeURIComponent(userId)}`);
+    if (token !== state.profileLoadToken) return;
+    renderProfileForm(data);
   }
 
   function conferenceAccessInfo(item) {
@@ -2040,6 +2671,7 @@
   async function loadSettings() {
     const data = await api("/api/settings");
     renderSettings(data);
+    await loadCurrentProfile();
   }
 
   async function saveSettings() {
@@ -2106,7 +2738,7 @@
   async function saveProfile() {
     const userId = $("profileUserId").value.trim() || currentUser();
     const pdfPaths = $("pdfPaths").value.split(";").map((item) => item.trim()).filter(Boolean);
-    await api("/api/profile", {
+    const data = await api("/api/profile", {
       method: "POST",
       body: JSON.stringify({
         user_id: userId,
@@ -2117,11 +2749,14 @@
         reset_existing: $("resetProfile").checked
       })
     });
+    state.currentUser = userId;
     if (!state.users.some((user) => user.user_id === userId)) {
       state.users.push(normalizeUser(userId));
       await loadUsers();
       $("userSelect").value = userId;
     }
+    renderProfileForm(data);
+    showSettingsMessage(`已加载 ${userId} 的画像信息。`);
   }
 
   function bindEvents() {
@@ -2129,12 +2764,19 @@
       button.addEventListener("click", () => setView(button.dataset.view));
     });
     window.addEventListener("hashchange", () => setView(window.location.hash.slice(1) || "papers", false));
-    $("refreshUsersBtn").addEventListener("click", () => runAction(loadUsers, "刷新用户"));
+    $("refreshUsersBtn").addEventListener("click", () => runAction(async () => {
+      await loadUsers();
+      await loadCurrentProfile();
+    }, "刷新用户"));
     $("userSelect").addEventListener("change", () => {
+      state.dailyPollToken += 1;
+      setDailyTaskState("", "", false);
       state.currentUser = currentUser();
       runAction(async () => {
         await loadLatestPush();
         await loadWiki();
+        await loadCurrentProfile();
+        await resumeDailyTask();
       }, "切换用户");
     });
 
@@ -2277,6 +2919,39 @@
     $("chatInput").addEventListener("keydown", (event) => {
       if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) runAction(askWiki, "生成回答");
     });
+    $("chatInput").addEventListener("input", scheduleMentionSearch);
+    $("chatInput").addEventListener("click", scheduleMentionSearch);
+    $("mentionSuggestions").addEventListener("click", (event) => {
+      const button = event.target.closest("[data-mention-node-id]");
+      if (!button) return;
+      insertMention({
+        node_id: button.dataset.mentionNodeId,
+        title: button.dataset.title,
+        node_type: button.dataset.nodeType
+      });
+    });
+    $("chatMentionChips").addEventListener("click", (event) => {
+      const button = event.target.closest("[data-remove-mention]");
+      if (!button) return;
+      const nodeId = button.dataset.removeMention;
+      state.chatMentions = state.chatMentions.filter((mention) => mention.node_id !== nodeId);
+      renderChatMentionChips();
+    });
+    $("chatThread").addEventListener("click", (event) => {
+      const button = event.target.closest(".citation-ref");
+      if (button) focusCitationSource(button.dataset.citationIndex);
+    });
+    $("chatSources").addEventListener("click", (event) => {
+      const openButton = event.target.closest("[data-open-citation-source]");
+      const card = event.target.closest(".citation-card");
+      if (openButton) {
+        runAction(() => openCitationSource(openButton.dataset.nodeId, openButton.dataset.title), "打开引用");
+        return;
+      }
+      if (card && !event.target.closest("a")) {
+        runAction(() => openCitationSource(card.dataset.nodeId, card.dataset.title), "打开引用");
+      }
+    });
     document.querySelectorAll(".quick-prompts button").forEach((button) => {
       button.addEventListener("click", () => {
         $("chatInput").value = button.dataset.prompt || "";
@@ -2349,6 +3024,7 @@
     await loadLatestPush();
     await loadWiki();
     await loadSettings();
+    await resumeDailyTask();
     const initialView = window.location.hash.slice(1) || "papers";
     setView(document.getElementById(initialView) ? initialView : "papers", false);
   }

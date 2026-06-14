@@ -172,6 +172,53 @@ def test_cli_daily_help_lists_options() -> None:
 
 
 @pytest.mark.unit
+def test_cli_daily_delegates_to_daily_push_agent(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run_python(script: Path, *args: str) -> int:
+        captured["script"] = script
+        captured["args"] = list(args)
+        return 0
+
+    monkeypatch.setattr("paperflow.cli._run_python", fake_run_python)
+
+    output = tmp_path / "push.txt"
+    result = runner.invoke(
+        app,
+        [
+            "daily",
+            "--user-id",
+            "user_cli",
+            "--days",
+            "3",
+            "--limit-per-source",
+            "77",
+            "--output",
+            str(output),
+            "--chat-id",
+            "chat_1",
+            "--send-feishu",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert str(captured["script"]).endswith(str(Path("daily-push-agent") / "main.py"))
+    assert captured["args"] == [
+        "--user-id",
+        "user_cli",
+        "--days",
+        "3",
+        "--limit-per-source",
+        "77",
+        "--output",
+        str(output),
+        "--chat-id",
+        "chat_1",
+        "--send-feishu",
+    ]
+
+
+@pytest.mark.unit
 def test_cli_eval_help_lists_options() -> None:
     result = runner.invoke(app, ["eval", "--help"])
     assert result.exit_code == 0

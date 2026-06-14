@@ -28,6 +28,17 @@ def test_desktop_server_routes_are_registered() -> None:
     assert "/api/provider-test" in server.POST_ROUTES
     assert "/api/daily/status" in server.GET_ROUTES
     assert "/api/daily/start" in server.POST_ROUTES
+    assert "/api/wiki/ask/stream" in server.POST_ROUTES
+
+
+def test_desktop_wiki_stream_helpers_emit_sse_frames() -> None:
+    frame = server._sse_bytes("chunk", {"text": "引用 [1]"})  # noqa: SLF001 - stream wire contract
+
+    assert frame.decode("utf-8") == 'event: chunk\ndata: {"text": "引用 [1]"}\n\n'
+    assert server._stream_chunks("abcdef", size=2) == ["ab", "cd", "ef"]  # noqa: SLF001
+    source = (PROJECT_ROOT / "deployments/desktop/server.py").read_text(encoding="utf-8")
+    assert "agents.wiki_ask_stream" in source
+    assert "_api_wiki_ask({}, body)" not in source
 
 
 def test_desktop_daily_target_date_controls_backend_fetch_window() -> None:
@@ -214,6 +225,212 @@ def test_desktop_wiki_node_update_preserves_node_metadata(monkeypatch: pytest.Mo
     assert captured["file_path"] == "topics/rag.md"
 
 
+def test_desktop_wiki_ask_routes_mentions_into_local_cited_answer(monkeypatch: pytest.MonkeyPatch) -> None:
+    selected_node = {
+        "node_id": "paper:structured-memory",
+        "node_type": "paper",
+        "title": "Structured Memory Paper",
+        "body": "Memory slots improve grounded retrieval.",
+        "metadata": {"url": "https://example.com/paper"},
+        "keywords": "memory rag",
+        "file_path": "reports/structured-memory.md",
+        "score": 0.95,
+        "updated_at": "2026-06-01",
+    }
+    captured = {}
+
+    monkeypatch.setattr(agents.wiki_db, "get_node", lambda user_id, node_id: selected_node if node_id == selected_node["node_id"] else None)
+    monkeypatch.setattr(agents.wiki_db, "search_nodes", lambda user_id, query, limit=5, node_type=None: [selected_node])
+
+    def fake_answer_question(user_id, question, *, limit=8, pinned_nodes=None):
+        captured["question"] = question
+        captured["limit"] = limit
+        captured["pinned_nodes"] = pinned_nodes or []
+        return {
+            "text": "结构化记忆方法更强调长期证据槽。[1]",
+            "citations": [
+                {
+                    "index": 1,
+                    "node_id": selected_node["node_id"],
+                    "title": selected_node["title"],
+                    "node_type": selected_node["node_type"],
+                    "excerpt": "Memory slots improve grounded retrieval.",
+                    "source_type": "reading_report",
+                    "source_id": "report-1",
+                    "metadata": selected_node["metadata"],
+                }
+            ],
+        }
+
+    monkeypatch.setattr(agents.wiki_answer, "answer_question", fake_answer_question)
+
+    payload = agents.wiki_ask(
+        "user_test",
+        "对比 @[Structured Memory Paper](paper:structured-memory) 的方法",
+        mentions=[{"node_id": "paper:structured-memory", "title": "Structured Memory Paper"}],
+    )
+
+    assert payload["mode"] == "wiki"
+    assert payload["retrieval_required"] is True
+    assert payload["routing_reason"] == "explicit_mention"
+    assert captured["pinned_nodes"][0]["node_id"] == "paper:structured-memory"
+    assert payload["sources"][0]["title"] == "Structured Memory Paper"
+    assert payload["sources"][0]["url"] == "https://example.com/paper"
+
+
+def test_desktop_wiki_ask_rolls_section_citations_up_to_paper_reference(monkeypatch: pytest.MonkeyPatch) -> None:
+    section_node = {
+        "node_id": "section:paper-1#Q1-problem-analysis",
+        "node_type": "section",
+        "title": "Q1 Problem analysis",
+        "body": "The paper frames retrieval grounding as a factuality problem.",
+        "metadata": {"parent_paper_id": "paper:paper-1", "section_kind": "Q1-problem-analysis"},
+        "keywords": "retrieval grounding",
+        "file_path": "reports/paper-1.md",
+    }
+    paper_node = {
+        "node_id": "paper:paper-1",
+        "node_type": "paper",
+        "title": "Grounded Retrieval for Scientific QA",
+        "body": "A paper about grounded retrieval.",
+        "metadata": {"url": "https://example.com/grounded"},
+        "keywords": "retrieval grounding",
+        "file_path": "reports/paper-1.md",
+    }
+
+    monkeypatch.setattr(agents.wiki_db, "embed_nodes_for_user", lambda *_args, **_kwargs: {"embedded": 0})
+    monkeypatch.setattr(agents.wiki_db, "search_nodes", lambda *_args, **_kwargs: [section_node])
+    monkeypatch.setattr(agents.wiki_db, "get_node", lambda _user_id, node_id: paper_node if node_id == "paper:paper-1" else None)
+    monkeypatch.setattr(agents.wiki_db, "get_citations_for_nodes", lambda *_args, **_kwargs: {})
+
+    class FakeLLM:
+        name = "fake"
+        model = "fake-model"
+
+        def generate(self, *_args, **_kwargs):
+            class Response:
+                text = "这篇论文从事实性角度分析检索增强。[1]"
+                prompt_tokens = 0
+                completion_tokens = 0
+
+            return Response()
+
+    monkeypatch.setattr(agents.wiki_answer, "build_llm_provider", lambda: FakeLLM())
+
+    payload = agents.wiki_ask("user_test", "总结这篇论文的问题分析")
+
+    assert payload["citations"][0]["title"] == "Grounded Retrieval for Scientific QA"
+    assert payload["citations"][0]["node_id"] == "paper:paper-1"
+    assert payload["sources"][0]["title"] == "Grounded Retrieval for Scientific QA"
+    assert "Q1" not in payload["sources"][0]["title"]
+
+
+def test_desktop_wiki_ask_stream_uses_native_wiki_chunks(monkeypatch: pytest.MonkeyPatch) -> None:
+    selected_node = {
+        "node_id": "paper:structured-memory",
+        "node_type": "paper",
+        "title": "Structured Memory Paper",
+        "body": "Memory slots improve grounded retrieval.",
+        "metadata": {"url": "https://example.com/paper"},
+        "keywords": "memory rag",
+        "file_path": "reports/structured-memory.md",
+        "score": 0.95,
+        "updated_at": "2026-06-01",
+    }
+    monkeypatch.setattr(agents.wiki_db, "get_node", lambda user_id, node_id: selected_node)
+    monkeypatch.setattr(agents.wiki_db, "search_nodes", lambda user_id, query, limit=5, node_type=None: [selected_node])
+
+    def fake_answer_question_stream(user_id, question, *, limit=8, pinned_nodes=None):
+        yield {
+            "event": "meta",
+            "data": {
+                "citations": [
+                    {
+                        "index": 1,
+                        "node_id": selected_node["node_id"],
+                        "title": selected_node["title"],
+                        "node_type": selected_node["node_type"],
+                        "excerpt": "Memory slots improve grounded retrieval.",
+                        "metadata": selected_node["metadata"],
+                    }
+                ],
+                "streaming": {"provider": True, "transport": "sse"},
+            },
+        }
+        yield {"event": "chunk", "data": {"text": "结构化"}}
+        yield {"event": "chunk", "data": {"text": "记忆"}}
+        yield {
+            "event": "done",
+            "data": {
+                "text": "结构化记忆",
+                "citations": [
+                    {
+                        "index": 1,
+                        "node_id": selected_node["node_id"],
+                        "title": selected_node["title"],
+                        "node_type": selected_node["node_type"],
+                        "excerpt": "Memory slots improve grounded retrieval.",
+                        "metadata": selected_node["metadata"],
+                    }
+                ],
+                "streaming": {"provider": True, "transport": "sse"},
+            },
+        }
+
+    monkeypatch.setattr(agents.wiki_answer, "answer_question_stream", fake_answer_question_stream)
+
+    events = list(
+        agents.wiki_ask_stream(
+            "user_test",
+            "对比 @[Structured Memory Paper](paper:structured-memory) 的方法",
+            mentions=[{"node_id": "paper:structured-memory", "title": "Structured Memory Paper"}],
+        )
+    )
+
+    assert [event["event"] for event in events] == ["meta", "chunk", "chunk", "done"]
+    assert events[0]["data"]["mode"] == "wiki"
+    assert events[0]["data"]["sources"][0]["url"] == "https://example.com/paper"
+    assert "".join(event["data"].get("text", "") for event in events if event["event"] == "chunk") == "结构化记忆"
+    assert events[-1]["data"]["streaming"]["provider"] is True
+
+
+def test_desktop_wiki_ask_can_answer_general_question_without_local_retrieval(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeMockLLM:
+        name = "mock"
+        model = "mock-llm"
+
+    monkeypatch.setattr(agents, "build_llm_provider", lambda: FakeMockLLM())
+    monkeypatch.setattr(agents.wiki_db, "search_nodes", lambda *_args, **_kwargs: pytest.fail("direct questions should not search wiki"))
+
+    payload = agents.wiki_ask("user_test", "什么是 RAG？")
+
+    assert payload["mode"] == "direct"
+    assert payload["retrieval_required"] is False
+    assert payload["citations"] == []
+    assert payload["sources"] == []
+
+
+def test_desktop_wiki_ask_stream_can_direct_answer_without_wiki(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeStreamingLLM:
+        name = "fake"
+        model = "fake-stream"
+
+        def stream_generate(self, *_args, **_kwargs):
+            yield "RAG"
+            yield " 是检索增强生成"
+
+    monkeypatch.setattr(agents, "build_llm_provider", lambda: FakeStreamingLLM())
+    monkeypatch.setattr(agents.wiki_db, "search_nodes", lambda *_args, **_kwargs: pytest.fail("direct stream should not search wiki"))
+
+    events = list(agents.wiki_ask_stream("user_test", "什么是 RAG？"))
+
+    assert [event["event"] for event in events] == ["meta", "chunk", "chunk", "done"]
+    assert events[0]["data"]["mode"] == "direct"
+    assert events[0]["data"]["retrieval_required"] is False
+    assert "".join(event["data"].get("text", "") for event in events if event["event"] == "chunk") == "RAG 是检索增强生成"
+    assert events[-1]["data"]["text"] == "RAG 是检索增强生成"
+
+
 def test_desktop_source_options_exposes_push_sources() -> None:
     options = agents.source_options()
 
@@ -296,6 +513,63 @@ def test_desktop_source_settings_explain_conference_auth() -> None:
     assert "grid-template-columns: minmax(0, 1fr) minmax(320px, 360px)" in css
     assert '[data-mode="credential"]' in css
     assert "label:has(input:checked)" in css
+
+
+def test_desktop_settings_controls_use_compact_typography() -> None:
+    css = (PROJECT_ROOT / "deployments/desktop/static/desktop.css").read_text(encoding="utf-8")
+
+    assert ".setting-card {\n  display: grid;\n  gap: 11px;\n  padding: 15px;" in css
+    assert ".setting-card button,\n.setting-card input,\n.setting-card select,\n.setting-card textarea {\n  font-size: 13px;" in css
+    assert ".setting-card input,\n.setting-card select,\n.setting-card textarea {\n  min-height: 34px;\n  padding: 7px 9px;" in css
+    assert ".setting-card button {\n  min-height: 34px;\n  padding: 7px 10px;" in css
+    assert ".setting-card-head h2 {\n  margin: 0;\n  font-size: 15px;" in css
+    assert ".settings-source .source-edit-row {\n  grid-column: 2;\n  grid-row: 5;\n  display: grid;\n  grid-template-columns: minmax(0, 1fr) 74px;" in css
+    assert ".settings-source .source-edit-row button {\n  white-space: normal;\n  line-height: 1.2;" in css
+    assert ".settings-storage .button-row button,\n.settings-advanced > button,\n.profile-card #saveProfileBtn {\n  min-height: 34px;\n  font-size: 13px;" in css
+
+
+def test_desktop_reports_view_uses_compact_reading_typography() -> None:
+    css = (PROJECT_ROOT / "deployments/desktop/static/desktop.css").read_text(encoding="utf-8")
+
+    assert ".report-list-pane .pane-head h2 {\n  font-size: 14px;" in css
+    assert ".report-list-pane .pane-head select,\n.report-list-pane .pane-head button,\n.report-filter-row input,\n.filter-actions button {\n  min-height: 32px;\n  padding: 6px 8px;\n  font-size: 12.5px;" in css
+    assert ".report-list-pane .pane-head button,\n.filter-actions button,\n.report-reader .reader-head .button-row button {\n  white-space: nowrap;" in css
+    assert ".report-row {\n  width: 100%;\n  display: block;\n  text-align: left;\n  border-color: #e0e9f6;\n  background: #fff;\n  padding: 8px 9px;\n  font-size: 12px;" in css
+    assert ".reader-head h2 {\n  margin: 0 0 4px;\n  font-size: 18px;" in css
+    assert ".markdown-body {\n  padding: 14px 0 4px;\n  color: #25354f;\n  line-height: 1.68;\n  font-size: 13.5px;" in css
+    assert ".markdown-body h1 {\n  font-size: 19px;" in css
+
+
+def test_desktop_user_picker_hydrates_settings_profile_form() -> None:
+    html = (PROJECT_ROOT / "deployments/desktop/static/index.html").read_text(encoding="utf-8")
+    script = (PROJECT_ROOT / "deployments/desktop/static/desktop.js").read_text(encoding="utf-8")
+    css = (PROJECT_ROOT / "deployments/desktop/static/desktop.css").read_text(encoding="utf-8")
+
+    assert 'id="profileSyncStatus"' in html
+    assert 'id="profileInfoGrid"' in html
+    assert 'id="profileTagGrid"' not in html
+    assert ".profile-tag-grid" not in css
+    assert ".setting-card-head small" in css
+    assert ".profile-info-grid" in css
+    assert ".profile-info-item.wide" in css
+    assert "function renderProfileForm(data = {})" in script
+    assert "function renderProfileInfoGrid(profile, raw, userInfo, details)" in script
+    assert "function profileAffiliation(raw, userInfo)" in script
+    assert "async function loadCurrentProfile()" in script
+    assert "/api/profile?user_id=${encodeURIComponent(userId)}" in script
+    assert "renderProfileForm(data);" in script
+    assert "await loadCurrentProfile();" in script
+    assert "$(\"profileUserId\").value = userId;" in script
+    assert 'profileInfoItem("所属机构", profileAffiliation(raw, userInfo), "wide")' in script
+    assert 'profileInfoItem("方向", listText(details.directions, 8), "wide")' in script
+    assert 'profileInfoItem("关键词", listText(mustRead.keywords, 10), "wide")' in script
+    assert 'profileInfoItem("作者", listText(mustRead.authors, 8), "wide")' in script
+    assert 'profileInfoItem("关注机构", listText(mustRead.institutions, 8), "wide")' in script
+    assert 'profileInfoItem("机构", listText(mustRead.institutions, 8), "wide")' not in script
+    assert "$(\"naturalLanguage\").value = profileEditableDescription(raw, userInfo);" in script
+    assert 'renderSettingTags("profileTagGrid"' not in script
+    assert 'userInfo.has_profile ? "画像已加载" : "尚未生成画像，可在此补充"' in script
+    assert "showSettingsMessage(`已加载 ${userId} 的画像信息。`);" in script
 
 
 def test_desktop_health_is_json_ready() -> None:
@@ -520,9 +794,18 @@ def test_desktop_paper_date_and_metrics_sync_with_backend() -> None:
     assert "function syncDateControls()" in script
     assert '$("paperDate").value = todayDateValue()' in script
     assert "selectedDateFetchDays()" in script
+    assert "runButton.disabled = false" in script
     assert 'target_date: $("paperDate").value' in script
     assert "/api/daily/status?task_id=" in script
-    assert "pollDailyTask(data.task?.task_id" in script
+    assert "/api/daily/status?user_id=" in script
+    assert "pollDailyTask(taskId, data.push, userId, pollToken)" in script
+    assert "while (pollToken === state.dailyPollToken)" in script
+    assert "for (let attempt = 0; attempt < 80" not in script
+    assert "function setDailyTaskState(" in script
+    assert "async function resumeDailyTask()" in script
+    assert 'if (name === "papers") {' in script
+    assert "await resumeDailyTask()" in script
+    assert "state.dailyPollToken += 1" in script
     assert "metadata.total_fetched ?? metadata.fetched_count ?? papers.length ?? 0" in script
     assert "metadata.paper_count ?? metadata.filtered_count ?? metadata.ranked_count ?? papers.length ?? 0" in script
     assert 'task.status === "completed"' in script
@@ -561,7 +844,33 @@ def test_desktop_chat_sources_do_not_fallback_to_demo_in_real_mode() -> None:
     assert "Wiki: 结构化记忆</span>" not in html
     assert "function renderChatSources(sources = DEMO_MODE ? demoSources : [])" in script
     assert "data.sources || demoSources" not in script
-    assert "暂无后端引用来源" in script
+    assert "暂无参考文献" in script
+
+
+def test_desktop_wiki_chat_supports_clickable_citations_streaming_and_mentions() -> None:
+    html = (PROJECT_ROOT / "deployments/desktop/static/index.html").read_text(encoding="utf-8")
+    script = (PROJECT_ROOT / "deployments/desktop/static/desktop.js").read_text(encoding="utf-8")
+    css = (PROJECT_ROOT / "deployments/desktop/static/desktop.css").read_text(encoding="utf-8")
+
+    assert 'id="mentionSuggestions"' in html
+    assert 'id="chatMentionChips"' in html
+    assert "/api/wiki/ask/stream" in script
+    assert "streamWikiAsk(payload, answerTarget, message)" in script
+    assert "renderAnswerWithCitations" in script
+    assert "class=\"citation-ref\"" in script
+    assert "data-citation-index" in script
+    assert "focusCitationSource" in script
+    assert "renderCitationRow" not in script
+    assert "本地 Wiki 引用" not in script
+    assert "参考文献 ·" in script
+    assert "renderMentionSuggestions" in script
+    assert "insertMention" in script
+    assert "`@[${title}](${nodeId})`" in script
+    assert "mentions: activeMentionsForQuestion(question)" in script
+    assert "retrieval_required" in script
+    assert ".citation-ref" in css
+    assert ".mention-suggestions" in css
+    assert ".answer-meta .wiki" in css
 
 
 def test_desktop_daily_push_preserves_empty_push_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -694,6 +1003,62 @@ def test_desktop_daily_push_task_reuses_running_user_task(monkeypatch: pytest.Mo
 
     assert second["already_running"] is True
     assert second["task"]["task_id"] == first["task"]["task_id"]
+
+
+def test_desktop_daily_push_task_forwards_gui_filters_and_recovers_by_user(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+    started_event = threading.Event()
+    release_event = threading.Event()
+
+    def fake_run_daily_push(user_id, **kwargs):
+        captured["user_id"] = user_id
+        captured.update(kwargs)
+        started_event.set()
+        release_event.wait(timeout=2)
+        return {
+            "result": {"push_id": "push_task_filters"},
+            "push": {"push_id": "push_task_filters", "papers": [], "metadata": {}},
+        }
+
+    monkeypatch.setattr(agents, "run_daily_push", fake_run_daily_push)
+
+    started = agents.start_daily_push_task(
+        "user_task_filters",
+        days=3,
+        limit_per_source=77,
+        arxiv_categories=["cs.LG", "cs.CV"],
+        conferences=["ICLR"],
+        journals=["Nature"],
+    )
+
+    try:
+        assert started_event.wait(timeout=2)
+        by_user = agents.get_daily_push_task(user_id="user_task_filters")["task"]
+
+        assert by_user["task_id"] == started["task"]["task_id"]
+        assert by_user["days"] == 3
+        assert by_user["limit_per_source"] == 77
+        assert by_user["arxiv_categories"] == ["cs.LG", "cs.CV"]
+        assert by_user["conferences"] == ["ICLR"]
+        assert by_user["journals"] == ["Nature"]
+        assert captured["user_id"] == "user_task_filters"
+        assert captured["days"] == 3
+        assert captured["limit_per_source"] == 77
+        assert captured["arxiv_categories"] == ["cs.LG", "cs.CV"]
+        assert captured["conferences"] == ["ICLR"]
+        assert captured["journals"] == ["Nature"]
+        assert callable(captured["progress_callback"])
+    finally:
+        release_event.set()
+
+    task = None
+    for _ in range(50):
+        task = agents.get_daily_push_task(task_id=started["task"]["task_id"])["task"]
+        if task and task["status"] == "completed":
+            break
+        time.sleep(0.02)
+    assert task is not None
+    assert task["status"] == "completed"
 
 
 def test_desktop_reports_payload_warns_on_feishu_failure() -> None:

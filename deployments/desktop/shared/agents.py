@@ -13,13 +13,15 @@ import json
 import os
 import re
 import threading
+import time
 import zipfile
 import yaml
+from paperflow.providers import build_llm_provider
 from copy import deepcopy
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 from uuid import uuid4
 
 import yaml
@@ -1997,15 +1999,429 @@ def update_wiki_node(user_id: str, node_id: str, title: str = "", body: str = ""
     return {"node": _wiki_node_payload(updated)}
 
 
-def wiki_ask(user_id: str, question: str, limit: int = 8, scope: str = "all") -> Dict[str, Any]:
+_MENTION_LINK_RE = re.compile(r"@\[([^\]]{1,180})\]\(([^)\s]{1,240})\)")
+_MENTION_TOKEN_RE = re.compile(r"@([^\s@\]\)（），。；;、,]{1,120})")
+
+_LOCAL_WIKI_TERMS = (
+    "@",
+    "wiki",
+    "知识库",
+    "本地",
+    "精读",
+    "报告",
+    "论文",
+    "paper",
+    "paperflow",
+    "这篇",
+    "这两篇",
+    "两篇",
+    "对比",
+    "比较",
+    "差异",
+    "总结",
+    "最近",
+    "一周",
+    "今天",
+    "引用",
+    "证据",
+    "根据",
+    "我的",
+    "方向",
+    "画像",
+    "推荐",
+    "候选",
+    "条目",
+    "节点",
+)
+
+_DIRECT_STARTERS = (
+    "什么是",
+    "解释一下",
+    "解释下",
+    "介绍一下",
+    "介绍下",
+    "如何理解",
+    "define ",
+    "what is ",
+    "explain ",
+)
+
+DIRECT_ANSWER_PROMPT = """You are PaperFlow's desktop research assistant.
+
+The user asked a general question that does not require local Wiki retrieval.
+Answer directly and concisely in Chinese by default. Do not add fake citations
+or [N] markers. If the question asks for local papers, reports, user profile,
+or Wiki evidence, say that local Wiki retrieval is required instead."""
+
+
+def _extract_question_mentions(question: str) -> List[Dict[str, str]]:
+    text = str(question or "")
+    mentions: List[Dict[str, str]] = []
+    for match in _MENTION_LINK_RE.finditer(text):
+        mentions.append({"title": match.group(1).strip(), "node_id": match.group(2).strip()})
+    stripped = _MENTION_LINK_RE.sub(" ", text)
+    for match in _MENTION_TOKEN_RE.finditer(stripped):
+        token = match.group(1).strip()
+        if token:
+            mentions.append({"title": token, "node_id": ""})
+    return mentions
+
+
+def _normalize_requested_mentions(mentions: Any) -> List[Dict[str, str]]:
+    normalized: List[Dict[str, str]] = []
+    if not isinstance(mentions, list):
+        return normalized
+    for item in mentions:
+        if isinstance(item, dict):
+            title = str(item.get("title") or item.get("label") or "").strip()
+            node_id = str(item.get("node_id") or item.get("id") or "").strip()
+            if title or node_id:
+                normalized.append({"title": title, "node_id": node_id})
+        else:
+            token = str(item or "").strip()
+            if token:
+                normalized.append({"title": token, "node_id": ""})
+    return normalized
+
+
+def _resolve_wiki_mentions(
+    user_id: str,
+    question: str,
+    mentions: Any = None,
+    *,
+    limit: int = 6,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, str]]]:
+    requested = [*_normalize_requested_mentions(mentions), *_extract_question_mentions(question)]
+    resolved_nodes: List[Dict[str, Any]] = []
+    resolved_payloads: List[Dict[str, Any]] = []
+    unresolved: List[Dict[str, str]] = []
+    seen_requests: Set[Tuple[str, str]] = set()
+    seen_nodes: Set[str] = set()
+
+    for request in requested[: max(1, int(limit))]:
+        title = str(request.get("title") or "").strip()
+        node_id = str(request.get("node_id") or "").strip()
+        request_key = (title.lower(), node_id.lower())
+        if request_key in seen_requests:
+            continue
+        seen_requests.add(request_key)
+
+        node: Optional[Dict[str, Any]] = None
+        if node_id:
+            node = wiki_db.get_node(user_id, node_id)
+        if node is None:
+            query = title or node_id
+            if query:
+                hits = wiki_db.search_nodes(user_id, query, limit=5)
+                lowered_title = title.lower()
+                lowered_node_id = node_id.lower()
+                exact = next(
+                    (
+                        hit
+                        for hit in hits
+                        if str(hit.get("node_id") or "").lower() == lowered_node_id
+                        or str(hit.get("title") or "").lower() == lowered_title
+                    ),
+                    None,
+                )
+                node = exact or (hits[0] if hits else None)
+
+        if not node:
+            unresolved.append({"title": title, "node_id": node_id})
+            continue
+
+        resolved_node_id = str(node.get("node_id") or "").strip()
+        if not resolved_node_id or resolved_node_id in seen_nodes:
+            continue
+        seen_nodes.add(resolved_node_id)
+        resolved_nodes.append(node)
+        payload = _wiki_node_payload(node)
+        payload["mention"] = title or node.get("title") or resolved_node_id
+        payload["selected"] = True
+        resolved_payloads.append(payload)
+
+    return resolved_nodes, resolved_payloads, unresolved
+
+
+def _question_route(question: str, scope: str, resolved_mentions: List[Dict[str, Any]]) -> Tuple[str, str]:
+    normalized_scope = str(scope or "all").strip().lower()
+    normalized_question = str(question or "").strip().lower()
+    if resolved_mentions or "@" in normalized_question:
+        return "wiki", "explicit_mention"
+    if normalized_scope in {"recent", "profile"}:
+        return "wiki", f"scope_{normalized_scope}"
+    if any(term in normalized_question for term in _LOCAL_WIKI_TERMS):
+        return "wiki", "local_research_context"
+    if normalized_question.startswith(_DIRECT_STARTERS):
+        return "direct", "general_question"
+    return "direct", "no_local_context_signal"
+
+
+def _citation_source_payload(citation: Dict[str, Any]) -> Dict[str, Any]:
+    metadata = citation.get("metadata") or {}
+    node_type = str(citation.get("node_type") or "").strip()
+    source_type = str(citation.get("source_type") or "").strip()
+    source_id = str(citation.get("source_id") or "").strip()
+    source_label = {
+        "reading_report": "精读报告",
+        "daily_push": "论文推荐",
+        "manual": "手动导入",
+    }.get(source_type, "")
+    meta_parts = [part for part in [source_label, source_id] if part]
+    return {
+        "index": citation.get("index"),
+        "node_id": citation.get("node_id"),
+        "node_type": node_type,
+        "title": citation.get("title") or citation.get("node_id") or "未命名来源",
+        "meta": " · ".join(meta_parts) if meta_parts else "参考文献",
+        "snippet": citation.get("excerpt") or "",
+        "excerpt": citation.get("excerpt") or "",
+        "source_type": source_type,
+        "source_id": source_id,
+        "anchor": citation.get("anchor"),
+        "metadata": metadata,
+        "url": metadata.get("url") or metadata.get("abs_url") or metadata.get("pdf_url") or "",
+    }
+
+
+def _direct_answer(question: str) -> Dict[str, Any]:
+    started = time.time()
+    llm = build_llm_provider()
+    llm_error = None
+    response = None
+    if getattr(llm, "name", "") == "mock":
+        text = "这个问题不需要调用本地 Wiki。当前未配置可用 LLM，因此离线版无法生成通用回答；如需基于本地论文回答，请用 @ 选择论文或切换到 Wiki 范围。"
+    else:
+        try:
+            response = llm.generate(
+                question,
+                system=DIRECT_ANSWER_PROMPT,
+                temperature=0.0,
+                max_tokens=700,
+            )
+            text = response.text
+        except Exception as exc:
+            llm_error = str(exc)
+            text = f"这个问题被判定为通用问题，不需要引用本地 Wiki；但当前 LLM 调用失败：{llm_error}"
+    return {
+        "text": text,
+        "citations": [],
+        "sources": [],
+        "elapsed_ms": int((time.time() - started) * 1000),
+        "token_usage": {
+            "provider": getattr(llm, "name", "unknown"),
+            "model": getattr(llm, "model", "unknown"),
+            "prompt_tokens": response.prompt_tokens if response else 0,
+            "completion_tokens": response.completion_tokens if response else 0,
+            "llm_error": llm_error,
+        },
+    }
+
+
+def _text_chunks(text: str, size: int = 24) -> Iterator[str]:
+    content = str(text or "")
+    for index in range(0, len(content), max(1, int(size))):
+        yield content[index : index + size]
+
+
+def _apply_chat_metadata(
+    result: Dict[str, Any],
+    *,
+    mode: str,
+    retrieval_required: bool,
+    routing_reason: str,
+    mentions: List[Dict[str, Any]],
+    unresolved_mentions: List[Dict[str, str]],
+    scope: str,
+) -> Dict[str, Any]:
+    citations = result.get("citations") or []
+    result["sources"] = [_citation_source_payload(citation) for citation in citations]
+    result.update(
+        {
+            "mode": mode,
+            "retrieval_required": retrieval_required,
+            "routing_reason": routing_reason,
+            "mentions": mentions,
+            "unresolved_mentions": unresolved_mentions,
+            "scope": scope if scope in {"all", "recent", "profile"} else "all",
+        }
+    )
+    return result
+
+
+def _direct_answer_stream(question: str) -> Iterator[Dict[str, Any]]:
+    started = time.time()
+    llm = build_llm_provider()
+    llm_error = None
+    text_parts: List[str] = []
+    meta = {
+        "citations": [],
+        "sources": [],
+        "elapsed_ms": 0,
+        "token_usage": {
+            "provider": getattr(llm, "name", "unknown"),
+            "model": getattr(llm, "model", "unknown"),
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "llm_error": None,
+        },
+        "streaming": {"provider": getattr(llm, "name", "") != "mock", "transport": "sse"},
+    }
+    yield {"event": "meta", "data": meta}
+    if getattr(llm, "name", "") == "mock":
+        text = "这个问题不需要调用本地 Wiki。当前未配置可用 LLM，因此离线版无法生成通用回答；如需基于本地论文回答，请用 @ 选择论文或切换到 Wiki 范围。"
+        for chunk in _text_chunks(text):
+            text_parts.append(chunk)
+            yield {"event": "chunk", "data": {"text": chunk}}
+    else:
+        try:
+            for chunk in llm.stream_generate(
+                question,
+                system=DIRECT_ANSWER_PROMPT,
+                temperature=0.0,
+                max_tokens=700,
+            ):
+                if not chunk:
+                    continue
+                text_parts.append(chunk)
+                yield {"event": "chunk", "data": {"text": chunk}}
+        except Exception as exc:
+            llm_error = str(exc)
+            text = f"这个问题被判定为通用问题，不需要引用本地 Wiki；但当前 LLM 流式调用失败：{llm_error}"
+            text_parts = [text]
+            yield {"event": "chunk", "data": {"text": text}}
+
+    result = {
+        "text": "".join(text_parts),
+        "citations": [],
+        "sources": [],
+        "elapsed_ms": int((time.time() - started) * 1000),
+        "token_usage": {
+            "provider": getattr(llm, "name", "unknown"),
+            "model": getattr(llm, "model", "unknown"),
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "llm_error": llm_error,
+        },
+        "streaming": {"provider": getattr(llm, "name", "") != "mock" and not llm_error, "transport": "sse"},
+    }
+    yield {"event": "done", "data": result}
+
+
+def wiki_ask(
+    user_id: str,
+    question: str,
+    limit: int = 8,
+    scope: str = "all",
+    mentions: Any = None,
+) -> Dict[str, Any]:
+    if not user_id:
+        raise ValueError("user_id is required")
+    cleaned_question = str(question or "").strip()
+    if not cleaned_question:
+        raise ValueError("question is required")
+    safe_limit = max(1, min(12, int(limit or 8)))
     normalized_scope = str(scope or "all").strip().lower()
     scope_hint = {
         "recent": " Prioritize recently updated wiki nodes and recent reading reports.",
         "profile": " Prioritize profile, trajectory, preference, and research-direction wiki nodes.",
     }.get(normalized_scope, "")
-    result = wiki_answer.answer_question(user_id, f"{question}{scope_hint}", limit=limit)
-    result["scope"] = normalized_scope if normalized_scope in {"all", "recent", "profile"} else "all"
+    resolved_nodes, resolved_mentions, unresolved_mentions = _resolve_wiki_mentions(
+        user_id,
+        cleaned_question,
+        mentions,
+        limit=6,
+    )
+    mode, routing_reason = _question_route(cleaned_question, normalized_scope, resolved_mentions)
+    if mode == "direct":
+        result = _direct_answer(cleaned_question)
+        result["streaming"] = {"provider": False, "transport": "json"}
+        _apply_chat_metadata(
+            result,
+            mode="direct",
+            retrieval_required=False,
+            routing_reason=routing_reason,
+            mentions=[],
+            unresolved_mentions=unresolved_mentions,
+            scope=normalized_scope,
+        )
+    else:
+        result = wiki_answer.answer_question(
+            user_id,
+            f"{cleaned_question}{scope_hint}",
+            limit=safe_limit,
+            pinned_nodes=resolved_nodes,
+        )
+        result["streaming"] = {"provider": False, "transport": "json"}
+        _apply_chat_metadata(
+            result,
+            mode="wiki",
+            retrieval_required=True,
+            routing_reason=routing_reason,
+            mentions=resolved_mentions,
+            unresolved_mentions=unresolved_mentions,
+            scope=normalized_scope,
+        )
     return result
+
+
+def wiki_ask_stream(
+    user_id: str,
+    question: str,
+    limit: int = 8,
+    scope: str = "all",
+    mentions: Any = None,
+) -> Iterator[Dict[str, Any]]:
+    if not user_id:
+        raise ValueError("user_id is required")
+    cleaned_question = str(question or "").strip()
+    if not cleaned_question:
+        raise ValueError("question is required")
+    safe_limit = max(1, min(12, int(limit or 8)))
+    normalized_scope = str(scope or "all").strip().lower()
+    scope_hint = {
+        "recent": " Prioritize recently updated wiki nodes and recent reading reports.",
+        "profile": " Prioritize profile, trajectory, preference, and research-direction wiki nodes.",
+    }.get(normalized_scope, "")
+    resolved_nodes, resolved_mentions, unresolved_mentions = _resolve_wiki_mentions(
+        user_id,
+        cleaned_question,
+        mentions,
+        limit=6,
+    )
+    mode, routing_reason = _question_route(cleaned_question, normalized_scope, resolved_mentions)
+    if mode == "direct":
+        for event in _direct_answer_stream(cleaned_question):
+            if event["event"] in {"meta", "done"}:
+                _apply_chat_metadata(
+                    event["data"],
+                    mode="direct",
+                    retrieval_required=False,
+                    routing_reason=routing_reason,
+                    mentions=[],
+                    unresolved_mentions=unresolved_mentions,
+                    scope=normalized_scope,
+                )
+            yield event
+        return
+
+    for event in wiki_answer.answer_question_stream(
+        user_id,
+        f"{cleaned_question}{scope_hint}",
+        limit=safe_limit,
+        pinned_nodes=resolved_nodes,
+    ):
+        if event["event"] in {"meta", "done"}:
+            _apply_chat_metadata(
+                event["data"],
+                mode="wiki",
+                retrieval_required=True,
+                routing_reason=routing_reason,
+                mentions=resolved_mentions,
+                unresolved_mentions=unresolved_mentions,
+                scope=normalized_scope,
+            )
+        yield event
 
 
 def recent_activity(user_id: str, days: int = 14, limit: int = 80) -> Dict[str, Any]:
