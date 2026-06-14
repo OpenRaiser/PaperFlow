@@ -34,6 +34,7 @@
     chatMentions: [],
     mentionSearchTimer: null,
     mentionSearchToken: 0,
+    currentView: "",
     dailyTaskId: "",
     dailyTaskUserId: "",
     dailyPollToken: 0,
@@ -768,6 +769,7 @@
   }
 
   function setView(name, updateHash = true, options = {}) {
+    state.currentView = name;
     document.body.classList.toggle("chat-view", name === "chat");
     document.querySelectorAll(".view").forEach((view) => view.classList.toggle("active", view.id === name));
     document.querySelectorAll(".rail-item").forEach((button) => button.classList.toggle("active", button.dataset.view === name));
@@ -2148,7 +2150,8 @@
     const stats = await api(`/api/wiki/stats?user_id=${encodeURIComponent(currentUser())}`);
     $("wikiNodeStat").textContent = stats.nodes || 0;
     $("wikiSettingStat").textContent = stats.nodes || "-";
-    $("wikiStats").textContent = `节点 ${stats.nodes || 0} · 关系 ${stats.edges || 0} · 引用 ${stats.citations || 0}`;
+    const wikiDirText = stats.wiki_dir ? ` · 目录 ${stats.wiki_dir}` : "";
+    $("wikiStats").textContent = `节点 ${stats.nodes || 0} · 关系 ${stats.edges || 0} · 引用 ${stats.citations || 0}${wikiDirText}`;
     try {
       state.wikiGraph = await api(`/api/wiki/graph?user_id=${encodeURIComponent(currentUser())}&limit=48`);
     } catch (error) {
@@ -2167,7 +2170,7 @@
           source: "wiki_search_fallback",
           query: ""
         };
-        $("wikiStats").textContent = `节点 ${stats.nodes || 0} · 关系 ${stats.edges || 0} · 引用 ${stats.citations || 0} · 已用节点列表恢复`;
+        $("wikiStats").textContent = `节点 ${stats.nodes || 0} · 关系 ${stats.edges || 0} · 引用 ${stats.citations || 0}${wikiDirText} · 已用节点列表恢复`;
       }
     }
     if (state.wikiView === "graph") {
@@ -3307,6 +3310,19 @@
     values.HTTPS_PROXY = $("proxyInput").value;
     const data = await api("/api/settings", { method: "POST", body: JSON.stringify({ values }) });
     renderSettings(data);
+    state.reports = [];
+    state.currentReport = null;
+    state.wikiNodes = [];
+    state.wikiGraph = null;
+    state.wikiMap = null;
+    state.currentWikiNodeId = "";
+    state.currentWikiEditNodeId = "";
+    if ($("wikiQuery")) $("wikiQuery").value = "";
+    if (state.currentView === "wiki") {
+      await loadWiki();
+    } else if (state.currentView === "reports") {
+      await refreshReports({ keepSelection: false });
+    }
     showSettingsMessage("设置已保存。每日推荐上限、相关性阈值和代理会用于下一次论文拉取；如果当天缓存参数不同，后端会自动重新拉取。");
     showFeedbackToast("success", "设置已保存", "新参数会用于下一次论文拉取，旧缓存参数不一致时会自动刷新。");
   }
