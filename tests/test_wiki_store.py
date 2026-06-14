@@ -120,6 +120,11 @@ def test_reading_report_ingest_creates_paper_sections_edges_and_citations(monkey
     paper_node = wiki_db.get_node("user_alice", "paper:2604.00007")
     assert paper_node["metadata"]["pdf_path"].endswith("2604.00007.pdf")
     assert paper_node["metadata"]["report_path"].endswith("reading-report.md")
+    assert "## Summary" in paper_node["body"]
+    assert "## Why It Matters" in paper_node["body"]
+    assert "Useful for PaperFlow wiki search" in paper_node["body"]
+    section_nodes = wiki_db.search_nodes("user_alice", "Solution approach", node_type="section")
+    assert any("Graph RAG for Literature Review / Q3 Solution approach" == node["title"] for node in section_nodes)
 
 
 def test_feedback_ingest_creates_preference_edges(monkeypatch, tmp_path):
@@ -189,10 +194,19 @@ def test_daily_push_drift_topics_embeddings_and_ask(monkeypatch, tmp_path):
         metadata={"rank": 1, "score": 0.91, "keywords": ["graph-rag", "agents"]},
         behavior_log_id=201,
     )
+    pushed_paper = wiki_db.get_node("user_alice", "paper:2606.00011")
+    push_trajectory = wiki_db.get_node("user_alice", "trajectory:user_alice:push_20260601")
+    assert "## Candidate Summary" in pushed_paper["body"]
+    assert "## Recommendation Context" in pushed_paper["body"]
+    assert "Candidate paper from daily push" not in pushed_paper["body"]
+    assert "## Daily Push Snapshot" in push_trajectory["body"]
     drift_result = drift_ingest.ingest_drift(
         user_id="user_alice",
         before={"topic_weights": {"graph-rag": 0.2}},
-        after={"topic_weights": {"graph-rag": 0.5}, "drift_state": {"status": "shifting"}},
+        after={
+            "topic_weights": {"graph-rag": 0.5},
+            "drift_state": {"status": "shifting", "long_term_vector": [0.1] * 64},
+        },
         evidence_papers=[{"arxiv_id": "2606.00011"}],
         source_ref="push_20260601",
     )
@@ -201,6 +215,12 @@ def test_daily_push_drift_topics_embeddings_and_ask(monkeypatch, tmp_path):
     answer = answer_module.answer_question("user_alice", "graph rag agents", limit=4)
 
     assert drift_result["delta_count"] == 1
+    topic_node = wiki_db.get_node("user_alice", "topic:graph-rag")
+    trajectory_node = wiki_db.get_node("user_alice", drift_result["trajectory_node"])
+    assert "## Topic Signal" in topic_node["body"]
+    assert "Topic node for" not in topic_node["body"]
+    assert "## Interest Drift Summary" in trajectory_node["body"]
+    assert "long_term_vector" not in trajectory_node["metadata"].get("drift_state", {})
     assert topic_result["topics"] >= 1
     assert embed_result["embedded"] >= 3
     assert answer["citations"]

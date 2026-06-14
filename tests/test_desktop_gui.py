@@ -33,11 +33,13 @@ def test_desktop_server_routes_are_registered() -> None:
     assert "/api/provider-test" in server.POST_ROUTES
     assert "/api/daily/status" in server.GET_ROUTES
     assert "/api/daily/start" in server.POST_ROUTES
+    assert "/api/wiki/mentions" in server.GET_ROUTES
     assert "/api/wiki/ask/stream" in server.POST_ROUTES
     assert "/api/chat/sessions" in server.GET_ROUTES
     assert "/api/chat/session" in server.GET_ROUTES
     assert "/api/chat/session" in server.POST_ROUTES
     assert "/api/chat/session/delete" in server.POST_ROUTES
+    assert "/api/chat/sessions/clear" in server.POST_ROUTES
     assert 'self.send_header("Cache-Control", "no-store")' in server_source
 
 
@@ -53,6 +55,7 @@ def test_desktop_wiki_stream_helpers_emit_sse_frames() -> None:
 
 def test_desktop_daily_target_date_controls_backend_fetch_window() -> None:
     today = server.datetime.now().date()
+    server_source = (PROJECT_ROOT / "deployments/desktop/server.py").read_text(encoding="utf-8")
 
     assert server._daily_days_from_body({"days": 7}) == 7  # noqa: SLF001 - GUI date contract
     assert server._daily_days_from_body({"target_date": today.isoformat(), "days": 9}) == 1  # noqa: SLF001
@@ -60,6 +63,8 @@ def test_desktop_daily_target_date_controls_backend_fetch_window() -> None:
     assert server._daily_days_from_body({"target_date": (today.replace(year=today.year + 1)).isoformat(), "days": 3}) == 1  # noqa: SLF001
     assert server._daily_days_from_body({"target_date": (today.replace(year=today.year - 1)).isoformat()}) == 14  # noqa: SLF001
     assert "/api/wiki/graph" in server.GET_ROUTES
+    assert "daily_scope" in server_source
+    assert "daily_month" in server_source
     assert "/api/wiki/node" in server.POST_ROUTES
     assert callable(server.run_server)
 
@@ -100,9 +105,10 @@ def test_desktop_wiki_graph_uses_user_nodes_and_edges(monkeypatch: pytest.Monkey
                 "title": "Graph RAG Paper",
                 "body": "A graph RAG paper.",
                 "metadata": {},
-                "keywords": "graph rag",
+                "keywords": "rag",
                 "file_path": "papers/graph-rag.md",
                 "score": 0.8,
+                "source_type": "reading_report",
                 "updated_at": "2026-06-01",
             },
             {
@@ -111,7 +117,7 @@ def test_desktop_wiki_graph_uses_user_nodes_and_edges(monkeypatch: pytest.Monkey
                 "title": "RAG",
                 "body": "Retrieval augmented generation.",
                 "metadata": {},
-                "keywords": "retrieval",
+                "keywords": "rag",
                 "file_path": "topics/rag.md",
                 "score": 0.7,
                 "updated_at": "2026-06-01",
@@ -149,16 +155,56 @@ def test_desktop_wiki_graph_uses_user_nodes_and_edges(monkeypatch: pytest.Monkey
 
     monkeypatch.setattr(agents.db_ops, "get_connection", lambda: FakeConnection())
 
-    graph = agents.wiki_graph("user_test")
+    graph = agents.wiki_graph("user_test", daily_scope="wiki_db")
 
     assert graph["source"] == "wiki_db"
     assert {node["node_id"] for node in graph["nodes"]} == {"user:user_test", "paper:1", "topic:rag"}
-    assert [edge["relation"] for edge in graph["edges"]] == ["same_topic", "interested_in"]
+    assert {"same_topic", "interested_in", "belongs_to"}.issubset({edge["relation"] for edge in graph["edges"]})
 
 
 def test_desktop_wiki_graph_prefers_edge_connected_nodes(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(agents, "_configured_wiki_root", lambda: None)
-    monkeypatch.setattr(agents.wiki_db, "list_nodes", lambda user_id, limit: [])
+    monkeypatch.setattr(
+        agents.wiki_db,
+        "list_nodes",
+        lambda user_id, limit: [
+            {
+                "node_id": "paper:important",
+                "node_type": "paper",
+                "title": "Important Paper",
+                "body": "A highly connected paper.",
+                "metadata": {"report_path": "/tmp/important.md"},
+                "keywords": "rag",
+                "file_path": "papers/important.md",
+                "score": 0.9,
+                "source_type": "reading_report",
+                "updated_at": "2026-06-01",
+            },
+            {
+                "node_id": "paper:candidate",
+                "node_type": "paper",
+                "title": "Candidate Paper",
+                "body": "A daily candidate paper.",
+                "metadata": {"category": "maybe_interested"},
+                "keywords": "rag",
+                "file_path": "papers/candidate.md",
+                "score": 0.99,
+                "source_type": "daily_push",
+                "updated_at": "2026-06-01",
+            },
+            {
+                "node_id": "topic:rag",
+                "node_type": "topic",
+                "title": "RAG",
+                "body": "Retrieval augmented generation.",
+                "metadata": {"canonical_name": "rag"},
+                "keywords": "rag",
+                "file_path": "topics/rag.md",
+                "score": 0.8,
+                "updated_at": "2026-06-01",
+            },
+        ],
+    )
 
     class FakeRows:
         def __init__(self, rows):
@@ -216,10 +262,256 @@ def test_desktop_wiki_graph_prefers_edge_connected_nodes(monkeypatch: pytest.Mon
 
     monkeypatch.setattr(agents.db_ops, "get_connection", lambda: FakeConnection())
 
-    graph = agents.wiki_graph("user_test")
+    graph = agents.wiki_graph("user_test", daily_scope="wiki_db")
 
     assert {node["node_id"] for node in graph["nodes"]} == {"paper:important", "topic:rag"}
-    assert graph["edges"][0]["relation"] == "cites_method"
+    assert "paper:candidate" not in {node["node_id"] for node in graph["nodes"]}
+    assert {"cites_method", "belongs_to"}.issubset({edge["relation"] for edge in graph["edges"]})
+
+
+def test_desktop_wiki_graph_excludes_section_nodes(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(agents, "_configured_wiki_root", lambda: None)
+    monkeypatch.setattr(
+        agents.wiki_db,
+        "list_nodes",
+        lambda user_id, limit: [
+            {
+                "node_id": "paper:1",
+                "node_type": "paper",
+                "title": "Paper",
+                "body": "Paper body",
+                "metadata": {"report_path": "/tmp/paper.md"},
+                "keywords": "",
+                "file_path": "papers/paper.md",
+                "score": 1,
+                "source_type": "reading_report",
+                "updated_at": "2026-06-01",
+            },
+            {
+                "node_id": "section:1#abstract",
+                "node_type": "section",
+                "title": "Abstract",
+                "body": "Abstract body",
+                "metadata": {"parent_paper_id": "paper:1"},
+                "keywords": "",
+                "file_path": "sections/abstract.md",
+                "score": 1,
+                "source_type": "reading_report",
+                "updated_at": "2026-06-01",
+            },
+        ],
+    )
+
+    class FakeRows:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def fetchall(self):
+            return self._rows
+
+    class FakeConnection:
+        def execute(self, sql, *_args, **_kwargs):
+            if "FROM wiki_edges" in sql:
+                return FakeRows(
+                    [
+                        {
+                            "src_id": "paper:1",
+                            "dst_id": "section:1#abstract",
+                            "relation": "contains_section",
+                            "weight": 1.0,
+                            "metadata_json": "{}",
+                            "created_at": "2026-06-01",
+                        },
+                        {
+                            "src_id": "user:user_test",
+                            "dst_id": "paper:1",
+                            "relation": "read",
+                            "weight": 1.0,
+                            "metadata_json": "{}",
+                            "created_at": "2026-06-01",
+                        },
+                    ]
+                )
+            if "FROM wiki_nodes" in sql:
+                return FakeRows(
+                    [
+                        {
+                            "node_id": "paper:1",
+                            "node_type": "paper",
+                            "title": "Paper",
+                            "body": "Paper body",
+                            "metadata_json": "{}",
+                            "keywords": "",
+                            "file_path": "papers/paper.md",
+                            "score": 1,
+                            "updated_at": "2026-06-01",
+                        },
+                        {
+                            "node_id": "section:1#abstract",
+                            "node_type": "section",
+                            "title": "Abstract",
+                            "body": "Abstract body",
+                            "metadata_json": "{}",
+                            "keywords": "",
+                            "file_path": "sections/abstract.md",
+                            "score": 1,
+                            "updated_at": "2026-06-01",
+                        },
+                    ]
+                )
+            return FakeRows([])
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(agents.db_ops, "get_connection", lambda: FakeConnection())
+
+    graph = agents.wiki_graph("user_test", daily_scope="wiki_db")
+
+    assert {node["node_id"] for node in graph["nodes"]} == {"user:user_test", "paper:1"}
+    assert [edge["relation"] for edge in graph["edges"]] == ["read"]
+
+
+def test_desktop_wiki_graph_defaults_to_reading_reports_and_topics(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(agents, "_configured_wiki_root", lambda: None)
+    monkeypatch.setattr(
+        agents.wiki_db,
+        "list_nodes",
+        lambda user_id, limit, node_type=None: [
+            {
+                "node_id": "paper:read",
+                "node_type": "paper",
+                "title": "Read Paper",
+                "body": "Summary",
+                "metadata": {"report_path": "/tmp/read.md"},
+                "keywords": "retrieval agent",
+                "file_path": "papers/read.md",
+                "source_type": "reading_report",
+            },
+            {
+                "node_id": "paper:candidate",
+                "node_type": "paper",
+                "title": "Candidate Paper",
+                "body": "Candidate",
+                "metadata": {"category": "maybe_interested"},
+                "keywords": "retrieval",
+                "file_path": "papers/candidate.md",
+                "source_type": "daily_push",
+            },
+            {
+                "node_id": "topic:retrieval",
+                "node_type": "topic",
+                "title": "Retrieval",
+                "body": "Topic",
+                "metadata": {"canonical_name": "retrieval"},
+                "keywords": "retrieval",
+                "file_path": "topics/retrieval.md",
+                "source_type": "topic_clustering",
+            },
+            {
+                "node_id": "section:read#abstract",
+                "node_type": "section",
+                "title": "Abstract",
+                "body": "Abstract",
+                "metadata": {"parent_paper_id": "paper:read"},
+                "keywords": "retrieval",
+                "file_path": "sections/abstract.md",
+                "source_type": "reading_report",
+            },
+        ],
+    )
+
+    class FakeRows:
+        def fetchall(self):
+            return []
+
+    class FakeConnection:
+        def execute(self, *_args, **_kwargs):
+            return FakeRows()
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(agents.db_ops, "get_connection", lambda: FakeConnection())
+
+    graph = agents.wiki_graph("user_test", daily_scope="wiki_db")
+
+    assert {node["node_id"] for node in graph["nodes"]} == {"paper:read", "topic:retrieval"}
+    assert "paper:candidate" not in {node["node_id"] for node in graph["nodes"]}
+    assert "section:read#abstract" not in {node["node_id"] for node in graph["nodes"]}
+    assert graph["edges"] == [
+        {
+            "src_id": "paper:read",
+            "dst_id": "topic:retrieval",
+            "relation": "belongs_to",
+            "weight": 0.75,
+            "metadata": {"source": "keyword_match"},
+        }
+    ]
+
+
+def test_desktop_wiki_graph_can_use_daily_note_scope(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    daily_root = tmp_path / "Daily Note"
+    year_dir = daily_root / "Daily Note 2026"
+    year_dir.mkdir(parents=True)
+    may_note = year_dir / "Daily Note - May 2026.md"
+    jun_note = year_dir / "Daily Note - Jun 2026.md"
+    may_note.write_text(
+        "# Older Topic\n\n## Older Paper\n\n- **Older summary.**\n",
+        encoding="utf-8",
+    )
+    jun_note.write_text(
+        "# AI Agents\n\n"
+        "<!-- paperflow-topic-summary:start -->\n"
+        "## PaperFlow Summary\n"
+        "- 概念：AI Agents\n"
+        "- 方法：reward modeling, orchestration\n"
+        "- 论文/报告：1 篇\n"
+        "- Reward Modeling for Multi-Agent Orchestration\n"
+        "- 画像/前沿：多智能体编排是当前前沿。\n"
+        "<!-- paperflow-topic-summary:end -->\n\n"
+        "## Reward Modeling for Multi-Agent Orchestration\n\n"
+        "- **OrchRM summary.**\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PAPERFLOW_READING_REPORTS_DIR", str(daily_root))
+    monkeypatch.setenv("PAPERFLOW_PDF_DIR", str(daily_root))
+    monkeypatch.setattr(agents, "_configured_wiki_root", lambda: None)
+    monkeypatch.setattr(
+        agents.wiki_db,
+        "list_nodes",
+        lambda user_id, limit: [
+            {
+                "node_id": "paper:orchrm",
+                "node_type": "paper",
+                "title": "Reward Modeling for Multi-Agent Orchestration",
+                "body": "Old body",
+                "metadata": {"report_path": "/tmp/orchrm.md"},
+                "keywords": "agent",
+                "file_path": "papers/orchrm.md",
+                "source_type": "reading_report",
+            }
+        ],
+    )
+
+    latest = agents.wiki_graph("cheng tan", daily_scope="latest")
+    month = agents.wiki_graph("cheng tan", daily_scope="month", daily_month="2026-05")
+    all_notes = agents.wiki_graph("cheng tan", daily_scope="all")
+
+    assert latest["source"] == "daily_note"
+    latest_titles = {node["title"] for node in latest["nodes"]}
+    latest_types = {node["node_type"] for node in latest["nodes"]}
+    assert {"AI Agents", "Reward Modeling for Multi-Agent Orchestration", "reward modeling", "orchestration"}.issubset(latest_titles)
+    assert {"topic", "paper", "method"}.issubset(latest_types)
+    assert "trajectory" not in latest_types
+    assert any(node["body"] == "OrchRM summary." for node in latest["nodes"])
+    assert {node["title"] for node in month["nodes"]} == {"Older Topic", "Older Paper"}
+    assert {
+        "Older Topic",
+        "Older Paper",
+        "AI Agents",
+        "Reward Modeling for Multi-Agent Orchestration",
+    }.issubset({node["title"] for node in all_notes["nodes"]})
 
 
 def test_desktop_wiki_search_filters_to_configured_wiki_directory(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -345,36 +637,55 @@ def test_desktop_wiki_ask_routes_mentions_into_local_cited_answer(monkeypatch: p
     assert payload["sources"][0]["url"] == "https://example.com/paper"
 
 
-def test_desktop_wiki_ask_pins_recent_papers_for_trend_questions(monkeypatch: pytest.MonkeyPatch) -> None:
-    recent_papers = [
+def test_desktop_wiki_mentions_use_daily_note_deep_reading_entries(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    report = tmp_path / "deep-reading.md"
+    report.write_text("# Deep report\n\nDetailed report body.", encoding="utf-8")
+    monkeypatch.setattr(
+        agents,
+        "_daily_note_reading_entries",
+        lambda **_kwargs: [
+            {
+                "title": "Daily Note Deep Reading Paper",
+                "topic": "Language Models",
+                "summary": "A paper selected from Daily Note deep reading.",
+                "report_path": str(report),
+                "daily_note": "/vault/Daily Note - Jun 2026.md",
+            }
+        ],
+    )
+
+    payload = agents.daily_note_mentions("user_test", query="Daily", limit=6)
+
+    assert payload["source"] == "daily_note_deep_reading"
+    assert payload["nodes"][0]["title"] == "Daily Note Deep Reading Paper"
+    assert payload["nodes"][0]["metadata"]["source"] == "daily_note_deep_reading"
+    assert payload["nodes"][0]["metadata"]["report_path"] == str(report)
+
+
+def test_desktop_wiki_ask_pins_daily_note_readings_for_trend_questions(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    first_report = tmp_path / "agentic-memory.md"
+    first_report.write_text("Agentic memory improves long horizon paper triage and report grounding.", encoding="utf-8")
+    second_report = tmp_path / "multimodal-retrieval.md"
+    second_report.write_text("Retrieval agents connect paper figures, text, and user feedback.", encoding="utf-8")
+    daily_entries = [
         {
-            "id": "paper-1",
             "title": "Agentic Memory for Scientific Reading",
-            "abstract": "Agentic memory improves long horizon paper triage and report grounding.",
-            "authors": ["A. Researcher", "B. Scientist"],
-            "subjects": ["cs.AI", "cs.CL"],
-            "category": "high_match",
-            "rank": 1,
-            "score": 0.94,
-            "push_id": "push_20260614",
-            "url": "https://example.com/agentic-memory",
+            "topic": "Memory, Personalization & Long-Horizon Agents",
+            "summary": "Agentic memory improves long horizon paper triage.",
+            "report_path": str(first_report),
+            "daily_note": "/vault/Daily Note - Jun 2026.md",
         },
         {
-            "id": "paper-2",
             "title": "Multimodal Retrieval Agents",
+            "topic": "Multimodal Models & Visual Reasoning",
             "summary": "Retrieval agents connect paper figures, text, and user feedback.",
-            "authors": "C. Author, D. Author",
-            "categories": "cs.IR, cs.MM",
-            "category": "explore",
-            "rank": 2,
-            "score": 0.88,
-            "push_id": "push_20260614",
+            "report_path": str(second_report),
+            "daily_note": "/vault/Daily Note - Jun 2026.md",
         },
     ]
     captured = {}
 
-    monkeypatch.setattr(agents.db_ops, "get_recent_pushes", lambda user_id, limit=8: recent_papers)
-    monkeypatch.setattr(agents.db_ops, "get_latest_push", lambda user_id: {})
+    monkeypatch.setattr(agents, "_daily_note_reading_entries", lambda **_kwargs: daily_entries)
 
     def fake_answer_question(user_id, question, *, limit=8, pinned_nodes=None, **_kwargs):
         captured["question"] = question
@@ -397,28 +708,25 @@ def test_desktop_wiki_ask_pins_recent_papers_for_trend_questions(monkeypatch: py
     first = captured["pinned_nodes"][0]
     second = captured["pinned_nodes"][1]
     assert first["node_type"] == "paper"
-    assert first["metadata"]["source"] == "recent_daily_push"
+    assert first["metadata"]["source"] == "daily_note_deep_reading"
     assert "Agentic memory improves long horizon" in first["body"]
-    assert "Category: high_match" in first["body"]
-    assert "cs.IR" in second["body"]
+    assert first["metadata"]["report_path"] == str(first_report)
+    assert "Retrieval agents connect paper figures" in second["body"]
 
 
-def test_desktop_wiki_ask_stream_pins_recent_papers_for_trend_questions(monkeypatch: pytest.MonkeyPatch) -> None:
-    recent_paper = {
-        "id": "paper-stream-1",
+def test_desktop_wiki_ask_stream_pins_daily_note_readings_for_trend_questions(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    report = tmp_path / "personalized-trend.md"
+    report.write_text("User feedback is aggregated into daily research trend summaries.", encoding="utf-8")
+    daily_entry = {
         "title": "Personalized Research Trend Mining",
-        "abstract": "User feedback is aggregated into daily research trend summaries.",
-        "authors": ["E. Analyst"],
-        "subjects": ["cs.DL"],
-        "category": "profile_match",
-        "rank": 1,
-        "score": 0.91,
-        "push_id": "push_stream",
+        "topic": "Memory, Personalization & Long-Horizon Agents",
+        "summary": "User feedback is aggregated into daily research trend summaries.",
+        "report_path": str(report),
+        "daily_note": "/vault/Daily Note - Jun 2026.md",
     }
     captured = {}
 
-    monkeypatch.setattr(agents.db_ops, "get_recent_pushes", lambda user_id, limit=8: [recent_paper])
-    monkeypatch.setattr(agents.db_ops, "get_latest_push", lambda user_id: {})
+    monkeypatch.setattr(agents, "_daily_note_reading_entries", lambda **_kwargs: [daily_entry])
 
     def fake_answer_question_stream(user_id, question, *, limit=8, pinned_nodes=None, **_kwargs):
         captured["pinned_nodes"] = pinned_nodes or []
@@ -432,39 +740,32 @@ def test_desktop_wiki_ask_stream_pins_recent_papers_for_trend_questions(monkeypa
 
     assert [event["event"] for event in events] == ["meta", "chunk", "done"]
     assert captured["pinned_nodes"][0]["title"] == "Personalized Research Trend Mining"
-    assert captured["pinned_nodes"][0]["metadata"]["source"] == "recent_daily_push"
+    assert captured["pinned_nodes"][0]["metadata"]["source"] == "daily_note_deep_reading"
     assert events[-1]["data"]["mode"] == "wiki"
 
 
-def test_desktop_wiki_ask_pins_filtered_recent_papers_for_rag_summary(monkeypatch: pytest.MonkeyPatch) -> None:
-    recent_papers = [
+def test_desktop_wiki_ask_pins_filtered_daily_note_readings_for_rag_summary(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    rag_report = tmp_path / "rag-agents.md"
+    rag_report.write_text("Retrieval augmented generation agents summarize recent papers with citations.", encoding="utf-8")
+    daily_entries = [
         {
-            "id": "rag-paper",
             "title": "RAG Agents for Literature Review",
-            "abstract": "Retrieval augmented generation agents summarize recent papers with citations.",
-            "authors": ["A. RAG"],
-            "subjects": ["cs.IR"],
-            "category": "high_match",
-            "rank": 1,
-            "score": 0.93,
-            "push_id": "push_rag",
+            "topic": "Language Models",
+            "summary": "Retrieval augmented generation agents summarize recent papers with citations.",
+            "report_path": str(rag_report),
+            "daily_note": "/vault/Daily Note - Jun 2026.md",
         },
         {
-            "id": "vision-paper",
             "title": "Vision Transformers for Segmentation",
-            "abstract": "A segmentation model unrelated to retrieval augmented generation.",
-            "authors": ["V. Author"],
-            "subjects": ["cs.CV"],
-            "category": "explore",
-            "rank": 2,
-            "score": 0.75,
-            "push_id": "push_rag",
+            "topic": "Multimodal Models & Visual Reasoning",
+            "summary": "A segmentation model unrelated to retrieval augmented generation.",
+            "report_path": str(tmp_path / "missing-vision.md"),
+            "daily_note": "/vault/Daily Note - Jun 2026.md",
         },
     ]
     captured = {}
 
-    monkeypatch.setattr(agents.db_ops, "get_recent_pushes", lambda user_id, limit=32: recent_papers)
-    monkeypatch.setattr(agents.db_ops, "get_latest_push", lambda user_id: {})
+    monkeypatch.setattr(agents, "_daily_note_reading_entries", lambda **_kwargs: daily_entries[:1])
 
     def fake_answer_question(user_id, question, *, limit=8, pinned_nodes=None, **_kwargs):
         captured["pinned_nodes"] = pinned_nodes or []
@@ -708,6 +1009,32 @@ def test_desktop_chat_history_persists_streaming_answers(monkeypatch: pytest.Mon
     assert len(session["messages"]) == 2
     assert session["messages"][1]["content"] == "RAG 是检索增强生成"
     assert session["messages"][1]["metadata"]["streaming"]["transport"] == "sse"
+
+
+def test_desktop_chat_history_can_be_cleared(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(agents.db_ops, "DB_PATH", tmp_path / "paperflow-chat-clear.db")
+    agents.db_ops.init_db()
+
+    first = agents.db_ops.create_chat_session(user_id="user_test", title="first")
+    second = agents.db_ops.create_chat_session(user_id="user_test", title="second")
+    agents.db_ops.save_chat_message(
+        user_id="user_test",
+        session_id=first["session_id"],
+        role="user",
+        content="hello",
+    )
+    agents.db_ops.save_chat_message(
+        user_id="user_test",
+        session_id=second["session_id"],
+        role="assistant",
+        content="world",
+    )
+
+    result = agents.clear_chat_sessions("user_test")
+
+    assert result == {"deleted": 2}
+    assert agents.chat_sessions("user_test")["sessions"] == []
+    assert agents.db_ops.get_chat_session("user_test", first["session_id"]) is None
 
 
 def test_desktop_wiki_answer_stream_uses_longer_default_completion_budget(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1492,19 +1819,24 @@ def test_desktop_wiki_frontend_derives_architecture_from_backend_graph() -> None
     assert "candidateLabelsForNode" in script
     assert "architecture:core" in script
     assert "知识库架构" in script
-    assert "原始节点" in script
+    assert "真实图谱" in script
     assert "related_papers" in script
-    assert "setWikiMapFocus(\"architecture:core\")" in script
+    assert 'setWikiMapFocus(pickWikiFocusNodeId() || "architecture:core")' in script
+    assert "wikiStatsText" in script
+    assert "wikiDailyGraphParams" in script
+    assert 'id="wikiDailyScope"' in html
+    assert 'id="wikiDailyMonth"' in html
     assert "wikiMapCatalog" not in script
     assert "concept:structured-memory" not in script
     assert "concept:agent" not in script
-    assert "&limit=48" in script
+    assert "&limit=120" in script
     assert "const query = rawQuery ||" not in script
     assert 'DEMO_MODE ? demoWikiNodes : []' in script
     assert 'class="wiki-entry-body"' in html
     assert "Wiki 架构图" in html
     assert "grid-template-columns: minmax(760px, 1fr) 292px" in css
     assert "repeating-linear-gradient(115deg" in css
+    assert ".wiki-graph.real .graph-node.small .node-label" in css
     assert ".wiki-evidence-pane" in css
     assert "position: sticky" in css
     assert "left: calc(100% + 9px)" in css
@@ -1690,6 +2022,7 @@ def test_desktop_wiki_chat_supports_clickable_citations_streaming_and_mentions()
     assert 'id="chatMentionChips"' in html
     assert 'id="chatHistoryList"' in html
     assert 'id="newChatBtn"' in html
+    assert 'id="clearChatHistoryBtn"' in html
     assert "quick-prompts" not in html
     assert "总结 RAG 趋势" not in html
     assert "对比两篇方法" not in html
@@ -1697,7 +2030,11 @@ def test_desktop_wiki_chat_supports_clickable_citations_streaming_and_mentions()
     assert "/api/wiki/ask/stream" in script
     assert "quick-prompts" not in script
     assert "/api/chat/sessions" in script
+    assert "/api/chat/sessions/clear" in script
     assert "/api/chat/session" in script
+    assert "function clearChatHistory()" in script
+    assert "此操作不会删除 Wiki 或精读报告" in script
+    assert "clearChatHistoryBtn" in script
     assert "loadChatSessions({ openLatest: true })" in script
     assert "session_id: state.chatSessionId || \"\"" in script
     assert "state.chatSessionId = data.session_id" in script
@@ -1706,6 +2043,7 @@ def test_desktop_wiki_chat_supports_clickable_citations_streaming_and_mentions()
     assert "后端还没加载聊天历史接口" in script
     assert 'document.body.classList.toggle("chat-view", name === "chat")' in script
     assert "streamWikiAsk(payload, answerTarget, message)" in script
+    assert "/api/wiki/mentions" in script
     assert "renderAnswerWithCitations" in script
     assert "let doneReceived = false" in script
     assert "doneReceived = true" in script
@@ -2210,6 +2548,31 @@ def test_reading_report_writes_obsidian_deep_reading_and_daily_note(
     assert "生成式人工智能在K-12教育场景中的实际应用模式与早期学业信号" not in daily_text
     assert "https://arxiv.org/pdf/2605.16277" in daily_text
     assert "[[Daily Note - May 2026]]" in toc.read_text(encoding="utf-8")
+
+
+def test_daily_note_topic_summary_methods_use_user_profile() -> None:
+    content = """
+# Agent Skills, Harness & Tooling
+
+<!-- paperflow:1234567890abcdef -->
+## Reliable Tool Use for Research Agents
+
+- **这篇论文研究 tool orchestration 和 multi-agent harness 如何提升科研代理的可靠性。**
+""".strip()
+    profile = {
+        "core_directions": {"tool orchestration": 0.9, "reward modeling": 0.8},
+        "topic_weights": {"multi-agent harness": 0.7},
+        "must_read": {"keywords": ["research agents", "diffusion"]},
+    }
+
+    refreshed = reading_agent._refresh_daily_note_topic_summaries(  # noqa: SLF001 - summary contract
+        content,
+        user_profile=profile,
+    )
+
+    assert "- 方法：tool orchestration, multi-agent harness, research agents" in refreshed
+    assert "reward modeling" not in refreshed
+    assert "diffusion" not in refreshed
 
 
 def test_obsidian_daily_note_category_uses_word_boundaries() -> None:

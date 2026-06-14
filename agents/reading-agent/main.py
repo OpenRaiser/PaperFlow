@@ -114,6 +114,47 @@ MONTH_LABELS = {
     12: "Dec",
 }
 
+DAILY_NOTE_CATEGORY_OPTIONS = [
+    "On-Policy Distillation & Post-Training",
+    "Multimodal Models & Visual Reasoning",
+    "Reward Models & Reinforcement Learning",
+    "Data, Benchmarking & Evaluation",
+    "World Models, Generation & Audio",
+    "Research Agents & Scientific Discovery",
+    "Web, GUI & Computer-Use Agents",
+    "Agent Skills, Harness & Tooling",
+    "Memory, Personalization & Long-Horizon Agents",
+    "AI for Science & Biology",
+    "Foundation AI & AGI",
+    "AI for Education",
+    "Language Models",
+    "Machine Learning",
+    "AI Agents",
+    "AI Research",
+]
+
+DAILY_NOTE_CLASSIFICATION_PROMPT = """You are PaperFlow's Daily Note curator.
+
+Your task is to review a monthly Daily Note after a new deep-reading paper has
+been inserted. Assign every paper to exactly one category from the allowed list.
+
+Rules:
+- Return JSON only.
+- Use only category names from allowed_categories.
+- Preserve every paper marker exactly.
+- Do not invent papers or remove papers.
+- Prefer specific research themes over broad buckets.
+- If a paper crosses multiple areas, choose the category most useful for later retrieval.
+- Use user_profile as the user's research context when two categories are both plausible.
+
+Expected JSON:
+{
+  "assignments": [
+    {"marker": "<!-- paperflow:... -->", "category": "Allowed Category"}
+  ]
+}
+"""
+
 
 def _env_flag(name: str, default: bool = False) -> bool:
     raw = os.environ.get(name)
@@ -1941,6 +1982,7 @@ def _prune_empty_daily_note_sections(text: str) -> str:
 
 def _sync_obsidian_daily_note(
     *,
+    user_id: str,
     paper: Dict[str, Any],
     report_payload: Dict[str, Any],
     report_path: Path,
@@ -1971,9 +2013,312 @@ def _sync_obsidian_daily_note(
         updated = current.rstrip() + "\n\n" + entry
     else:
         updated = current[:next_section].rstrip() + "\n\n" + entry + "\n" + current[next_section:].lstrip("\n")
+    user_profile = _daily_note_user_profile(user_id)
+    updated = _refresh_daily_note_topic_summaries(updated, user_profile=user_profile)
+    updated = _llm_review_daily_note_categories(updated, user_profile=user_profile)
+    updated = _refresh_daily_note_topic_summaries(updated, user_profile=user_profile)
     daily_note.write_text(updated.rstrip() + "\n", encoding="utf-8")
     _sync_obsidian_toc(daily_note)
     return str(daily_note)
+
+
+def _daily_note_user_profile(user_id: str) -> Dict[str, Any]:
+    if not user_id:
+        return {}
+    try:
+        profile = get_profile(user_id) or {}
+        return ensure_profile_schema(profile) if isinstance(profile, dict) else {}
+    except Exception as exc:
+        print(f"  Daily Note profile lookup skipped: {exc}")
+        return {}
+
+
+def _daily_note_profile_terms(user_profile: Optional[Dict[str, Any]]) -> List[str]:
+    profile = user_profile if isinstance(user_profile, dict) else {}
+    terms: List[str] = []
+
+    def add_term(value: Any) -> None:
+        text = _clean_text(value)
+        if not text:
+            return
+        text = re.sub(r"^(preference|prefer|methodology)[_-]+", "", text, flags=re.IGNORECASE)
+        text = text.replace("_", " ").strip()
+        if len(text) >= 2 and text.lower() not in {term.lower() for term in terms}:
+            terms.append(text)
+
+    def add_weighted_keys(mapping: Any) -> None:
+        if not isinstance(mapping, dict):
+            return
+        weighted = []
+        for key, value in mapping.items():
+            try:
+                weight = float(value)
+            except (TypeError, ValueError):
+                weight = 0.0
+            weighted.append((str(key), weight))
+        for key, _weight in sorted(weighted, key=lambda item: item[1], reverse=True):
+            add_term(key)
+
+    add_weighted_keys(profile.get("core_directions"))
+    add_weighted_keys(profile.get("topic_weights"))
+
+    preferences = profile.get("methodology_preferences") or {}
+    if isinstance(preferences, dict):
+        for key, value in preferences.items():
+            if value:
+                add_term(key)
+                if isinstance(value, str):
+                    add_term(value)
+                elif isinstance(value, (list, tuple, set)):
+                    for item in value:
+                        add_term(item)
+
+    must_read = profile.get("must_read") or {}
+    if isinstance(must_read, dict):
+        for keyword in must_read.get("keywords") or []:
+            add_term(keyword)
+
+    return terms
+
+
+def _term_matches_daily_note_section(term: str, section_text: str) -> bool:
+    normalized_term = _clean_text(term).replace("_", " ").replace("-", " ").lower()
+    normalized_section = _clean_text(section_text).replace("_", " ").replace("-", " ").lower()
+    if not normalized_term or not normalized_section:
+        return False
+    if normalized_term in normalized_section:
+        return True
+    tokens = [token for token in re.split(r"[^0-9a-zA-Z\u4e00-\u9fff]+", normalized_term) if len(token) >= 3]
+    return bool(tokens) and all(token in normalized_section for token in tokens)
+
+
+def _daily_note_topic_methods(section_body: str, user_profile: Optional[Dict[str, Any]]) -> List[str]:
+    section_text = re.sub(r"\s+", " ", section_body)
+    matches: List[str] = []
+    for term in _daily_note_profile_terms(user_profile):
+        if _term_matches_daily_note_section(term, section_text):
+            matches.append(term)
+    return matches[:8]
+
+
+def _daily_note_profile_payload(user_profile: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    profile = user_profile if isinstance(user_profile, dict) else {}
+    must_read = profile.get("must_read") or {}
+    must_read_keywords = must_read.get("keywords") if isinstance(must_read, dict) else []
+    return {
+        "core_directions": profile.get("core_directions") or {},
+        "topic_weights": profile.get("topic_weights") or {},
+        "methodology_preferences": profile.get("methodology_preferences") or {},
+        "must_read_keywords": must_read_keywords or [],
+    }
+
+
+def _daily_note_topic_summary(
+    category: str,
+    section_body: str,
+    *,
+    user_profile: Optional[Dict[str, Any]] = None,
+) -> str:
+    titles = re.findall(r"^##\s+(.+)$", section_body, flags=re.MULTILINE)
+    method_terms = _daily_note_topic_methods(section_body, user_profile)
+    paper_lines = "\n".join(f"- {title}" for title in titles[:8]) or "- 暂无精读论文"
+    return "\n".join(
+        [
+            "<!-- paperflow-topic-summary:start -->",
+            "## PaperFlow Summary",
+            f"- 概念：{category}",
+            f"- 方法：{', '.join(method_terms[:8]) if method_terms else '待从后续精读中沉淀'}",
+            f"- 论文/报告：{len(titles)} 篇",
+            paper_lines,
+            "- 画像/前沿：该主题来自当前精读论文与研究画像的交集，供 Wiki 可视化和后续检索使用。",
+            "<!-- paperflow-topic-summary:end -->",
+        ]
+    )
+
+
+def _extract_daily_note_paper_blocks(content: str) -> List[Dict[str, str]]:
+    text = re.sub(
+        r"\n?<!-- paperflow-topic-summary:start -->.*?<!-- paperflow-topic-summary:end -->\n?",
+        "\n",
+        str(content or ""),
+        flags=re.DOTALL,
+    )
+    sections = list(re.finditer(r"^#\s+(.+)$", text, flags=re.MULTILINE))
+    blocks: List[Dict[str, str]] = []
+    for section_index, section in enumerate(sections):
+        category = section.group(1).strip()
+        start = section.end()
+        end = sections[section_index + 1].start() if section_index + 1 < len(sections) else len(text)
+        body = text[start:end]
+        matches = list(re.finditer(r"(?m)^<!-- paperflow:[0-9a-f]{16} -->$", body))
+        for match_index, marker_match in enumerate(matches):
+            block_start = marker_match.start()
+            block_end = matches[match_index + 1].start() if match_index + 1 < len(matches) else len(body)
+            block = body[block_start:block_end].strip()
+            title_match = re.search(r"(?m)^##\s+(.+)$", block)
+            if not title_match:
+                continue
+            marker = marker_match.group(0).strip()
+            summary_match = re.search(r"-\s+\*\*(.*?)\*\*", block, flags=re.DOTALL)
+            blocks.append(
+                {
+                    "marker": marker,
+                    "title": title_match.group(1).strip(),
+                    "category": category,
+                    "summary": re.sub(r"\s+", " ", summary_match.group(1)).strip() if summary_match else "",
+                    "block": block,
+                }
+            )
+    return blocks
+
+
+def _daily_note_classification_payload(
+    blocks: List[Dict[str, str]],
+    user_profile: Optional[Dict[str, Any]] = None,
+) -> str:
+    papers = [
+        {
+            "marker": block["marker"],
+            "title": block["title"],
+            "current_category": block["category"],
+            "summary": block["summary"][:700],
+        }
+        for block in blocks
+    ]
+    return json.dumps(
+        {
+            "allowed_categories": DAILY_NOTE_CATEGORY_OPTIONS,
+            "user_profile": _daily_note_profile_payload(user_profile),
+            "papers": papers,
+        },
+        ensure_ascii=False,
+    )
+
+
+def _parse_daily_note_classification_response(text: str, markers: set[str]) -> Dict[str, str]:
+    content = str(text or "").strip()
+    if content.startswith("```"):
+        content = re.sub(r"^```(?:json)?\s*", "", content)
+        content = re.sub(r"\s*```$", "", content)
+    start = content.find("{")
+    end = content.rfind("}")
+    if start >= 0 and end > start:
+        content = content[start : end + 1]
+    parsed = json.loads(content)
+    assignments = parsed.get("assignments") if isinstance(parsed, dict) else None
+    if not isinstance(assignments, list):
+        return {}
+    allowed = set(DAILY_NOTE_CATEGORY_OPTIONS)
+    result: Dict[str, str] = {}
+    for item in assignments:
+        if not isinstance(item, dict):
+            continue
+        marker = str(item.get("marker") or "").strip()
+        category = str(item.get("category") or "").strip()
+        if marker in markers and category in allowed:
+            result[marker] = category
+    return result
+
+
+def _llm_daily_note_category_assignments(
+    blocks: List[Dict[str, str]],
+    user_profile: Optional[Dict[str, Any]] = None,
+) -> Dict[str, str]:
+    if not blocks or not _env_flag("PAPERFLOW_DAILY_NOTE_LLM_CLASSIFY", True):
+        return {}
+    try:
+        provider_module = importlib.import_module("paperflow.providers")
+        llm = provider_module.build_llm_provider()
+        if getattr(llm, "name", "") == "mock":
+            return {}
+        response = llm.generate(
+            _daily_note_classification_payload(blocks, user_profile=user_profile),
+            system=DAILY_NOTE_CLASSIFICATION_PROMPT,
+            temperature=0.0,
+            max_tokens=4096,
+        )
+        return _parse_daily_note_classification_response(
+            response.text,
+            {block["marker"] for block in blocks},
+        )
+    except Exception as exc:
+        print(f"  Daily Note LLM classification skipped: {exc}")
+        return {}
+
+
+def _rebuild_daily_note_from_blocks(
+    blocks: List[Dict[str, str]],
+    assignments: Dict[str, str],
+    *,
+    user_profile: Optional[Dict[str, Any]] = None,
+) -> str:
+    grouped: Dict[str, List[Dict[str, str]]] = {}
+    ordered_categories: List[str] = []
+    for block in blocks:
+        category = assignments.get(block["marker"]) or block["category"] or "AI Research"
+        if category not in grouped:
+            grouped[category] = []
+            ordered_categories.append(category)
+        grouped[category].append(block)
+    preferred_order = [category for category in DAILY_NOTE_CATEGORY_OPTIONS if category in grouped]
+    preferred_order.extend(category for category in ordered_categories if category not in preferred_order)
+    sections = []
+    for category in preferred_order:
+        section_body = "\n\n".join(block["block"] for block in grouped[category])
+        sections.append(
+            f"# {category}\n\n"
+            f"{_daily_note_topic_summary(category, section_body, user_profile=user_profile)}\n\n"
+            f"{section_body}"
+        )
+    return "\n\n".join(sections).rstrip() + "\n"
+
+
+def _llm_review_daily_note_categories(
+    content: str,
+    *,
+    user_profile: Optional[Dict[str, Any]] = None,
+) -> str:
+    blocks = _extract_daily_note_paper_blocks(content)
+    if not blocks:
+        return content
+    assignments = _llm_daily_note_category_assignments(blocks, user_profile=user_profile)
+    if not assignments:
+        return content
+    return _rebuild_daily_note_from_blocks(blocks, assignments, user_profile=user_profile)
+
+
+def _refresh_daily_note_topic_summaries(
+    content: str,
+    *,
+    user_profile: Optional[Dict[str, Any]] = None,
+) -> str:
+    text = re.sub(
+        r"\n?<!-- paperflow-topic-summary:start -->.*?<!-- paperflow-topic-summary:end -->\n?",
+        "\n",
+        str(content or ""),
+        flags=re.DOTALL,
+    )
+    matches = list(re.finditer(r"^#\s+(.+)$", text, flags=re.MULTILINE))
+    if not matches:
+        return text
+    pieces: List[str] = []
+    for index, match in enumerate(matches):
+        start = match.start()
+        body_start = match.end()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        if index == 0:
+            pieces.append(text[:body_start])
+        else:
+            pieces.append(text[start:body_start])
+        category = match.group(1).strip()
+        section_body = text[body_start:end]
+        pieces.append("\n\n")
+        pieces.append(_daily_note_topic_summary(category, section_body, user_profile=user_profile))
+        pieces.append("\n")
+        pieces.append(section_body.strip("\n"))
+        if index + 1 < len(matches):
+            pieces.append("\n\n")
+    return "\n".join(part.rstrip("\n") for part in pieces if part is not None).strip() + "\n"
 
 
 def _sync_obsidian_toc(daily_note: Path) -> None:
@@ -2047,6 +2392,7 @@ def _save_reading_report_markdown(
         encoding="utf-8",
     )
     daily_note_written = _sync_obsidian_daily_note(
+        user_id=user_id,
         paper=paper,
         report_payload=report_payload,
         report_path=report_path,

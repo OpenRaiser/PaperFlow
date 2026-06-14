@@ -21,9 +21,12 @@
     wikiNodes: [],
     wikiGraph: null,
     wikiMap: null,
+    wikiStats: null,
     currentWikiNodeId: "",
     currentWikiEditNodeId: "",
     wikiView: "graph",
+    wikiGraphTransform: { scale: 1, x: 0, y: 0 },
+    wikiGraphDragMoved: false,
     currentProfile: null,
     profileLoadToken: 0,
     chatSessionId: "",
@@ -1865,12 +1868,64 @@
   }
 
   function layoutGraph(nodes, edges) {
-    const map = buildWikiMap(nodes, edges);
+    const sourceNodes = uniqueGraphNodes((nodes || []).filter((node) => graphId(node).trim()));
+    const sourceNodeIds = new Set(sourceNodes.map((node) => graphId(node)));
+    const sourceEdges = (edges || [])
+      .map(normalizeGraphEdge)
+      .filter((edge) => sourceNodeIds.has(edge.src_id) && sourceNodeIds.has(edge.dst_id));
+    const degree = graphDegreeMap(sourceNodes, sourceEdges);
+    const groups = {
+      topic: { x: 26, y: 31, nodes: [] },
+      paper: { x: 42, y: 64, nodes: [] },
+      method: { x: 70, y: 58, nodes: [] },
+      frontier: { x: 74, y: 28, nodes: [] }
+    };
+    sourceNodes
+      .slice()
+      .sort((a, b) => (degree[graphId(b)] || 0) - (degree[graphId(a)] || 0))
+      .forEach((node) => {
+        const type = graphType(node);
+        (groups[type] || groups.topic).nodes.push(node);
+      });
+
+    const mapNodes = [];
+    Object.entries(groups).forEach(([type, group]) => {
+      const count = Math.max(1, group.nodes.length);
+      group.nodes.forEach((node, index) => {
+        const ring = Math.floor(index / 18);
+        const slot = index % 18;
+        const angle = (slot / Math.min(18, count)) * Math.PI * 2 + ring * 0.38;
+        const radiusX = 7 + ring * 6 + (type === "paper" ? 3 : 0);
+        const radiusY = 6 + ring * 4.5 + (type === "paper" ? 2 : 0);
+        const id = graphId(node);
+        const score = degree[id] || 0;
+        mapNodes.push({
+          ...node,
+          id,
+          node_id: id,
+          type,
+          x: clamp(group.x + Math.cos(angle) * radiusX, 5, 94),
+          y: clamp(group.y + Math.sin(angle) * radiusY, 8, 91),
+          size: score >= 2.5 ? "large" : score >= 1.0 ? "medium" : "small",
+          real_node_id: id
+        });
+      });
+    });
+    const map = {
+      nodes: mapNodes,
+      edges: sourceEdges,
+      sourceNodes,
+      sourceEdges,
+      byId: Object.fromEntries(mapNodes.map((node) => [node.id, node]))
+    };
     state.wikiMap = map;
+    const focusId = state.currentWikiNodeId && map.byId[state.currentWikiNodeId]
+      ? state.currentWikiNodeId
+      : pickWikiFocusNodeId();
     return {
       nodes: map.nodes.map((node) => ({ ...node, x: node.x, y: node.y, type: node.type, size: node.size })),
       edges: map.edges,
-      centerId: state.currentWikiNodeId && map.byId[state.currentWikiNodeId] ? state.currentWikiNodeId : "architecture:core",
+      centerId: focusId || graphId(map.nodes[0] || {}),
       sourceCount: map.sourceNodes.length,
       sourceEdgeCount: map.sourceEdges.length
     };
@@ -1892,7 +1947,13 @@
       `;
       return;
     }
-    const byId = Object.fromEntries(layout.nodes.map((node) => [node.id, node]));
+    const spread = state.wikiGraphTransform.scale;
+    const visualNodes = layout.nodes.map((node) => ({
+      ...node,
+      x: 50 + (Number(node.x) - 50) * spread,
+      y: 50 + (Number(node.y) - 50) * spread
+    }));
+    const byId = Object.fromEntries(visualNodes.map((node) => [node.id, node]));
     const lineHtml = layout.edges.map((edge, index) => {
       const a = byId[String(edge.src_id)];
       const b = byId[String(edge.dst_id)];
@@ -1900,13 +1961,15 @@
       const weightClass = graphWeight(edge) >= 0.78 || a.id === layout.centerId || b.id === layout.centerId
         ? "strong"
         : graphWeight(edge) >= 0.35 ? "medium" : "light";
-      const curve = index % 2 === 0 ? 4 : -4;
+      const curve = (index % 2 === 0 ? 4 : -4) * Math.max(0.8, Math.min(spread, 1.8));
       const midX = (a.x + b.x) / 2 + curve;
       const midY = (a.y + b.y) / 2 - curve;
       return `<path class="graph-svg-link ${weightClass}" d="M ${a.x} ${a.y} Q ${midX} ${midY} ${b.x} ${b.y}"></path>`;
     }).join("");
     const activeNodeId = state.currentWikiNodeId || layout.centerId;
-    const nodeHtml = layout.nodes.map((node) => `
+    const nodeZoom = Math.max(0.82, Math.min(1.18, 0.9 + spread * 0.1));
+    const labelZoom = Math.max(0.9, Math.min(1.22, 0.94 + spread * 0.08));
+    const nodeHtml = visualNodes.map((node) => `
       <button
         class="graph-node ${node.type} ${node.size || "medium"} ${node.id === activeNodeId ? "active" : ""}"
         data-node-id="${escapeHtml(graphId(node))}"
@@ -1914,21 +1977,26 @@
         data-node-title="${escapeHtml(graphTitle(node))}"
         data-node-body="${escapeHtml(graphBody(node))}"
         title="${escapeHtml(graphTitle(node))}"
-        style="left:${node.x}%;top:${node.y}%"
+        style="left:${node.x}%;top:${node.y}%;--node-zoom:${nodeZoom};--label-zoom:${labelZoom}"
         type="button"
       >
         <span class="node-dot"></span>
         <span class="node-label">${escapeHtml(graphTitle(node))}</span>
       </button>
     `).join("");
+    target.classList.toggle("real", hasBackendGraph);
+    const totalNodes = Number(state.wikiStats?.nodes || layout.sourceCount || 0);
     const graphNote = hasBackendGraph
-      ? `知识库架构 · ${layout.sourceCount} 原始节点 / ${layout.sourceEdgeCount} 原始关系 → ${layout.nodes.length} 展示节点`
+      ? `真实图谱 · 展示 ${layout.nodes.length} / 全库 ${totalNodes} 节点 · ${layout.sourceEdgeCount} 条当前关系`
       : state.wikiNodes.length
         ? `当前检索结果 · ${layout.sourceCount} 原始节点 → ${layout.nodes.length} 展示节点`
         : "本地预览数据";
     target.innerHTML = `
       <div class="graph-canvas">
-        <svg class="graph-svg" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">${lineHtml}</svg>
+        <div class="graph-viewport">
+          <svg class="graph-svg" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">${lineHtml}</svg>
+          ${nodeHtml}
+        </div>
         <div class="graph-legend">
           <span><i class="legend-dot topic"></i>概念</span>
           <span><i class="legend-dot method"></i>方法</span>
@@ -1940,10 +2008,41 @@
           <button data-graph-action="zoom-out" type="button" title="缩小">－</button>
           <button data-graph-action="focus" type="button" title="聚焦中心">⌖</button>
         </div>
-        ${nodeHtml}
       </div>
       <div class="graph-note">${graphNote}</div>
     `;
+    applyWikiGraphTransform();
+  }
+
+  function clampWikiGraphPan() {
+    const graph = $("wikiGraph");
+    if (!graph) return;
+    const rect = graph.getBoundingClientRect();
+    const scale = state.wikiGraphTransform.scale;
+    const limitX = Math.max(180, rect.width * scale * 0.7);
+    const limitY = Math.max(180, rect.height * scale * 0.7);
+    state.wikiGraphTransform.x = clamp(state.wikiGraphTransform.x, -limitX, limitX);
+    state.wikiGraphTransform.y = clamp(state.wikiGraphTransform.y, -limitY, limitY);
+  }
+
+  function applyWikiGraphTransform() {
+    clampWikiGraphPan();
+    const viewport = $("wikiGraph")?.querySelector(".graph-viewport");
+    if (!viewport) return;
+    const { scale, x, y } = state.wikiGraphTransform;
+    viewport.style.transform = `translate(${x}px, ${y}px)`;
+    viewport.dataset.zoom = scale.toFixed(2);
+  }
+
+  function zoomWikiGraph(delta) {
+    const previousScale = state.wikiGraphTransform.scale;
+    state.wikiGraphTransform.scale = clamp(previousScale * delta, 0.45, 2.4);
+    if (state.wikiView === "graph") renderWikiGraph();
+  }
+
+  function resetWikiGraphTransform() {
+    state.wikiGraphTransform = { scale: 1, x: 0, y: 0 };
+    applyWikiGraphTransform();
   }
 
   function renderWikiList() {
@@ -1998,13 +2097,38 @@
     });
     return (candidates.length ? candidates : nodes).reduce((best, node) => {
       const id = graphId(node);
-      const typeBoost = graphType(node) === "topic" ? 1.2 : graphType(node) === "paper" ? 0.7 : 0.4;
+      const typeBoost = graphType(node) === "paper" ? 2.0 : graphType(node) === "topic" ? 1.2 : 0.4;
       const score = (degree[id] || 0) + Number(node.score || 0) + typeBoost;
       const bestNode = nodes.find((item) => graphId(item) === best);
-      const bestTypeBoost = bestNode && graphType(bestNode) === "topic" ? 1.2 : bestNode && graphType(bestNode) === "paper" ? 0.7 : 0.4;
+      const bestTypeBoost = bestNode && graphType(bestNode) === "paper" ? 2.0 : bestNode && graphType(bestNode) === "topic" ? 1.2 : 0.4;
       const bestScore = (degree[best] || 0) + Number(bestNode?.score || 0) + bestTypeBoost;
       return score > bestScore ? id : best;
     }, graphId(candidates[0] || nodes[0]));
+  }
+
+  function wikiStatsText(stats, suffix = "") {
+    const byType = stats.nodes_by_type || {};
+    const typeParts = [
+      byType.paper ? `论文 ${byType.paper}` : "",
+      byType.topic ? `主题 ${byType.topic}` : "",
+      byType.section ? `片段 ${byType.section}` : "",
+      byType.trajectory ? `轨迹 ${byType.trajectory}` : ""
+    ].filter(Boolean).join(" · ");
+    const wikiDirText = stats.wiki_dir ? ` · 目录 ${stats.wiki_dir}` : "";
+    const typeText = typeParts ? ` · ${typeParts}` : "";
+    return `节点 ${stats.nodes || 0} · 关系 ${stats.edges || 0} · 引用 ${stats.citations || 0}${typeText}${wikiDirText}${suffix}`;
+  }
+
+  function wikiDailyGraphParams() {
+    const scope = $("wikiDailyScope")?.value || "latest";
+    const month = $("wikiDailyMonth")?.value || "";
+    const params = new URLSearchParams({
+      user_id: currentUser(),
+      limit: "80",
+      daily_scope: scope
+    });
+    if (scope === "month" && month) params.set("daily_month", month);
+    return params.toString();
   }
 
   function relatedWikiNodes(nodeId) {
@@ -2148,19 +2272,19 @@
 
   async function loadWiki() {
     const stats = await api(`/api/wiki/stats?user_id=${encodeURIComponent(currentUser())}`);
+    state.wikiStats = stats;
     $("wikiNodeStat").textContent = stats.nodes || 0;
     $("wikiSettingStat").textContent = stats.nodes || "-";
-    const wikiDirText = stats.wiki_dir ? ` · 目录 ${stats.wiki_dir}` : "";
-    $("wikiStats").textContent = `节点 ${stats.nodes || 0} · 关系 ${stats.edges || 0} · 引用 ${stats.citations || 0}${wikiDirText}`;
+    $("wikiStats").textContent = wikiStatsText(stats);
     try {
-      state.wikiGraph = await api(`/api/wiki/graph?user_id=${encodeURIComponent(currentUser())}&limit=48`);
+      state.wikiGraph = await api(`/api/wiki/graph?${wikiDailyGraphParams()}`);
     } catch (error) {
       console.warn("Wiki graph unavailable, falling back to search nodes.", error);
       state.wikiGraph = null;
     }
     state.wikiNodes = state.wikiGraph?.nodes || [];
     if (!state.wikiNodes.length && Number(stats.nodes || 0) > 0) {
-      const fallback = await api(`/api/wiki/search?user_id=${encodeURIComponent(currentUser())}&limit=48`);
+      const fallback = await api(`/api/wiki/search?user_id=${encodeURIComponent(currentUser())}&limit=120`);
       state.wikiNodes = fallback.nodes || [];
       if (state.wikiNodes.length) {
         state.wikiGraph = {
@@ -2170,12 +2294,12 @@
           source: "wiki_search_fallback",
           query: ""
         };
-        $("wikiStats").textContent = `节点 ${stats.nodes || 0} · 关系 ${stats.edges || 0} · 引用 ${stats.citations || 0}${wikiDirText} · 已用节点列表恢复`;
+        $("wikiStats").textContent = wikiStatsText(stats, " · 已用节点列表恢复");
       }
     }
     if (state.wikiView === "graph") {
       renderWikiGraph();
-      setWikiMapFocus("architecture:core");
+      setWikiMapFocus(pickWikiFocusNodeId() || "architecture:core");
     } else {
       const focusId = pickWikiFocusNodeId();
       const focusNode = graphNodesById()[focusId];
@@ -2199,7 +2323,7 @@
     const nodes = data.nodes || [];
     state.wikiNodes = nodes;
     try {
-      const graph = await api(`/api/wiki/graph?user_id=${encodeURIComponent(currentUser())}&q=${encodeURIComponent(rawQuery)}&limit=48`);
+      const graph = await api(`/api/wiki/graph?user_id=${encodeURIComponent(currentUser())}&q=${encodeURIComponent(rawQuery)}&limit=120`);
       if (graph.nodes?.length) state.wikiGraph = graph;
     } catch (error) {
       console.warn("Wiki search graph unavailable.", error);
@@ -2475,6 +2599,27 @@
     renderChatHistory({ sessions: state.chatHistory, groups: state.chatHistoryGroups });
   }
 
+  async function clearChatHistory() {
+    const count = state.chatHistory.length;
+    if (!count) {
+      showFeedbackToast("warning", "暂无历史对话", "当前没有可清空的对话记录。");
+      return;
+    }
+    const confirmed = window.confirm(`确定清空 ${count} 段历史对话吗？此操作不会删除 Wiki 或精读报告。`);
+    if (!confirmed) return;
+    const data = await api("/api/chat/sessions/clear", {
+      method: "POST",
+      body: JSON.stringify({ user_id: currentUser() })
+    });
+    state.chatSessionId = "";
+    state.chatHistory = [];
+    state.chatHistoryGroups = [];
+    resetChatThread();
+    renderChatSources([]);
+    renderChatHistory({ sessions: [], groups: [] });
+    showFeedbackToast("success", "已清空历史对话", `删除 ${data.deleted || count} 段对话。`);
+  }
+
   function startNewChat(options = {}) {
     state.chatSessionId = "";
     state.chatLoadToken += 1;
@@ -2660,7 +2805,7 @@
       return;
     }
     const token = ++state.mentionSearchToken;
-    const data = await api(`/api/wiki/search?user_id=${encodeURIComponent(currentUser())}&q=${encodeURIComponent(context.query)}&limit=6`);
+    const data = await api(`/api/wiki/mentions?user_id=${encodeURIComponent(currentUser())}&q=${encodeURIComponent(context.query)}&limit=6`);
     if (token !== state.mentionSearchToken) return;
     renderMentionSuggestions(data.nodes || []);
   }
@@ -3491,6 +3636,12 @@
 
     $("refreshWikiBtn").addEventListener("click", () => runAction(loadWiki, "更新 Wiki"));
     $("wikiSearchBtn").addEventListener("click", () => runAction(searchWiki, "搜索 Wiki"));
+    $("wikiDailyScope")?.addEventListener("change", () => {
+      const monthInput = $("wikiDailyMonth");
+      if (monthInput) monthInput.hidden = $("wikiDailyScope").value !== "month";
+      runAction(loadWiki, "更新 Wiki");
+    });
+    $("wikiDailyMonth")?.addEventListener("change", () => runAction(loadWiki, "更新 Wiki"));
     document.querySelectorAll("[data-wiki-view]").forEach((button) => {
       button.addEventListener("click", () => setWikiView(button.dataset.wikiView));
     });
@@ -3502,12 +3653,17 @@
       const node = event.target.closest("[data-node-title]");
       if (!action && !node) return;
       event.stopImmediatePropagation();
+      if (state.wikiGraphDragMoved) {
+        state.wikiGraphDragMoved = false;
+        return;
+      }
       if (action) {
-        $("wikiGraph").classList.toggle("zoomed", action === "zoom-in");
-        $("wikiGraph").classList.toggle("compact", action === "zoom-out");
+        if (action === "zoom-in") zoomWikiGraph(1.25);
+        if (action === "zoom-out") zoomWikiGraph(0.8);
         if (action === "focus") {
-          $("wikiGraph").classList.remove("zoomed", "compact");
-          const focus = state.wikiMap?.byId?.["architecture:core"];
+          resetWikiGraphTransform();
+          const focusId = pickWikiFocusNodeId() || "architecture:core";
+          const focus = state.wikiMap?.byId?.[focusId] || graphNodesById()[focusId] || state.wikiMap?.byId?.["architecture:core"];
           if (focus) setWikiEntry(graphTitle(focus), graphBody(focus), graphId(focus), { editNodeId: focus.real_node_id || "" });
         }
         return;
@@ -3519,6 +3675,47 @@
         { editNodeId: node.dataset.realNodeId || "" }
       );
     }, true);
+    let wikiGraphDrag = null;
+    $("wikiGraph").addEventListener("pointerdown", (event) => {
+      if (state.wikiView !== "graph") return;
+      if (event.button !== 0) return;
+      if (event.target.closest("[data-graph-action], [data-node-title]")) return;
+      const canvas = event.target.closest(".graph-canvas");
+      if (!canvas) return;
+      wikiGraphDrag = {
+        pointerId: event.pointerId,
+        startX: event.clientX,
+        startY: event.clientY,
+        baseX: state.wikiGraphTransform.x,
+        baseY: state.wikiGraphTransform.y,
+        moved: false
+      };
+      canvas.classList.add("dragging");
+      $("wikiGraph").setPointerCapture?.(event.pointerId);
+      event.preventDefault();
+    });
+    $("wikiGraph").addEventListener("pointermove", (event) => {
+      if (!wikiGraphDrag || wikiGraphDrag.pointerId !== event.pointerId) return;
+      const dx = event.clientX - wikiGraphDrag.startX;
+      const dy = event.clientY - wikiGraphDrag.startY;
+      if (Math.abs(dx) > 3 || Math.abs(dy) > 3) wikiGraphDrag.moved = true;
+      state.wikiGraphTransform.x = wikiGraphDrag.baseX + dx;
+      state.wikiGraphTransform.y = wikiGraphDrag.baseY + dy;
+      applyWikiGraphTransform();
+      event.preventDefault();
+    });
+    const finishWikiGraphDrag = (event) => {
+      if (!wikiGraphDrag || wikiGraphDrag.pointerId !== event.pointerId) return;
+      state.wikiGraphDragMoved = wikiGraphDrag.moved;
+      $("wikiGraph").querySelector(".graph-canvas")?.classList.remove("dragging");
+      $("wikiGraph").releasePointerCapture?.(event.pointerId);
+      wikiGraphDrag = null;
+      window.setTimeout(() => {
+        state.wikiGraphDragMoved = false;
+      }, 150);
+    };
+    $("wikiGraph").addEventListener("pointerup", finishWikiGraphDrag);
+    $("wikiGraph").addEventListener("pointercancel", finishWikiGraphDrag);
     $("wikiResults").addEventListener("click", (event) => {
       const node = event.target.closest("[data-node-title]");
       if (!node) return;
@@ -3560,6 +3757,7 @@
 
     $("wikiAskBtn").addEventListener("click", () => runAction(askWiki, "生成回答"));
     $("newChatBtn").addEventListener("click", () => runAction(() => startNewChat(), "新建对话"));
+    $("clearChatHistoryBtn").addEventListener("click", () => runAction(clearChatHistory, "清空历史"));
     $("chatHistoryList").addEventListener("click", (event) => {
       const button = event.target.closest("[data-chat-session-id]");
       if (!button) return;

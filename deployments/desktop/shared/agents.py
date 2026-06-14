@@ -17,6 +17,7 @@ import time
 import zipfile
 import yaml
 from paperflow.providers import build_llm_provider
+from paperflow import roles as role_utils
 from copy import deepcopy
 from contextlib import contextmanager
 from datetime import datetime, timedelta
@@ -2107,7 +2108,7 @@ def wiki_stats(user_id: str) -> Dict[str, Any]:
     stats = wiki_db.stats(user_id)
     nodes = _filter_wiki_nodes_for_configured_dir(wiki_db.list_nodes(user_id, limit=10000))
     if nodes is None:
-        return stats
+        return {**stats, "wiki_dir": str(_effective_wiki_dir_for_user(user_id) or stats.get("wiki_dir") or "")}
 
     by_type: Dict[str, int] = {}
     latest = None
@@ -2158,6 +2159,7 @@ def wiki_stats(user_id: str) -> Dict[str, Any]:
         "edges": edge_count,
         "citations": citation_count,
         "latest_update": latest,
+        "wiki_dir": str(_effective_wiki_dir_for_user(user_id) or stats.get("wiki_dir") or ""),
     }
 
 
@@ -2166,6 +2168,7 @@ def wiki_search(user_id: str, query: str = "", node_type: Optional[str] = None, 
     filtered_nodes = _filter_wiki_nodes_for_configured_dir(nodes)
     if filtered_nodes is not None:
         nodes = filtered_nodes
+    nodes = sorted(nodes, key=_wiki_display_priority)
     return {
         "nodes": [
             {
@@ -2175,7 +2178,7 @@ def wiki_search(user_id: str, query: str = "", node_type: Optional[str] = None, 
                 "body": str(node.get("body") or "")[:800],
                 "keywords": node.get("keywords"),
                 "file_path": node.get("file_path"),
-                "metadata": node.get("metadata") or {},
+                "metadata": _compact_wiki_metadata(node.get("metadata") or {}),
                 "score": node.get("score"),
                 "updated_at": node.get("updated_at"),
             }
@@ -2194,6 +2197,28 @@ def _configured_wiki_root() -> Optional[Path]:
     return path
 
 
+def _effective_wiki_dir_for_user(user_id: str) -> Optional[Path]:
+    root = _configured_wiki_root()
+    if root is None:
+        return None
+    label = role_utils.storage_label_for_user_id(user_id, project_root=PROJECT_ROOT)
+    if root.name == label:
+        return root
+    scoped = root / label
+    return scoped if scoped.exists() else root
+
+
+def _wiki_node_file_exists(root: Path, relative_path: str) -> bool:
+    if not relative_path:
+        return False
+    relative = Path(relative_path)
+    if (root / relative).exists():
+        return True
+    if root.name and relative.parts and relative.parts[0] == root.name:
+        return (root / Path(*relative.parts[1:])).exists()
+    return False
+
+
 def _filter_wiki_nodes_for_configured_dir(nodes: Iterable[Dict[str, Any]]) -> Optional[List[Dict[str, Any]]]:
     root = _configured_wiki_root()
     if root is None:
@@ -2201,7 +2226,7 @@ def _filter_wiki_nodes_for_configured_dir(nodes: Iterable[Dict[str, Any]]) -> Op
     filtered = []
     for node in nodes or []:
         relative_path = str(node.get("file_path") or "").strip()
-        if relative_path and (root / relative_path).exists():
+        if _wiki_node_file_exists(root, relative_path):
             filtered.append(node)
     return filtered
 
@@ -2228,17 +2253,512 @@ def _wiki_node_payload(node: Dict[str, Any]) -> Dict[str, Any]:
         "body": str(node.get("body") or "")[:800],
         "keywords": node.get("keywords"),
         "file_path": node.get("file_path"),
-        "metadata": node.get("metadata") or {},
+        "metadata": _compact_wiki_metadata(node.get("metadata") or {}),
         "score": node.get("score"),
         "updated_at": node.get("updated_at"),
     }
 
 
-def wiki_graph(user_id: str, query: str = "", limit: int = 24) -> Dict[str, Any]:
+def _compact_wiki_metadata(value: Any, *, depth: int = 0) -> Any:
+    if depth > 3:
+        return None
+    if isinstance(value, dict):
+        compact: Dict[str, Any] = {}
+        for key, item in value.items():
+            key_text = str(key)
+            if re.search(r"(embedding|vector|long_term_vector|short_term_vector)", key_text, re.I):
+                continue
+            cleaned = _compact_wiki_metadata(item, depth=depth + 1)
+            if cleaned is not None:
+                compact[key_text] = cleaned
+        return compact
+    if isinstance(value, list):
+        if len(value) > 24 and all(isinstance(item, (int, float)) for item in value):
+            return None
+        return [_compact_wiki_metadata(item, depth=depth + 1) for item in value[:24]]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _wiki_display_priority(node: Dict[str, Any]) -> Tuple[int, float]:
+    node_type = str(node.get("node_type") or "")
+    metadata = node.get("metadata") if isinstance(node.get("metadata"), dict) else {}
+    section_kind = str(metadata.get("section_kind") or "").lower()
+    type_rank = {
+        "paper": 0,
+        "topic": 1,
+        "trajectory": 2,
+        "section": 3,
+    }.get(node_type, 4)
+    if node_type == "section":
+        if "q6" in section_kind or "summary" in section_kind or "tldr" in section_kind:
+            type_rank = 1
+        elif "abstract" in section_kind:
+            type_rank = 5
+    try:
+        score = float(node.get("score") or 0)
+    except (TypeError, ValueError):
+        score = 0.0
+    return type_rank, -score
+
+
+def _wiki_graph_node_visible(node: Dict[str, Any]) -> bool:
+    return str(node.get("node_type") or "").strip().lower() != "section"
+
+
+def _wiki_graph_paper_is_reading_report(node: Dict[str, Any]) -> bool:
+    if str(node.get("node_type") or "").strip().lower() != "paper":
+        return False
+    metadata = node.get("metadata") if isinstance(node.get("metadata"), dict) else {}
+    return str(node.get("source_type") or "") == "reading_report" or bool(metadata.get("report_path"))
+
+
+def _wiki_keyword_tokens(value: Any) -> Set[str]:
+    text = str(value or "").lower()
+    return {token for token in re.split(r"[\s,;，；/]+", text) if token}
+
+
+def _wiki_topic_tokens(node: Dict[str, Any]) -> Set[str]:
+    metadata = node.get("metadata") if isinstance(node.get("metadata"), dict) else {}
+    tokens = _wiki_keyword_tokens(node.get("keywords"))
+    tokens.update(_wiki_keyword_tokens(metadata.get("canonical_name")))
+    tokens.update(_wiki_keyword_tokens(node.get("title")))
+    return tokens
+
+
+def _daily_note_roots() -> List[Path]:
+    roots: List[Path] = []
+    for env_name in ("PAPERFLOW_READING_REPORTS_DIR", "PAPERFLOW_PDF_DIR"):
+        path = Path(_configured_path(env_name, "data/exports")).expanduser()
+        roots.append(path if path.is_absolute() else PROJECT_ROOT / path)
+    unique: List[Path] = []
+    for root in roots:
+        resolved = root.resolve()
+        if resolved not in unique:
+            unique.append(resolved)
+    return unique
+
+
+def _daily_note_sort_key(path: Path) -> Tuple[int, int, float]:
+    match = re.fullmatch(r"Daily Note - ([A-Za-z]+) (20\d{2})\.md", path.name)
+    month_order = {
+        "jan": 1,
+        "feb": 2,
+        "mar": 3,
+        "apr": 4,
+        "may": 5,
+        "jun": 6,
+        "jul": 7,
+        "aug": 8,
+        "sept": 9,
+        "sep": 9,
+        "oct": 10,
+        "nov": 11,
+        "dec": 12,
+    }
+    if match:
+        month, year = match.groups()
+        return int(year), month_order.get(month.lower(), 0), path.stat().st_mtime
+    return 0, 0, path.stat().st_mtime
+
+
+def _all_daily_note_paths() -> List[Path]:
+    candidates: List[Path] = []
+    for root in _daily_note_roots():
+        if root.name.startswith("Daily Note 20"):
+            candidates.extend(root.glob("Daily Note - * 20[0-9][0-9].md"))
+        candidates.extend(root.glob("Daily Note 20[0-9][0-9]/Daily Note - * 20[0-9][0-9].md"))
+    existing = [path for path in candidates if path.exists()]
+    return sorted(set(existing), key=_daily_note_sort_key)
+
+
+def _daily_note_paths_for_graph(scope: str = "latest", month: str = "") -> List[Path]:
+    paths = _all_daily_note_paths()
+    if not paths:
+        return []
+    normalized_scope = str(scope or "latest").strip().lower()
+    normalized_month = str(month or "").strip()
+    if normalized_scope == "all":
+        return paths
+    if normalized_scope == "month" and normalized_month:
+        year, _, month_number = normalized_month.partition("-")
+        month_labels = {
+            "01": "Jan",
+            "02": "Feb",
+            "03": "Mar",
+            "04": "Apr",
+            "05": "May",
+            "06": "Jun",
+            "07": "Jul",
+            "08": "Aug",
+            "09": "Sept",
+            "10": "Oct",
+            "11": "Nov",
+            "12": "Dec",
+        }
+        expected = f"Daily Note - {month_labels.get(month_number, '')} {year}.md"
+        return [path for path in paths if path.name == expected]
+    return [paths[-1]]
+
+
+def _normalize_title_key(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip()).casefold()
+
+
+def _extract_daily_note_summary(lines: List[str]) -> str:
+    text = "\n".join(lines)
+    match = re.search(r"-\s+\*\*(.*?)\*\*", text, flags=re.DOTALL)
+    if match:
+        return re.sub(r"\s+", " ", match.group(1)).strip()
+    paragraphs = [
+        re.sub(r"\s+", " ", line.strip("- ").strip()).strip()
+        for line in lines
+        if line.strip() and not line.strip().startswith("[[") and "paperflow:" not in line
+    ]
+    return "\n".join(paragraphs).strip()
+
+
+def _parse_daily_note_entries(path: Path) -> List[Dict[str, str]]:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    entries: List[Dict[str, str]] = []
+    current_topic = "未分类"
+    index = 0
+    while index < len(lines):
+        line = lines[index].strip()
+        if line.startswith("# ") and not line.startswith("## "):
+            current_topic = line[2:].strip() or "未分类"
+            index += 1
+            continue
+        if line.startswith("## "):
+            title = line[3:].strip()
+            body_lines: List[str] = []
+            index += 1
+            while index < len(lines) and not lines[index].startswith("## ") and not lines[index].startswith("# "):
+                body_lines.append(lines[index])
+                index += 1
+            if title == "PaperFlow Summary":
+                continue
+            entries.append(
+                {
+                    "topic": current_topic,
+                    "title": title,
+                    "summary": _extract_daily_note_summary(body_lines),
+                    "body": "\n".join(body_lines).strip(),
+                }
+            )
+            continue
+        index += 1
+    return [entry for entry in entries if entry.get("title")]
+
+
+def _daily_note_entry_report_path(daily_note: Path, body: str) -> Optional[Path]:
+    match = re.search(r"\[\[([^|\]]*Deep Reading - [^|\]]+)(?:\|[^\]]*)?\]\]", str(body or ""))
+    if not match:
+        return None
+    link = match.group(1).strip()
+    if not link:
+        return None
+    candidate = (daily_note.parent / link).with_suffix(".md")
+    try:
+        return candidate.resolve()
+    except OSError:
+        return candidate
+
+
+def _daily_note_entry_pdf_url(body: str) -> str:
+    match = re.search(r"https://arxiv\.org/pdf/[^\s)\]]+", str(body or ""))
+    return match.group(0).strip() if match else ""
+
+
+def _daily_note_reading_entries(scope: str = "latest", month: str = "", query: str = "", limit: int = 12) -> List[Dict[str, Any]]:
+    entries: List[Dict[str, Any]] = []
+    normalized_query = str(query or "").strip().lower()
+    for daily_note in _daily_note_paths_for_graph(scope=scope, month=month):
+        for entry in _parse_daily_note_entries(daily_note):
+            report_path = _daily_note_entry_report_path(daily_note, entry.get("body") or "")
+            if not report_path or not report_path.exists():
+                continue
+            haystack = " ".join(
+                [
+                    str(entry.get("title") or ""),
+                    str(entry.get("topic") or ""),
+                    str(entry.get("summary") or ""),
+                    str(entry.get("body") or ""),
+                ]
+            ).lower()
+            if normalized_query and normalized_query not in haystack:
+                query_tokens = _local_paper_query_tokens(normalized_query)
+                if query_tokens and not any(token in haystack for token in query_tokens):
+                    continue
+                if not query_tokens:
+                    continue
+            item = dict(entry)
+            item.update(
+                {
+                    "daily_note": str(daily_note),
+                    "report_path": str(report_path),
+                    "pdf_url": _daily_note_entry_pdf_url(entry.get("body") or ""),
+                }
+            )
+            entries.append(item)
+            if len(entries) >= max(1, int(limit or 12)):
+                return entries
+    return entries
+
+
+def _daily_note_reading_node(entry: Dict[str, Any]) -> Dict[str, Any]:
+    title = str(entry.get("title") or "").strip()
+    report_path = Path(str(entry.get("report_path") or ""))
+    report_content = ""
+    if report_path.exists():
+        try:
+            report_content = report_path.read_text(encoding="utf-8")
+        except OSError:
+            report_content = ""
+    summary = str(entry.get("summary") or "").strip()
+    body = "\n\n".join(
+        part
+        for part in [
+            f"Daily Note topic: {entry.get('topic') or '未分类'}",
+            f"Daily Note summary: {summary}" if summary else "",
+            "Deep Reading report:",
+            report_content or str(entry.get("body") or ""),
+        ]
+        if part
+    )
+    key = str(entry.get("report_path") or title)
+    return {
+        "node_id": f"daily-reading:{hashlib.sha1(key.encode('utf-8')).hexdigest()[:16]}",
+        "node_type": "paper",
+        "title": title,
+        "body": body,
+        "keywords": " ".join([str(entry.get("topic") or ""), title, "daily note deep reading"]).strip(),
+        "file_path": str(entry.get("report_path") or ""),
+        "metadata": {
+            "source": "daily_note_deep_reading",
+            "daily_note": entry.get("daily_note"),
+            "daily_note_topic": entry.get("topic"),
+            "report_path": entry.get("report_path"),
+            "pdf_url": entry.get("pdf_url") or "",
+        },
+        "source_type": "reading_report",
+        "source_ref": str(entry.get("report_path") or ""),
+        "score": 1.0,
+        "updated_at": None,
+    }
+
+
+def daily_note_mentions(user_id: str, query: str = "", limit: int = 8) -> Dict[str, Any]:
+    del user_id
+    entries = _daily_note_reading_entries(scope="all", query=query, limit=limit)
+    nodes = []
+    for entry in entries:
+        node = _daily_note_reading_node(entry)
+        nodes.append(
+            {
+                "node_id": node["node_id"],
+                "node_type": "paper",
+                "title": node["title"],
+                "body": str(entry.get("summary") or "")[:500],
+                "score": 1.0,
+                "metadata": node["metadata"],
+            }
+        )
+    return {"nodes": nodes, "source": "daily_note_deep_reading"}
+
+
+def _parse_daily_note_topic_summaries(path: Path) -> Dict[str, Dict[str, Any]]:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return {}
+    summaries: Dict[str, Dict[str, Any]] = {}
+    current_topic = ""
+    index = 0
+    while index < len(lines):
+        line = lines[index].strip()
+        if line.startswith("# ") and not line.startswith("## "):
+            current_topic = line[2:].strip()
+            index += 1
+            continue
+        if current_topic and line == "## PaperFlow Summary":
+            block: List[str] = []
+            index += 1
+            while index < len(lines) and not lines[index].startswith("## ") and not lines[index].startswith("# "):
+                block.append(lines[index].strip())
+                index += 1
+            methods: List[str] = []
+            frontier = ""
+            concept = current_topic
+            for item in block:
+                if item.startswith("- 概念："):
+                    concept = item.split("：", 1)[1].strip() or concept
+                elif item.startswith("- 方法："):
+                    raw_methods = item.split("：", 1)[1].strip()
+                    if raw_methods and raw_methods != "待从后续精读中沉淀":
+                        methods = [part.strip() for part in re.split(r"[,，、]+", raw_methods) if part.strip()]
+                elif item.startswith("- 画像/前沿："):
+                    frontier = item.split("：", 1)[1].strip()
+            summaries[current_topic] = {
+                "concept": concept,
+                "methods": methods,
+                "frontier": frontier,
+            }
+            continue
+        index += 1
+    return summaries
+
+
+def _daily_note_graph(user_id: str, limit: int, *, scope: str = "latest", month: str = "") -> Optional[Dict[str, Any]]:
+    daily_notes = _daily_note_paths_for_graph(scope, month)
+    if not daily_notes:
+        return None
+    entries: List[Dict[str, str]] = []
+    topic_summaries: Dict[str, Dict[str, Any]] = {}
+    for daily_note in daily_notes:
+        topic_summaries.update(_parse_daily_note_topic_summaries(daily_note))
+        for entry in _parse_daily_note_entries(daily_note):
+            entry["daily_note"] = str(daily_note)
+            entries.append(entry)
+    if not entries:
+        return None
+
+    wiki_nodes = _filter_wiki_nodes_for_configured_dir(wiki_db.list_nodes(user_id, limit=10000))
+    if wiki_nodes is None:
+        wiki_nodes = wiki_db.list_nodes(user_id, limit=10000)
+    paper_nodes = [
+        node
+        for node in wiki_nodes
+        if str(node.get("node_type") or "").lower() == "paper"
+        and _wiki_graph_paper_is_reading_report(node)
+    ]
+    by_title = {_normalize_title_key(node.get("title")): node for node in paper_nodes}
+
+    graph_nodes: List[Dict[str, Any]] = []
+    graph_edges: List[Dict[str, Any]] = []
+    topic_ids: Dict[str, str] = {}
+    topic_method_ids: Dict[str, Set[str]] = {}
+    seen_nodes: Set[str] = set()
+
+    def add_node(node: Dict[str, Any]) -> None:
+        node_id = str(node.get("node_id") or "").strip()
+        if node_id and node_id not in seen_nodes:
+            seen_nodes.add(node_id)
+            graph_nodes.append(node)
+
+    for entry in entries[: max(1, limit)]:
+        topic = entry["topic"]
+        topic_id = topic_ids.get(topic)
+        if topic_id is None:
+            topic_id = f"daily-topic:{role_utils.slug(topic, max_len=72)}"
+            topic_ids[topic] = topic_id
+            summary_info = topic_summaries.get(topic) or {}
+            add_node(
+                {
+                    "node_id": topic_id,
+                    "node_type": "topic",
+                    "title": topic,
+                    "body": f"## 概念\n{summary_info.get('concept') or topic}\n\n## 来源\nDaily Note topic from {len(daily_notes)} note(s).",
+                    "keywords": topic,
+                    "file_path": entry.get("daily_note") or "",
+                    "metadata": {"source": "daily_note", "daily_notes": [str(path) for path in daily_notes]},
+                    "score": 1.0,
+                    "updated_at": None,
+                }
+            )
+            method_ids: Set[str] = set()
+            for method in (summary_info.get("methods") or [])[:8]:
+                method_id = f"daily-method:{role_utils.slug(method, max_len=96)}"
+                method_ids.add(method_id)
+                add_node(
+                    {
+                        "node_id": method_id,
+                        "node_type": "method",
+                        "title": method,
+                        "body": f"Daily Note method shared by one or more topics.",
+                        "keywords": method,
+                        "file_path": entry.get("daily_note") or "",
+                        "metadata": {"source": "daily_note"},
+                        "score": 0.85,
+                        "updated_at": None,
+                    }
+                )
+                graph_edges.append(
+                    {
+                        "src_id": topic_id,
+                        "dst_id": method_id,
+                        "relation": "has_method",
+                        "weight": 0.8,
+                        "metadata": {"source": "daily_note"},
+                    }
+                )
+            topic_method_ids[topic] = method_ids
+
+        matched = by_title.get(_normalize_title_key(entry["title"]))
+        if matched:
+            paper_node = _wiki_node_payload(matched)
+            paper_node["body"] = entry.get("summary") or paper_node.get("body") or ""
+            metadata = dict(paper_node.get("metadata") or {})
+            metadata["daily_note_topic"] = topic
+            metadata["daily_note"] = entry.get("daily_note")
+            paper_node["metadata"] = metadata
+        else:
+            paper_node = {
+                "node_id": f"daily-paper:{hashlib.sha1(entry['title'].encode('utf-8')).hexdigest()[:16]}",
+                "node_type": "paper",
+                "title": entry["title"],
+                "body": entry.get("summary") or entry.get("body") or "",
+                "keywords": topic,
+                "file_path": entry.get("daily_note") or "",
+                "metadata": {"source": "daily_note", "daily_note_topic": topic, "daily_note": entry.get("daily_note")},
+                "score": 1.0,
+                "updated_at": None,
+            }
+        add_node(paper_node)
+        graph_edges.append(
+            {
+                "src_id": topic_id,
+                "dst_id": paper_node["node_id"],
+                "relation": "daily_note_topic",
+                "weight": 1.0,
+                "metadata": {"source": "daily_note", "daily_note": entry.get("daily_note")},
+            }
+        )
+        for method_id in topic_method_ids.get(topic, set()):
+            graph_edges.append(
+                {
+                    "src_id": method_id,
+                    "dst_id": paper_node["node_id"],
+                    "relation": "method_evidence",
+                    "weight": 0.45,
+                    "metadata": {"source": "daily_note"},
+                }
+            )
+
+    return {
+        "nodes": graph_nodes,
+        "edges": graph_edges,
+        "source": "daily_note",
+        "query": "",
+        "daily_notes": [str(path) for path in daily_notes],
+        "daily_scope": scope,
+        "daily_month": month,
+    }
+
+
+def wiki_graph(user_id: str, query: str = "", limit: int = 24, daily_scope: str = "latest", daily_month: str = "") -> Dict[str, Any]:
     """Return user-scoped wiki nodes and edges for the desktop graph view."""
-    safe_limit = max(4, min(80, int(limit or 24)))
+    safe_limit = max(4, min(160, int(limit or 24)))
     query = str(query or "").strip()
     user_node_id = f"user:{user_id}"
+    if not query and str(daily_scope or "").strip().lower() != "wiki_db":
+        daily_graph = _daily_note_graph(user_id, safe_limit, scope=daily_scope, month=daily_month)
+        if daily_graph and daily_graph.get("nodes"):
+            return daily_graph
 
     def row_to_node(row: Any) -> Dict[str, Any]:
         node = dict(row)
@@ -2314,6 +2834,7 @@ def wiki_graph(user_id: str, query: str = "", limit: int = 24) -> Dict[str, Any]
         ).fetchall()
 
     node_by_id: Dict[str, Dict[str, Any]] = {}
+    synthetic_edges: List[Dict[str, Any]] = []
     if query:
         remember_nodes(wiki_db.search_nodes(user_id, query, limit=safe_limit), node_by_id)
         rows = fetch_edges_for_ids(list(node_by_id))
@@ -2325,15 +2846,43 @@ def wiki_graph(user_id: str, query: str = "", limit: int = 24) -> Dict[str, Any]
         remaining_slots = max(0, safe_limit - len(node_by_id))
         node_by_id.update(fetch_nodes_by_ids(edge_node_ids[:remaining_slots]))
     else:
-        rows = fetch_top_edges()
-        edge_node_ids = []
-        for row in rows:
-            for endpoint in (str(row["src_id"] or ""), str(row["dst_id"] or "")):
-                if endpoint and endpoint != user_node_id and endpoint not in edge_node_ids:
-                    edge_node_ids.append(endpoint)
-        node_by_id.update(fetch_nodes_by_ids(edge_node_ids[:safe_limit]))
-        if len(node_by_id) < safe_limit:
-            remember_nodes(wiki_db.list_nodes(user_id, limit=safe_limit), node_by_id)
+        rows = []
+        all_nodes = wiki_db.list_nodes(user_id, limit=10000)
+        filtered_all_nodes = _filter_wiki_nodes_for_configured_dir(all_nodes)
+        if filtered_all_nodes is not None:
+            all_nodes = filtered_all_nodes
+        reading_papers = [node for node in all_nodes if _wiki_graph_paper_is_reading_report(node)]
+        topic_nodes = [
+            node
+            for node in all_nodes
+            if str(node.get("node_type") or "").strip().lower() == "topic"
+        ]
+        paper_tokens = {
+            str(paper.get("node_id") or ""): _wiki_keyword_tokens(paper.get("keywords"))
+            for paper in reading_papers
+        }
+        matched_topics: Dict[str, Dict[str, Any]] = {}
+        for topic in topic_nodes:
+            topic_id = str(topic.get("node_id") or "")
+            tokens = _wiki_topic_tokens(topic)
+            for paper_id, tokens_for_paper in paper_tokens.items():
+                if tokens and tokens_for_paper and tokens.intersection(tokens_for_paper):
+                    matched_topics[topic_id] = topic
+                    synthetic_edges.append(
+                        {
+                            "src_id": paper_id,
+                            "dst_id": topic_id,
+                            "relation": "belongs_to",
+                            "weight": 0.75,
+                            "metadata": {"source": "keyword_match"},
+                        }
+                    )
+        ordered_nodes = reading_papers + list(matched_topics.values())
+        for node in ordered_nodes[:safe_limit]:
+            node_id = str(node.get("node_id") or "").strip()
+            if node_id:
+                node_by_id[node_id] = node
+        rows = fetch_edges_for_ids(list(node_by_id))
 
     rows = rows or fetch_edges_for_ids(list(node_by_id))
     conn.close()
@@ -2345,6 +2894,11 @@ def wiki_graph(user_id: str, query: str = "", limit: int = 24) -> Dict[str, Any]
             for node in filtered_nodes
             if str(node.get("node_id") or "")
         }
+    node_by_id = {
+        node_id: node
+        for node_id, node in node_by_id.items()
+        if _wiki_graph_node_visible(node)
+    }
 
     if not node_by_id:
         return {"nodes": [], "edges": [], "source": "wiki_db", "query": query}
@@ -2370,9 +2924,14 @@ def wiki_graph(user_id: str, query: str = "", limit: int = 24) -> Dict[str, Any]
                 "dst_id": dst_id,
                 "relation": row["relation"],
                 "weight": float(row["weight"] or 1.0),
-                "metadata": metadata,
+                "metadata": _compact_wiki_metadata(metadata),
             }
         )
+    edges.extend(
+        edge
+        for edge in synthetic_edges
+        if edge["src_id"] in node_by_id and edge["dst_id"] in node_by_id
+    )
 
     degree: Dict[str, float] = {}
     for edge in edges:
@@ -2494,7 +3053,6 @@ _RECENT_CONTEXT_QUERY_TERMS = (
     "推荐",
     "候选",
     "相关",
-    "总结",
     "趋势",
     "动态",
     "方向",
@@ -2606,10 +3164,23 @@ def _resolve_wiki_mentions(
         seen_requests.add(request_key)
 
         node: Optional[Dict[str, Any]] = None
+        daily_node = None
+        for entry in _daily_note_reading_entries(scope="all", query=title or node_id, limit=8):
+            candidate = _daily_note_reading_node(entry)
+            if node_id and str(candidate.get("node_id") or "") == node_id:
+                daily_node = candidate
+                break
+            if title and str(candidate.get("title") or "").strip().lower() == title.lower():
+                daily_node = candidate
+                break
+            if daily_node is None:
+                daily_node = candidate
+        if daily_node is not None:
+            node = daily_node
         if node_id:
-            node = wiki_db.get_node(user_id, node_id)
-            if not _wiki_node_is_visible(node):
-                node = None
+            db_node = wiki_db.get_node(user_id, node_id)
+            if _wiki_node_is_visible(db_node):
+                node = node or db_node
         if node is None:
             query = title or node_id
             if query:
@@ -2828,14 +3399,22 @@ def _chat_pinned_nodes(
     scope: str = "all",
 ) -> List[Dict[str, Any]]:
     pinned = list(resolved_nodes or [])
-    if _should_pin_recent_papers(question, scope):
+    if _should_pin_recent_papers(question, scope) or pinned:
         seen = {str(node.get("node_id") or "") for node in pinned}
-        for node in _recent_paper_context_nodes(user_id, question=question, limit=limit):
+        remaining = max(0, int(limit or 8) - len(pinned))
+        query = question if _local_paper_query_tokens(question) else ""
+        for entry in _daily_note_reading_entries(scope="all", query=query, limit=remaining or int(limit or 8)):
+            node = _daily_note_reading_node(entry)
             node_id = str(node.get("node_id") or "")
             if node_id and node_id not in seen:
                 pinned.append(node)
                 seen.add(node_id)
     return pinned
+
+
+def _chat_allowed_node_ids(user_id: str, pinned_nodes: List[Dict[str, Any]]) -> Set[str]:
+    del user_id
+    return {str(node.get("node_id") or "") for node in pinned_nodes if str(node.get("node_id") or "").strip()}
 
 
 def _citation_source_payload(citation: Dict[str, Any]) -> Dict[str, Any]:
@@ -3305,6 +3884,12 @@ def delete_chat_session(user_id: str, session_id: str) -> Dict[str, Any]:
     if not user_id or not session_id:
         raise ValueError("user_id and session_id are required")
     return {"deleted": db_ops.delete_chat_session(user_id=user_id, session_id=session_id)}
+
+
+def clear_chat_sessions(user_id: str) -> Dict[str, Any]:
+    if not user_id:
+        raise ValueError("user_id is required")
+    return {"deleted": db_ops.clear_chat_sessions(user_id=user_id)}
 
 
 def recent_activity(user_id: str, days: int = 14, limit: int = 80) -> Dict[str, Any]:

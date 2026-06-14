@@ -17,6 +17,22 @@ def _slug(value: str, max_len: int = 80) -> str:
     return (text or "topic")[:max_len]
 
 
+def _topic_body(keyword: str, member_papers: List[str]) -> str:
+    papers = "\n".join(f"- {paper_id}" for paper_id in member_papers[:12]) or "- 暂无论文"
+    return "\n".join(
+        [
+            "## Topic Signal",
+            f"`{keyword}` appears in {len(member_papers)} PaperFlow wiki paper nodes.",
+            "",
+            "## Why This Page Exists",
+            "该主题页由论文关键词聚合生成，用来把分散的 paper 节点组织成可追踪的研究主线。",
+            "",
+            "## Member Papers",
+            papers,
+        ]
+    )
+
+
 def flush_topics(user_id: str, *, min_count: int = 2, limit: int = 50) -> Dict[str, int]:
     """Create topic nodes from frequent paper keywords and connect member papers."""
     papers = wiki_db.list_nodes(user_id, node_type="paper", limit=5000)
@@ -40,7 +56,7 @@ def flush_topics(user_id: str, *, min_count: int = 2, limit: int = 50) -> Dict[s
             node_id=topic_id,
             node_type="topic",
             title=keyword.replace("-", " ").title(),
-            body=f"{keyword} appears in {len(member_papers)} PaperFlow wiki paper nodes.",
+            body=_topic_body(keyword, member_papers),
             metadata={
                 "slug": _slug(keyword),
                 "canonical_name": keyword,
@@ -63,4 +79,3 @@ def flush_topics(user_id: str, *, min_count: int = 2, limit: int = 50) -> Dict[s
             )
             edges += 1
     return {"topics": created, "belongs_to_edges": edges}
-

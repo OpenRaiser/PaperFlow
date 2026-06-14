@@ -78,6 +78,61 @@ def _safe_float(value: Any, default: float = 1.0) -> float:
         return default
 
 
+def _paper_url(paper: Dict[str, Any], metadata: Dict[str, Any]) -> str:
+    return _first_url(paper, metadata, "paper_url", "url", "openreview_url", "doi_url")
+
+
+def _pdf_url(paper: Dict[str, Any], metadata: Dict[str, Any]) -> str:
+    url = _first_url(paper, metadata, "pdf_url")
+    if url:
+        return url
+    arxiv_id = _clean_text(paper.get("arxiv_id"))
+    return f"https://arxiv.org/pdf/{arxiv_id}" if arxiv_id else ""
+
+
+def _candidate_body(paper: Dict[str, Any], metadata: Dict[str, Any], category: Any) -> str:
+    abstract = _clean_text(paper.get("abstract")) or "暂无摘要。"
+    paper_link = _paper_url(paper, metadata)
+    pdf_link = _pdf_url(paper, metadata)
+    lines = [
+        "## Candidate Summary",
+        abstract,
+        "",
+        "## Recommendation Context",
+        f"- Category: {category or 'unknown'}",
+        f"- Rank: {metadata.get('rank') or '?'}",
+        f"- Score: {metadata.get('score') if metadata.get('score') is not None else '?'}",
+        "",
+        "## Links",
+    ]
+    if paper_link:
+        lines.append(f"- Paper: [link]({paper_link})")
+    if pdf_link:
+        lines.append(f"- PDF: [link]({pdf_link})")
+    if not paper_link and not pdf_link:
+        lines.append("- 暂无链接")
+    return "\n".join(lines)
+
+
+def _push_body(user_id: str, push_id: str, paper: Dict[str, Any], metadata: Dict[str, Any], category: Any) -> str:
+    title = _clean_text(paper.get("title")) or "Untitled Paper"
+    arxiv_id = _clean_text(paper.get("arxiv_id"))
+    return "\n".join(
+        [
+            "## Daily Push Snapshot",
+            f"- User: {user_id}",
+            f"- Push: {push_id}",
+            f"- Latest candidate written: {title}",
+            f"- arXiv: {arxiv_id or 'N/A'}",
+            f"- Category: {category or 'unknown'}",
+            f"- Rank: {metadata.get('rank') or '?'}",
+            "",
+            "## Purpose",
+            "该节点记录一次每日推送写入 Wiki 的上下文。候选论文会作为 paper 节点沉淀，并通过 derived_from 关系连接到该推送。",
+        ]
+    )
+
+
 def ingest_pushed_paper(
     *,
     user_id: str,
@@ -102,7 +157,7 @@ def ingest_pushed_paper(
         node_id=paper_node_id,
         node_type="paper",
         title=_clean_text(paper.get("title")) or "Untitled Paper",
-        body=_clean_text(paper.get("abstract")) or f"Candidate paper from daily push {push_id}.",
+        body=_candidate_body(paper, metadata, category_value),
         metadata={
             "paper_id": paper.get("id"),
             "arxiv_id": paper.get("arxiv_id"),
@@ -112,7 +167,7 @@ def ingest_pushed_paper(
             "publish_date": paper.get("publish_date") or metadata.get("publish_date"),
             "subjects": _normalize_list(paper.get("subjects") or paper.get("categories") or metadata.get("categories")),
             "url": _first_url(paper, metadata, "paper_url", "url", "openreview_url", "doi_url"),
-            "pdf_url": _first_url(paper, metadata, "pdf_url"),
+            "pdf_url": _pdf_url(paper, metadata),
             "push_id": push_id,
             "category": category_value,
             "rank": rank,
@@ -127,7 +182,7 @@ def ingest_pushed_paper(
         node_id=trajectory_id,
         node_type="trajectory",
         title=f"Daily push {push_id}",
-        body=f"Daily push {push_id} recommended candidate papers for {user_id}.",
+        body=_push_body(user_id, push_id, paper, metadata, category_value),
         metadata={
             "period": push_id,
             "push_id": push_id,

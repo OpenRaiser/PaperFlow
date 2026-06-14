@@ -77,6 +77,32 @@ def _body_text(value: Any) -> str:
     return "\n".join(f"- {item}" for item in items)
 
 
+def _bullet_list(items: Any, *, empty: str = "- 暂无记录") -> str:
+    values = _normalize_list(items)
+    if not values:
+        return empty
+    return "\n".join(f"- {item}" for item in values)
+
+
+def _markdown_link(label: str, target: str) -> str:
+    cleaned = _clean_text(target)
+    if not cleaned:
+        return ""
+    if cleaned.startswith(("http://", "https://")):
+        return f"[{label}]({cleaned})"
+    return cleaned
+
+
+def _obsidian_link_from_path(path: Optional[str], fallback: str = "") -> str:
+    cleaned = _clean_text(path)
+    if not cleaned:
+        return fallback
+    name = cleaned.rsplit("/", 1)[-1]
+    if name.endswith(".md"):
+        name = name[:-3]
+    return f"[[{name}]]" if name else fallback
+
+
 def _slug(value: str, max_len: int = 80) -> str:
     text = re.sub(r"[^\w.\-]+", "-", str(value or "").strip(), flags=re.UNICODE)
     text = re.sub(r"-{2,}", "-", text).strip("-._")
@@ -187,6 +213,49 @@ def _paper_metadata(
     }
 
 
+def _paper_body(
+    paper: Dict[str, Any],
+    payload: Dict[str, Any],
+    *,
+    report_path: Optional[str],
+    doc_url: Optional[str],
+) -> str:
+    title = _clean_text(paper.get("title")) or "Untitled Paper"
+    summary = (
+        _clean_text(payload.get("paper_summary"))
+        or _clean_text(payload.get("one_sentence_summary"))
+        or _clean_text(paper.get("abstract"))
+    )
+    pdf_link = _markdown_link("PDF", _pdf_url(paper)) or _clean_text(paper.get("pdf_path"))
+    paper_link = _markdown_link("Paper", _paper_url(paper))
+    deep_reading = _obsidian_link_from_path(report_path)
+    links = [
+        f"- Paper: {paper_link}" if paper_link else "",
+        f"- PDF: {pdf_link}" if pdf_link else "",
+        f"- Deep Reading: {deep_reading}" if deep_reading else "",
+        f"- Feishu: {_markdown_link('Doc', doc_url or '')}" if doc_url else "",
+    ]
+    lines = [
+        "## Summary",
+        summary or "暂无总结，建议回到精读报告核对。",
+        "",
+        "## Why It Matters",
+        _bullet_list(payload.get("relevance_points"), empty="- 暂无画像相关性说明"),
+        "",
+        "## Contributions",
+        _bullet_list(payload.get("main_contributions"), empty="- 暂无贡献摘要"),
+        "",
+        "## Reading Focus",
+        _bullet_list(payload.get("reading_focus"), empty="- 先读摘要、方法和实验结论"),
+        "",
+        "## Links",
+        "\n".join(item for item in links if item) or "- 暂无链接",
+    ]
+    if payload.get("recommendation_reason"):
+        lines.extend(["", "## Recommendation Reason", _body_text(payload.get("recommendation_reason"))])
+    return "\n".join(lines).strip() or title
+
+
 def ingest_reading_report(
     *,
     user_id: str,
@@ -204,15 +273,8 @@ def ingest_reading_report(
     keywords = _keywords(paper, payload)
     source_ref = report_path or doc_url or paper_node_id
 
-    paper_body = "\n\n".join(
-        item
-        for item in (
-            _clean_text(payload.get("one_sentence_summary")),
-            _clean_text(paper.get("abstract")),
-        )
-        if item
-    )
-    if not paper_body:
+    paper_body = _paper_body(paper, payload, report_path=report_path, doc_url=doc_url)
+    if not paper_body.strip():
         paper_body = _clean_text(report_md)[:4000]
 
     wiki_db.upsert_node(
@@ -265,7 +327,7 @@ def ingest_reading_report(
             user_id=user_id,
             node_id=section_id,
             node_type="section",
-            title=title,
+            title=f"{_clean_text(paper.get('title')) or paper_key} / {title}",
             body=body[:8000],
             metadata={
                 "parent_paper_id": paper_node_id,

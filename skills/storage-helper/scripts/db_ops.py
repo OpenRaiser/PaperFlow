@@ -510,6 +510,27 @@ def delete_chat_session(user_id: str, session_id: str) -> bool:
     return deleted
 
 
+def clear_chat_sessions(user_id: str) -> int:
+    """Delete all GUI chat sessions and messages for one user."""
+    normalized_user_id = _normalize_identifier(user_id)
+    if not normalized_user_id:
+        raise ValueError("user_id is required")
+
+    ensure_chat_tables()
+    conn = get_connection()
+    cursor = conn.cursor()
+    count_row = cursor.execute(
+        "SELECT COUNT(*) AS count FROM chat_sessions WHERE user_id = ?",
+        (normalized_user_id,),
+    ).fetchone()
+    deleted = int(count_row["count"] if count_row else 0)
+    cursor.execute("DELETE FROM chat_messages WHERE user_id = ?", (normalized_user_id,))
+    cursor.execute("DELETE FROM chat_sessions WHERE user_id = ?", (normalized_user_id,))
+    conn.commit()
+    conn.close()
+    return deleted
+
+
 # ============== Profile Operations ==============
 
 def create_profile(user_id: str, profile_json: Dict) -> Optional[int]:

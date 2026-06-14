@@ -36,20 +36,66 @@ def _period(now: datetime) -> str:
     return f"{year}-W{week:02d}"
 
 
+def _compact_drift_state(drift_state: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(drift_state, dict):
+        return {}
+    keep_keys = {
+        "status",
+        "explanation",
+        "drift_enabled",
+        "detected_at",
+        "last_updated_at",
+        "adaptive_alpha",
+        "anchor_topic",
+        "anchor_topics",
+        "anchor_source",
+        "intent_score",
+    }
+    return {key: drift_state.get(key) for key in keep_keys if key in drift_state}
+
+
+def _format_evidence(evidence_papers: List[str]) -> str:
+    if not evidence_papers:
+        return "- 暂无直接证据论文"
+    return "\n".join(f"- {paper_id}" for paper_id in evidence_papers[:12])
+
+
 def _render_body(deltas: List[Dict[str, Any]], evidence_papers: List[str], drift_state: Dict[str, Any]) -> str:
-    lines = ["Profile drift snapshot:"]
+    lines = ["## Interest Drift Summary"]
     for item in deltas:
         sign = "+" if item["delta"] >= 0 else ""
         lines.append(
             f"- {item['topic']}: {item['before']:.3f} -> {item['after']:.3f} ({sign}{item['delta']:.3f})"
         )
     if drift_state:
-        lines.append(f"- Drift status: {drift_state.get('status', 'stable')}")
+        lines.extend(["", "## System Interpretation"])
+        lines.append(f"- Status: {drift_state.get('status', 'stable')}")
         if drift_state.get("explanation"):
             lines.append(f"- Explanation: {drift_state.get('explanation')}")
-    if evidence_papers:
-        lines.append("- Evidence papers: " + ", ".join(evidence_papers[:12]))
+    lines.extend(["", "## Evidence Papers", _format_evidence(evidence_papers)])
     return "\n".join(lines)
+
+
+def _render_topic_body(item: Dict[str, Any], period: str, trajectory_id: str, evidence_ids: List[str]) -> str:
+    sign = "+" if item["delta"] >= 0 else ""
+    direction = "增强" if item["delta"] > 0 else "减弱"
+    return "\n".join(
+        [
+            "## Topic Signal",
+            f"- Period: {period}",
+            f"- Direction: {direction}",
+            f"- Weight: {item['before']:.3f} -> {item['after']:.3f} ({sign}{item['delta']:.3f})",
+            "",
+            "## Why This Page Exists",
+            "该主题页由近期阅读、选择和画像漂移自动生成，用来把分散论文沉淀成可追踪的研究主线。",
+            "",
+            "## Evidence Papers",
+            _format_evidence(evidence_ids),
+            "",
+            "## Related Trajectory",
+            f"- {trajectory_id}",
+        ]
+    )
 
 
 def ingest_drift(
@@ -94,7 +140,8 @@ def ingest_drift(
                 evidence_ids.append(f"paper:{_slug(str(key))}")
 
     drift_state = after.get("drift_state") if isinstance(after.get("drift_state"), dict) else {}
-    body = _render_body(deltas, evidence_ids, drift_state or {})
+    compact_drift_state = _compact_drift_state(drift_state)
+    body = _render_body(deltas, evidence_ids, compact_drift_state)
     wiki_db.upsert_node(
         user_id=user_id,
         node_id=trajectory_id,
@@ -110,7 +157,7 @@ def ingest_drift(
             "delta_summary": " / ".join(
                 f"{item['topic']} {'+' if item['delta'] >= 0 else ''}{item['delta']:.2f}" for item in deltas
             ),
-            "drift_state": drift_state,
+            "drift_state": compact_drift_state,
             "evidence_papers": evidence_ids,
         },
         keywords=" ".join(item["topic"] for item in deltas),
@@ -125,8 +172,14 @@ def ingest_drift(
             node_id=topic_id,
             node_type="topic",
             title=str(item["topic"]).replace("-", " ").title(),
-            body=f"Topic node for {item['topic']}.",
-            metadata={"canonical_name": item["topic"], "source": "profile_drift"},
+            body=_render_topic_body(item, period, trajectory_id, evidence_ids),
+            metadata={
+                "canonical_name": item["topic"],
+                "source": "profile_drift",
+                "period": period,
+                "delta": item["delta"],
+                "trajectory_id": trajectory_id,
+            },
             keywords=item["topic"],
             source_type="profile_drift",
             source_ref=trajectory_id,
@@ -149,4 +202,3 @@ def ingest_drift(
             metadata={"period": period},
         )
     return {"trajectory_node": trajectory_id, "delta_count": len(deltas)}
-

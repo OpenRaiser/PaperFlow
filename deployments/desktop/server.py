@@ -163,11 +163,21 @@ def _api_wiki_search(query_params: Dict[str, Any], _body: Dict[str, Any]) -> Dic
     )
 
 
+def _api_wiki_mentions(query_params: Dict[str, Any], _body: Dict[str, Any]) -> Dict[str, Any]:
+    return agents.daily_note_mentions(
+        _required_user(query_params),
+        query=str(query_params.get("q") or ""),
+        limit=int(query_params.get("limit") or 8),
+    )
+
+
 def _api_wiki_graph(query_params: Dict[str, Any], _body: Dict[str, Any]) -> Dict[str, Any]:
     return agents.wiki_graph(
         _required_user(query_params),
         query=str(query_params.get("q") or ""),
         limit=int(query_params.get("limit") or 24),
+        daily_scope=str(query_params.get("daily_scope") or "latest"),
+        daily_month=str(query_params.get("daily_month") or ""),
     )
 
 
@@ -367,6 +377,12 @@ def _api_delete_chat_session(_query_params: Dict[str, Any], body: Dict[str, Any]
     )
 
 
+def _api_clear_chat_sessions(_query_params: Dict[str, Any], body: Dict[str, Any]) -> Dict[str, Any]:
+    return agents.clear_chat_sessions(
+        user_id=str(body.get("user_id") or "").strip(),
+    )
+
+
 def _api_wiki_node(_query_params: Dict[str, Any], body: Dict[str, Any]) -> Dict[str, Any]:
     return agents.update_wiki_node(
         user_id=str(body.get("user_id") or "").strip(),
@@ -403,6 +419,7 @@ GET_ROUTES: Dict[str, ApiHandler] = {
     "/api/daily/status": _api_daily_status,
     "/api/wiki/stats": _api_wiki_stats,
     "/api/wiki/search": _api_wiki_search,
+    "/api/wiki/mentions": _api_wiki_mentions,
     "/api/wiki/graph": _api_wiki_graph,
     "/api/chat/sessions": _api_chat_sessions,
     "/api/chat/session": _api_chat_session,
@@ -428,6 +445,7 @@ POST_ROUTES: Dict[str, ApiHandler] = {
     "/api/wiki/ask/stream": _api_wiki_ask,
     "/api/chat/session": _api_create_chat_session,
     "/api/chat/session/delete": _api_delete_chat_session,
+    "/api/chat/sessions/clear": _api_clear_chat_sessions,
     "/api/wiki/node": _api_wiki_node,
     "/api/export": _api_export,
     "/api/must-read": _api_must_read_update,

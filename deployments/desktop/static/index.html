@@ -232,6 +232,12 @@
                   <button class="active" data-wiki-view="graph" type="button">图谱视图</button>
                   <button data-wiki-view="list" type="button">列表视图</button>
                 </div>
+                <select id="wikiDailyScope" aria-label="Daily Note 范围">
+                  <option value="latest">最新 Daily Note</option>
+                  <option value="month">指定月份</option>
+                  <option value="all">全部 Daily Note</option>
+                </select>
+                <input id="wikiDailyMonth" type="month" aria-label="Daily Note 月份" hidden>
                 <input id="wikiQuery" placeholder="搜索节点、主题、论文或方法">
                 <span id="wikiStats">尚未加载知识库统计。</span>
               </div>
@@ -269,7 +275,10 @@
                   <h2>历史对话</h2>
                   <span id="chatHistoryHint">按日期保存</span>
                 </div>
-                <button id="newChatBtn" type="button">新建</button>
+                <div class="chat-history-actions">
+                  <button id="newChatBtn" type="button">新建</button>
+                  <button id="clearChatHistoryBtn" type="button">清空</button>
+                </div>
               </div>
               <div id="chatHistoryList" class="chat-history-list empty">暂无历史对话。</div>
             </aside>
