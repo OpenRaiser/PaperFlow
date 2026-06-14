@@ -68,10 +68,6 @@ all route through the local backend.
 
 <div align="center">
   <img src="https://github.com/user-attachments/assets/c852c134-5ddb-478e-8a13-3fa313dcd812" alt="PaperFlow offline desktop workflow demo" width="92%">
-  <br>
-  <a href="https://github.com/user-attachments/assets/d491949a-f86b-4894-825b-31c16b29248c">Watch the MP4 demo</a>
-  ·
-  <a href="https://github.com/OpenRaiser/PaperFlow/issues/1">Media gallery</a>
 </div>
 
 <br>
