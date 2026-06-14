@@ -2900,6 +2900,68 @@ def _apply_chat_metadata(
     return result
 
 
+def _chat_turn_metadata(result: Dict[str, Any]) -> Dict[str, Any]:
+    metadata_keys = [
+        "citations",
+        "sources",
+        "mode",
+        "retrieval_required",
+        "routing_reason",
+        "mentions",
+        "unresolved_mentions",
+        "scope",
+        "elapsed_ms",
+        "token_usage",
+        "streaming",
+    ]
+    return {key: deepcopy(result.get(key)) for key in metadata_keys if key in result}
+
+
+def _persist_chat_turn(
+    user_id: str,
+    session_id: str,
+    question: str,
+    result: Dict[str, Any],
+) -> str:
+    session = db_ops.create_chat_session(user_id=user_id, title=question, session_id=session_id or None)
+    saved_session_id = session["session_id"]
+    db_ops.save_chat_message(
+        user_id=user_id,
+        session_id=saved_session_id,
+        role="user",
+        content=question,
+        metadata={
+            "scope": result.get("scope"),
+            "mentions": result.get("mentions") or [],
+            "unresolved_mentions": result.get("unresolved_mentions") or [],
+        },
+    )
+    db_ops.save_chat_message(
+        user_id=user_id,
+        session_id=saved_session_id,
+        role="assistant",
+        content=str(result.get("text") or ""),
+        metadata=_chat_turn_metadata(result),
+    )
+    result["session_id"] = saved_session_id
+    return saved_session_id
+
+
+def _attach_chat_session(
+    result: Dict[str, Any],
+    *,
+    user_id: str,
+    session_id: str,
+    question: str,
+    persist_chat: bool,
+) -> Dict[str, Any]:
+    if persist_chat:
+        _persist_chat_turn(user_id, session_id, question, result)
+    elif session_id:
+        result["session_id"] = session_id
+    return result
+
+
 def _direct_answer_stream(question: str) -> Iterator[Dict[str, Any]]:
     started = time.time()
     llm = build_llm_provider()
@@ -2965,6 +3027,8 @@ def wiki_ask(
     limit: int = 8,
     scope: str = "all",
     mentions: Any = None,
+    session_id: str = "",
+    persist_chat: bool = False,
 ) -> Dict[str, Any]:
     if not user_id:
         raise ValueError("user_id is required")
@@ -2996,6 +3060,13 @@ def wiki_ask(
             mentions=resolved_mentions,
             unresolved_mentions=unresolved_mentions,
             scope=normalized_scope,
+        )
+        _attach_chat_session(
+            result,
+            user_id=user_id,
+            session_id=session_id,
+            question=cleaned_question,
+            persist_chat=persist_chat,
         )
         return result
     if mode == "direct":
@@ -3034,6 +3105,13 @@ def wiki_ask(
             unresolved_mentions=unresolved_mentions,
             scope=normalized_scope,
         )
+    _attach_chat_session(
+        result,
+        user_id=user_id,
+        session_id=session_id,
+        question=cleaned_question,
+        persist_chat=persist_chat,
+    )
     return result
 
 
@@ -3043,6 +3121,8 @@ def wiki_ask_stream(
     limit: int = 8,
     scope: str = "all",
     mentions: Any = None,
+    session_id: str = "",
+    persist_chat: bool = False,
 ) -> Iterator[Dict[str, Any]]:
     if not user_id:
         raise ValueError("user_id is required")
@@ -3076,6 +3156,16 @@ def wiki_ask_stream(
                     unresolved_mentions=unresolved_mentions,
                     scope=normalized_scope,
                 )
+            if event["event"] == "meta" and session_id:
+                event["data"]["session_id"] = session_id
+            if event["event"] == "done":
+                _attach_chat_session(
+                    event["data"],
+                    user_id=user_id,
+                    session_id=session_id,
+                    question=cleaned_question,
+                    persist_chat=persist_chat,
+                )
             yield event
         return
     if mode == "direct":
@@ -3089,6 +3179,16 @@ def wiki_ask_stream(
                     mentions=[],
                     unresolved_mentions=unresolved_mentions,
                     scope=normalized_scope,
+                )
+            if event["event"] == "meta" and session_id:
+                event["data"]["session_id"] = session_id
+            if event["event"] == "done":
+                _attach_chat_session(
+                    event["data"],
+                    user_id=user_id,
+                    session_id=session_id,
+                    question=cleaned_question,
+                    persist_chat=persist_chat,
                 )
             yield event
         return
@@ -3116,7 +3216,44 @@ def wiki_ask_stream(
                 unresolved_mentions=unresolved_mentions,
                 scope=normalized_scope,
             )
+        if event["event"] == "meta" and session_id:
+            event["data"]["session_id"] = session_id
+        if event["event"] == "done":
+            _attach_chat_session(
+                event["data"],
+                user_id=user_id,
+                session_id=session_id,
+                question=cleaned_question,
+                persist_chat=persist_chat,
+            )
         yield event
+
+
+def chat_sessions(user_id: str, days: int = 30, limit: int = 80) -> Dict[str, Any]:
+    if not user_id:
+        raise ValueError("user_id is required")
+    return db_ops.list_chat_sessions(user_id=user_id, days=days, limit=limit)
+
+
+def chat_session(user_id: str, session_id: str) -> Dict[str, Any]:
+    if not user_id or not session_id:
+        raise ValueError("user_id and session_id are required")
+    payload = db_ops.get_chat_session(user_id=user_id, session_id=session_id)
+    if not payload:
+        raise ValueError("chat session not found")
+    return payload
+
+
+def create_chat_session(user_id: str, title: str = "") -> Dict[str, Any]:
+    if not user_id:
+        raise ValueError("user_id is required")
+    return {"session": db_ops.create_chat_session(user_id=user_id, title=title or "新对话")}
+
+
+def delete_chat_session(user_id: str, session_id: str) -> Dict[str, Any]:
+    if not user_id or not session_id:
+        raise ValueError("user_id and session_id are required")
+    return {"deleted": db_ops.delete_chat_session(user_id=user_id, session_id=session_id)}
 
 
 def recent_activity(user_id: str, days: int = 14, limit: int = 80) -> Dict[str, Any]:

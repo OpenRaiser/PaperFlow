@@ -26,6 +26,11 @@
     wikiView: "graph",
     currentProfile: null,
     profileLoadToken: 0,
+    chatSessionId: "",
+    chatHistory: [],
+    chatHistoryGroups: [],
+    chatHistoryLoaded: false,
+    chatLoadToken: 0,
     chatMentions: [],
     mentionSearchTimer: null,
     mentionSearchToken: 0,
@@ -223,6 +228,9 @@
       excerpt: "结合 peer-review signals 改进个性化论文推荐。"
     }
   ];
+
+  const demoChatSessions = [];
+  const demoChatMessages = {};
 
   const demoProfiles = {
     user_demo: {
@@ -470,14 +478,27 @@
       ...options
     });
     const data = await response.json();
-    if (!data.ok) throw new Error(data.error || "请求失败");
+    if (!data.ok) {
+      const error = new Error(data.error || "请求失败");
+      error.status = response.status;
+      error.path = path;
+      error.payload = data;
+      throw error;
+    }
     return data;
+  }
+
+  function isUnknownApiRoute(error, route = "") {
+    return Number(error?.status) === 404
+      && String(error?.message || "").includes("Unknown API route")
+      && (!route || String(error?.path || "").includes(route));
   }
 
   async function demoApi(path, options = {}) {
     await new Promise((resolve) => window.setTimeout(resolve, 90));
     const url = new URL(path, window.location.origin);
     const route = url.pathname;
+    const method = (options.method || "GET").toUpperCase();
     const body = options.body ? JSON.parse(options.body) : {};
 
     if (route === "/api/health") {
@@ -586,8 +607,63 @@
         ]
       };
     }
-    if (route === "/api/wiki/ask") {
+    if (route === "/api/chat/sessions") {
+      const grouped = {};
+      demoChatSessions.forEach((session) => {
+        const dateKey = String(session.updated_at || session.created_at || todayDateValue()).slice(0, 10);
+        if (!grouped[dateKey]) grouped[dateKey] = [];
+        grouped[dateKey].push(session);
+      });
       return {
+        ok: true,
+        sessions: demoChatSessions,
+        groups: Object.keys(grouped).map((date) => ({ date, sessions: grouped[date] }))
+      };
+    }
+    if (route === "/api/chat/session" && method === "POST") {
+      const now = new Date().toISOString().slice(0, 19).replace("T", " ");
+      const session = {
+        session_id: `demo_chat_${Date.now()}`,
+        user_id: body.user_id || "user_demo",
+        title: body.title || "新对话",
+        created_at: now,
+        updated_at: now,
+        message_count: 0
+      };
+      demoChatSessions.unshift(session);
+      demoChatMessages[session.session_id] = [];
+      return { ok: true, session };
+    }
+    if (route === "/api/chat/session") {
+      const sessionId = url.searchParams.get("session_id") || "";
+      const session = demoChatSessions.find((item) => item.session_id === sessionId);
+      return { ok: true, session, messages: demoChatMessages[sessionId] || [] };
+    }
+    if (route === "/api/chat/session/delete") {
+      const sessionId = body.session_id || "";
+      const index = demoChatSessions.findIndex((item) => item.session_id === sessionId);
+      if (index >= 0) demoChatSessions.splice(index, 1);
+      delete demoChatMessages[sessionId];
+      return { ok: true, deleted: index >= 0 };
+    }
+    if (route === "/api/wiki/ask") {
+      const now = new Date().toISOString().slice(0, 19).replace("T", " ");
+      let sessionId = body.session_id || "";
+      let session = demoChatSessions.find((item) => item.session_id === sessionId);
+      if (!session) {
+        sessionId = sessionId || `demo_chat_${Date.now()}`;
+        session = {
+          session_id: sessionId,
+          user_id: body.user_id || "user_demo",
+          title: String(body.question || "新对话").slice(0, 48),
+          created_at: now,
+          updated_at: now,
+          message_count: 0
+        };
+        demoChatSessions.unshift(session);
+        demoChatMessages[sessionId] = [];
+      }
+      const answer = {
         ok: true,
         text: "基于最近的 5 篇论文和 3 个 Wiki 条目，RAG 方向的重点正在从单纯检索转向结构化记忆、引用可追溯和多模态证据融合。[1][2] 建议优先精读 test-time scaling 与 structured memory 两条线索。[3]",
         mode: "wiki",
@@ -596,8 +672,32 @@
         citations: demoSources,
         sources: demoSources,
         mentions: body.mentions || [],
-        streaming: { provider: false, transport: "desktop-progressive" }
+        streaming: { provider: false, transport: "desktop-progressive" },
+        session_id: sessionId
       };
+      const messages = demoChatMessages[sessionId] || [];
+      messages.push({
+        id: messages.length + 1,
+        session_id: sessionId,
+        user_id: session.user_id,
+        role: "user",
+        content: body.question || "",
+        metadata: { scope: body.scope || "all", mentions: body.mentions || [] },
+        created_at: now
+      });
+      messages.push({
+        id: messages.length + 1,
+        session_id: sessionId,
+        user_id: session.user_id,
+        role: "assistant",
+        content: answer.text,
+        metadata: { ...answer },
+        created_at: now
+      });
+      demoChatMessages[sessionId] = messages;
+      session.updated_at = now;
+      session.message_count = messages.length;
+      return answer;
     }
     if (route === "/api/wiki/node") {
       return { ok: true, node: { node_id: body.node_id, title: body.title, body: body.body, node_type: "topic" } };
@@ -668,6 +768,7 @@
   }
 
   function setView(name, updateHash = true, options = {}) {
+    document.body.classList.toggle("chat-view", name === "chat");
     document.querySelectorAll(".view").forEach((view) => view.classList.toggle("active", view.id === name));
     document.querySelectorAll(".rail-item").forEach((button) => button.classList.toggle("active", button.dataset.view === name));
     const active = $(name);
@@ -681,6 +782,7 @@
     window.scrollTo({ top: 0, left: 0 });
     if (name === "reports" && !options.skipLoad) runAction(() => refreshReports({ keepSelection: true }), "加载报告");
     if (name === "wiki" && !options.skipLoad) runAction(loadWiki, "加载 Wiki");
+    if (name === "chat" && !options.skipLoad) runAction(() => loadChatSessions({ openLatest: true }), "加载历史对话");
     if (name === "settings") runAction(loadSettings, "加载设置");
     if (name === "papers") {
       resumeDailyTask().catch((error) => {
@@ -2192,6 +2294,199 @@
     }).join("") : "暂无参考文献。";
   }
 
+  function chatIntroHtml() {
+    return `
+      <div class="message assistant">
+        <div class="avatar">AI</div>
+        <div class="bubble">
+          <p>可以围绕最近论文、精读报告和 Wiki 条目提问；回答会列出参考文献。</p>
+        </div>
+      </div>
+    `;
+  }
+
+  function resetChatThread() {
+    $("chatThread").innerHTML = chatIntroHtml();
+    renderChatSources();
+    window.setTimeout(() => {
+      $("chatThread").scrollTop = $("chatThread").scrollHeight;
+    }, 0);
+  }
+
+  function formatChatDateLabel(dateValue) {
+    const date = String(dateValue || "").slice(0, 10);
+    if (!date) return "未分组";
+    if (date === todayDateValue()) return "今天";
+    const yesterday = new Date();
+    yesterday.setDate(yesterday.getDate() - 1);
+    const yesterdayValue = `${yesterday.getFullYear()}-${String(yesterday.getMonth() + 1).padStart(2, "0")}-${String(yesterday.getDate()).padStart(2, "0")}`;
+    if (date === yesterdayValue) return "昨天";
+    return date;
+  }
+
+  function formatChatTime(value) {
+    const text = String(value || "");
+    const match = text.match(/(\d{2}):(\d{2})/);
+    return match ? `${match[1]}:${match[2]}` : "";
+  }
+
+  function renderChatHistory(data = {}) {
+    const sessions = Array.isArray(data.sessions) ? data.sessions : state.chatHistory;
+    let groups = Array.isArray(data.groups) ? data.groups : state.chatHistoryGroups;
+    if ((!groups || !groups.length) && sessions.length) {
+      const grouped = {};
+      sessions.forEach((session) => {
+        const date = String(session.updated_at || session.created_at || todayDateValue()).slice(0, 10);
+        if (!grouped[date]) grouped[date] = [];
+        grouped[date].push(session);
+      });
+      groups = Object.keys(grouped).map((date) => ({ date, sessions: grouped[date] }));
+    }
+    state.chatHistory = sessions;
+    state.chatHistoryGroups = groups || [];
+
+    const hint = $("chatHistoryHint");
+    if (hint) hint.textContent = sessions.length ? `${sessions.length} 段对话` : "按日期保存";
+
+    const target = $("chatHistoryList");
+    target.className = sessions.length ? "chat-history-list" : "chat-history-list empty";
+    if (!sessions.length) {
+      target.innerHTML = "暂无历史对话。开始提问后会自动保存到本地数据库。";
+      return;
+    }
+    target.innerHTML = state.chatHistoryGroups.map((group) => `
+      <div class="chat-history-date">
+        <div class="chat-history-date-title">${escapeHtml(formatChatDateLabel(group.date))}</div>
+        ${(group.sessions || []).map((session) => `
+          <button
+            class="chat-session-button${session.session_id === state.chatSessionId ? " active" : ""}"
+            type="button"
+            data-chat-session-id="${escapeHtml(session.session_id)}"
+            title="${escapeHtml(session.title || "新对话")}"
+          >
+            <strong>${escapeHtml(session.title || "新对话")}</strong>
+            <span>${escapeHtml(formatChatTime(session.updated_at))}${session.message_count ? ` · ${escapeHtml(session.message_count)} 条消息` : ""}</span>
+          </button>
+        `).join("")}
+      </div>
+    `).join("");
+  }
+
+  function renderChatMessages(messages = []) {
+    if (!messages.length) {
+      resetChatThread();
+      return;
+    }
+    let latestCitations = [];
+    $("chatThread").innerHTML = messages.map((message) => {
+      const role = message.role === "user" ? "user" : "assistant";
+      const content = String(message.content || "");
+      if (role === "user") {
+        return `
+          <div class="message user" data-chat-message-id="${escapeHtml(message.id || "")}">
+            <div class="avatar">我</div>
+            <div class="bubble"><p>${escapeHtml(content).replace(/\n/g, "<br>")}</p></div>
+          </div>
+        `;
+      }
+      const metadata = message.metadata && typeof message.metadata === "object" ? message.metadata : {};
+      const answerData = {
+        mode: "direct",
+        retrieval_required: false,
+        ...metadata,
+        text: content
+      };
+      const citations = normalizeCitations(answerData);
+      latestCitations = citations;
+      return `
+        <div class="message assistant" data-chat-message-id="${escapeHtml(message.id || "")}">
+          <div class="avatar">AI</div>
+          <div class="bubble">
+            ${renderAnswerMeta(answerData, citations)}
+            <div class="answer-text">${renderAnswerWithCitations(content, citations)}</div>
+          </div>
+        </div>
+      `;
+    }).join("");
+    renderChatSources(latestCitations);
+    window.setTimeout(() => {
+      $("chatThread").scrollTop = $("chatThread").scrollHeight;
+    }, 0);
+  }
+
+  function renderChatHistoryUnavailable() {
+    state.chatHistoryLoaded = false;
+    state.chatHistory = [];
+    state.chatHistoryGroups = [];
+    const hint = $("chatHistoryHint");
+    if (hint) hint.textContent = "后端需重启";
+    const target = $("chatHistoryList");
+    target.className = "chat-history-list empty";
+    target.innerHTML = "当前 GUI 后端还没加载聊天历史接口。请停止后重新运行 PaperFlow GUI，再刷新页面。";
+  }
+
+  async function loadChatSessions(options = {}) {
+    let data;
+    try {
+      data = await api(`/api/chat/sessions?user_id=${encodeURIComponent(currentUser())}&days=90&limit=120`);
+    } catch (error) {
+      if (isUnknownApiRoute(error, "/api/chat/sessions")) {
+        renderChatHistoryUnavailable();
+        return;
+      }
+      throw error;
+    }
+    state.chatHistoryLoaded = true;
+    renderChatHistory(data);
+    if (options.openLatest && !state.chatSessionId) {
+      const latest = state.chatHistory[0];
+      if (latest?.session_id) {
+        await loadChatSession(latest.session_id);
+      } else {
+        resetChatThread();
+      }
+    }
+  }
+
+  async function loadChatSession(sessionId) {
+    const normalizedSessionId = String(sessionId || "").trim();
+    if (!normalizedSessionId) {
+      startNewChat({ silent: true });
+      return;
+    }
+    const token = ++state.chatLoadToken;
+    let data;
+    try {
+      data = await api(`/api/chat/session?user_id=${encodeURIComponent(currentUser())}&session_id=${encodeURIComponent(normalizedSessionId)}`);
+    } catch (error) {
+      if (isUnknownApiRoute(error, "/api/chat/session")) {
+        renderChatHistoryUnavailable();
+        return;
+      }
+      throw error;
+    }
+    if (token !== state.chatLoadToken) return;
+    if (!data.session) throw new Error("历史对话不存在");
+    state.chatSessionId = data.session.session_id || normalizedSessionId;
+    renderChatMessages(data.messages || []);
+    renderChatHistory({ sessions: state.chatHistory, groups: state.chatHistoryGroups });
+  }
+
+  function startNewChat(options = {}) {
+    state.chatSessionId = "";
+    state.chatLoadToken += 1;
+    if ($("chatInput")) $("chatInput").value = "";
+    clearChatMentions();
+    window.clearTimeout(state.mentionSearchTimer);
+    state.mentionSearchToken += 1;
+    if ($("mentionSuggestions")) $("mentionSuggestions").hidden = true;
+    resetChatThread();
+    renderChatHistory({ sessions: state.chatHistory, groups: state.chatHistoryGroups });
+    if (!options.silent) {
+      showFeedbackToast("success", "已新建对话", "第一条回答完成后会自动保存到历史。");
+    }
+  }
+
   function focusCitationSource(index) {
     const card = document.querySelector(`#chatSources [data-citation-index="${CSS.escape(String(index))}"]`);
     if (!card) return;
@@ -2427,7 +2722,8 @@
       question,
       scope: document.querySelector("input[name='chatScope']:checked")?.value || "all",
       limit: 8,
-      mentions: activeMentionsForQuestion(question)
+      mentions: activeMentionsForQuestion(question),
+      session_id: state.chatSessionId || ""
     };
     $("chatThread").insertAdjacentHTML("beforeend", `
       <div class="message user">
@@ -2480,6 +2776,18 @@
           renderChatSources(citations);
         }
         const citations = normalizeCitations(data);
+      }
+      if (data?.session_id) {
+        state.chatSessionId = data.session_id;
+      }
+      try {
+        await loadChatSessions();
+      } catch (historyError) {
+        console.warn("Chat history refresh failed.", historyError);
+        const detail = isUnknownApiRoute(historyError, "/api/chat/sessions")
+          ? "本次回答已完成；请重启 PaperFlow GUI 后端后再使用历史对话。"
+          : "本次回答已完成，稍后可重新加载历史。";
+        showFeedbackToast("warning", "历史列表刷新失败", detail);
       }
       $("chatThread").scrollTop = $("chatThread").scrollHeight;
     } catch (error) {
@@ -3081,9 +3389,13 @@
       setDailyTaskState("", "", false);
       state.currentUser = currentUser();
       runAction(async () => {
+        startNewChat({ silent: true });
         await loadLatestPush();
         await loadWiki();
         await loadCurrentProfile();
+        if (document.querySelector(".view.active")?.id === "chat") {
+          await loadChatSessions({ openLatest: true });
+        }
         await resumeDailyTask();
       }, "切换用户");
     });
@@ -3242,6 +3554,12 @@
     }, "保存 Wiki"));
 
     $("wikiAskBtn").addEventListener("click", () => runAction(askWiki, "生成回答"));
+    $("newChatBtn").addEventListener("click", () => runAction(() => startNewChat(), "新建对话"));
+    $("chatHistoryList").addEventListener("click", (event) => {
+      const button = event.target.closest("[data-chat-session-id]");
+      if (!button) return;
+      runAction(() => loadChatSession(button.dataset.chatSessionId), "打开历史对话");
+    });
     $("chatInput").addEventListener("keydown", (event) => {
       if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) runAction(askWiki, "生成回答");
     });
@@ -3278,13 +3596,7 @@
         runAction(() => openCitationSource(card.dataset.nodeId, card.dataset.title), "打开引用");
       }
     });
-    document.querySelectorAll(".quick-prompts button").forEach((button) => {
-      button.addEventListener("click", () => {
-        $("chatInput").value = button.dataset.prompt || "";
-        runAction(askWiki, "生成回答");
-      });
-    });
-
+    $("refreshSettingsBtn")?.addEventListener("click", () => runAction(loadSettings, "加载设置"));
     $("saveSettingsBtn").addEventListener("click", () => runAction(saveSettings, "保存设置"));
     $("saveAdvancedSettingsBtn").addEventListener("click", () => runAction(saveSettings, "保存设置"));
     $("saveStorageSettingsBtn").addEventListener("click", () => runAction(saveSettings, "保存设置"));

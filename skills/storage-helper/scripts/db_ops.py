@@ -11,6 +11,7 @@ Provides CRUD operations for:
 
 import sqlite3
 import json
+import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, List, Dict, Any
@@ -139,6 +140,35 @@ def _derive_push_metadata_from_papers(papers: List[Dict[str, Any]]) -> Dict[str,
     return push_metadata
 
 
+def _create_chat_tables(cursor: sqlite3.Cursor) -> None:
+    """Create persistent GUI chat history tables."""
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS chat_sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT UNIQUE NOT NULL,
+            user_id TEXT NOT NULL,
+            title TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            message_count INTEGER DEFAULT 0
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS chat_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            metadata TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (session_id) REFERENCES chat_sessions(session_id)
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_chat_sessions_user_updated ON chat_sessions(user_id, updated_at)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_chat_messages_session_id ON chat_messages(session_id, id)")
+
+
 def init_db() -> None:
     """Initialize database, create all tables"""
     conn = get_connection()
@@ -206,6 +236,8 @@ def init_db() -> None:
         )
     """)
 
+    _create_chat_tables(cursor)
+
     # Create indexes
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_papers_arxiv ON papers(arxiv_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_papers_doi ON papers(doi)")
@@ -217,6 +249,265 @@ def init_db() -> None:
     conn.commit()
     conn.close()
     print("Database tables created successfully.")
+
+
+# ============== Chat History Operations ==============
+
+def ensure_chat_tables() -> None:
+    """Ensure persistent GUI chat history tables exist for upgraded databases."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    _create_chat_tables(cursor)
+    conn.commit()
+    conn.close()
+
+
+def _chat_now() -> str:
+    return datetime.now().isoformat(sep=" ", timespec="seconds")
+
+
+def _chat_title_from_content(content: str, max_chars: int = 48) -> str:
+    title = " ".join(str(content or "").split())
+    if not title:
+        return "新对话"
+    if len(title) <= max_chars:
+        return title
+    return title[: max(1, max_chars - 3)].rstrip() + "..."
+
+
+def _chat_session_row(row: sqlite3.Row) -> Dict[str, Any]:
+    return {
+        "session_id": row["session_id"],
+        "user_id": row["user_id"],
+        "title": row["title"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+        "message_count": int(row["message_count"] or 0),
+    }
+
+
+def create_chat_session(
+    user_id: str,
+    title: str = "",
+    session_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Create or return a persistent GUI chat session."""
+    normalized_user_id = _normalize_identifier(user_id)
+    if not normalized_user_id:
+        raise ValueError("user_id is required")
+
+    ensure_chat_tables()
+    normalized_session_id = _normalize_identifier(session_id) or f"chat_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+    normalized_title = _chat_title_from_content(title)
+    now = _chat_now()
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT OR IGNORE INTO chat_sessions (session_id, user_id, title, created_at, updated_at, message_count)
+        VALUES (?, ?, ?, ?, ?, 0)
+        """,
+        (normalized_session_id, normalized_user_id, normalized_title, now, now),
+    )
+    cursor.execute(
+        """
+        SELECT session_id, user_id, title, created_at, updated_at, message_count
+        FROM chat_sessions
+        WHERE user_id = ? AND session_id = ?
+        """,
+        (normalized_user_id, normalized_session_id),
+    )
+    row = cursor.fetchone()
+    conn.commit()
+    conn.close()
+    if not row:
+        raise ValueError("chat session belongs to another user or could not be created")
+    return _chat_session_row(row)
+
+
+def save_chat_message(
+    user_id: str,
+    session_id: str,
+    role: str,
+    content: str,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Persist a GUI chat message and update its parent session summary."""
+    normalized_user_id = _normalize_identifier(user_id)
+    normalized_session_id = _normalize_identifier(session_id)
+    normalized_role = str(role or "").strip().lower()
+    if not normalized_user_id or not normalized_session_id:
+        raise ValueError("user_id and session_id are required")
+    if normalized_role not in {"user", "assistant"}:
+        raise ValueError("role must be user or assistant")
+
+    ensure_chat_tables()
+    create_chat_session(normalized_user_id, str(content or ""), normalized_session_id)
+
+    now = _chat_now()
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO chat_messages (session_id, user_id, role, content, metadata, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            normalized_session_id,
+            normalized_user_id,
+            normalized_role,
+            str(content or ""),
+            json.dumps(metadata or {}, ensure_ascii=False),
+            now,
+        ),
+    )
+    message_id = cursor.lastrowid
+    if normalized_role == "user":
+        cursor.execute(
+            """
+            UPDATE chat_sessions
+            SET title = CASE WHEN title IN ('', '新对话', 'New chat') THEN ? ELSE title END,
+                updated_at = ?
+            WHERE user_id = ? AND session_id = ?
+            """,
+            (_chat_title_from_content(content), now, normalized_user_id, normalized_session_id),
+        )
+    else:
+        cursor.execute(
+            """
+            UPDATE chat_sessions
+            SET updated_at = ?
+            WHERE user_id = ? AND session_id = ?
+            """,
+            (now, normalized_user_id, normalized_session_id),
+        )
+    cursor.execute(
+        """
+        UPDATE chat_sessions
+        SET message_count = (
+            SELECT COUNT(*)
+            FROM chat_messages
+            WHERE user_id = ? AND session_id = ?
+        )
+        WHERE user_id = ? AND session_id = ?
+        """,
+        (normalized_user_id, normalized_session_id, normalized_user_id, normalized_session_id),
+    )
+    cursor.execute(
+        """
+        SELECT id, session_id, user_id, role, content, metadata, created_at
+        FROM chat_messages
+        WHERE id = ?
+        """,
+        (message_id,),
+    )
+    row = cursor.fetchone()
+    conn.commit()
+    conn.close()
+    message = dict(row)
+    message["metadata"] = _load_json_metadata(message.get("metadata"))
+    return message
+
+
+def list_chat_sessions(user_id: str, days: int = 30, limit: int = 80) -> Dict[str, Any]:
+    """List a user's chat sessions grouped by updated local date."""
+    normalized_user_id = _normalize_identifier(user_id)
+    if not normalized_user_id:
+        raise ValueError("user_id is required")
+
+    ensure_chat_tables()
+    safe_days = max(1, int(days or 30))
+    safe_limit = max(1, min(200, int(limit or 80)))
+    since = (datetime.now() - timedelta(days=safe_days)).isoformat(sep=" ")
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT session_id, user_id, title, created_at, updated_at, message_count
+        FROM chat_sessions
+        WHERE user_id = ? AND updated_at >= ?
+        ORDER BY updated_at DESC, id DESC
+        LIMIT ?
+        """,
+        (normalized_user_id, since, safe_limit),
+    )
+    sessions = [_chat_session_row(row) for row in cursor.fetchall()]
+    conn.close()
+
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for session in sessions:
+        date_key = str(session.get("updated_at") or session.get("created_at") or _chat_now())[:10]
+        grouped.setdefault(date_key, []).append(session)
+    return {
+        "sessions": sessions,
+        "groups": [{"date": date_key, "sessions": grouped[date_key]} for date_key in grouped],
+    }
+
+
+def get_chat_session(user_id: str, session_id: str) -> Optional[Dict[str, Any]]:
+    """Return a chat session with ordered messages."""
+    normalized_user_id = _normalize_identifier(user_id)
+    normalized_session_id = _normalize_identifier(session_id)
+    if not normalized_user_id or not normalized_session_id:
+        raise ValueError("user_id and session_id are required")
+
+    ensure_chat_tables()
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT session_id, user_id, title, created_at, updated_at, message_count
+        FROM chat_sessions
+        WHERE user_id = ? AND session_id = ?
+        """,
+        (normalized_user_id, normalized_session_id),
+    )
+    session_row = cursor.fetchone()
+    if not session_row:
+        conn.close()
+        return None
+    cursor.execute(
+        """
+        SELECT id, session_id, user_id, role, content, metadata, created_at
+        FROM chat_messages
+        WHERE user_id = ? AND session_id = ?
+        ORDER BY id ASC
+        """,
+        (normalized_user_id, normalized_session_id),
+    )
+    messages = []
+    for row in cursor.fetchall():
+        message = dict(row)
+        message["metadata"] = _load_json_metadata(message.get("metadata"))
+        messages.append(message)
+    conn.close()
+    return {"session": _chat_session_row(session_row), "messages": messages}
+
+
+def delete_chat_session(user_id: str, session_id: str) -> bool:
+    """Delete a GUI chat session and its messages."""
+    normalized_user_id = _normalize_identifier(user_id)
+    normalized_session_id = _normalize_identifier(session_id)
+    if not normalized_user_id or not normalized_session_id:
+        raise ValueError("user_id and session_id are required")
+
+    ensure_chat_tables()
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "DELETE FROM chat_messages WHERE user_id = ? AND session_id = ?",
+        (normalized_user_id, normalized_session_id),
+    )
+    cursor.execute(
+        "DELETE FROM chat_sessions WHERE user_id = ? AND session_id = ?",
+        (normalized_user_id, normalized_session_id),
+    )
+    deleted = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    return deleted
 
 
 # ============== Profile Operations ==============

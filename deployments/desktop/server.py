@@ -332,6 +332,37 @@ def _api_wiki_ask(_query_params: Dict[str, Any], body: Dict[str, Any]) -> Dict[s
         scope=str(body.get("scope") or "all").strip(),
         limit=int(body.get("limit") or 8),
         mentions=body.get("mentions") or [],
+        session_id=str(body.get("session_id") or "").strip(),
+        persist_chat=True,
+    )
+
+
+def _api_chat_sessions(query_params: Dict[str, Any], _body: Dict[str, Any]) -> Dict[str, Any]:
+    return agents.chat_sessions(
+        user_id=_required_user(query_params),
+        days=int(query_params.get("days") or 30),
+        limit=int(query_params.get("limit") or 80),
+    )
+
+
+def _api_chat_session(query_params: Dict[str, Any], _body: Dict[str, Any]) -> Dict[str, Any]:
+    return agents.chat_session(
+        user_id=_required_user(query_params),
+        session_id=str(query_params.get("session_id") or "").strip(),
+    )
+
+
+def _api_create_chat_session(_query_params: Dict[str, Any], body: Dict[str, Any]) -> Dict[str, Any]:
+    return agents.create_chat_session(
+        user_id=str(body.get("user_id") or "").strip(),
+        title=str(body.get("title") or "").strip(),
+    )
+
+
+def _api_delete_chat_session(_query_params: Dict[str, Any], body: Dict[str, Any]) -> Dict[str, Any]:
+    return agents.delete_chat_session(
+        user_id=str(body.get("user_id") or "").strip(),
+        session_id=str(body.get("session_id") or "").strip(),
     )
 
 
@@ -372,6 +403,8 @@ GET_ROUTES: Dict[str, ApiHandler] = {
     "/api/wiki/stats": _api_wiki_stats,
     "/api/wiki/search": _api_wiki_search,
     "/api/wiki/graph": _api_wiki_graph,
+    "/api/chat/sessions": _api_chat_sessions,
+    "/api/chat/session": _api_chat_session,
     "/api/activity": _api_activity,
     "/api/reports": _api_reports,
     "/api/reports/content": _api_report_content,
@@ -392,6 +425,8 @@ POST_ROUTES: Dict[str, ApiHandler] = {
     "/api/submit": _api_submit,
     "/api/wiki/ask": _api_wiki_ask,
     "/api/wiki/ask/stream": _api_wiki_ask,
+    "/api/chat/session": _api_create_chat_session,
+    "/api/chat/session/delete": _api_delete_chat_session,
     "/api/wiki/node": _api_wiki_node,
     "/api/export": _api_export,
     "/api/must-read": _api_must_read_update,
@@ -455,6 +490,8 @@ class PaperFlowGuiHandler(BaseHTTPRequestHandler):
                 scope=str(body.get("scope") or "all").strip(),
                 limit=int(body.get("limit") or 8),
                 mentions=body.get("mentions") or [],
+                session_id=str(body.get("session_id") or "").strip(),
+                persist_chat=True,
             ):
                 self._send_sse_event(str(event.get("event") or "message"), {"ok": True, **(event.get("data") or {})})
         except Exception as exc:

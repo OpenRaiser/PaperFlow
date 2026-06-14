@@ -31,6 +31,10 @@ def test_desktop_server_routes_are_registered() -> None:
     assert "/api/daily/status" in server.GET_ROUTES
     assert "/api/daily/start" in server.POST_ROUTES
     assert "/api/wiki/ask/stream" in server.POST_ROUTES
+    assert "/api/chat/sessions" in server.GET_ROUTES
+    assert "/api/chat/session" in server.GET_ROUTES
+    assert "/api/chat/session" in server.POST_ROUTES
+    assert "/api/chat/session/delete" in server.POST_ROUTES
     assert 'self.send_header("Cache-Control", "no-store")' in server_source
 
 
@@ -74,6 +78,7 @@ def test_desktop_settings_page_renders_storage_paths_as_inputs() -> None:
     assert 'id="saveStorageSettingsBtn" class="primary" type="button">保存设置</button>' in html
     assert 'data-env-key="${escapeHtml(row.envKey)}"' in script
     assert "editable-path-row" in script
+    assert '$("refreshSettingsBtn")?.addEventListener("click", () => runAction(loadSettings, "加载设置"));' in script
     assert '$("saveStorageSettingsBtn").addEventListener("click", () => runAction(saveSettings, "保存设置"));' in script
     assert "PAPERFLOW_PDF_DIR" in script
     assert "PAPERFLOW_READING_REPORTS_DIR" in script
@@ -647,6 +652,55 @@ def test_desktop_wiki_ask_stream_can_direct_answer_without_wiki(monkeypatch: pyt
     assert "".join(event["data"].get("text", "") for event in events if event["event"] == "chunk") == "RAG 是检索增强生成"
     assert events[-1]["data"]["text"] == "RAG 是检索增强生成"
     assert captured["max_tokens"] >= 1400
+
+
+def test_desktop_chat_history_persists_json_answers(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(agents.db_ops, "DB_PATH", tmp_path / "paperflow-chat.db")
+    agents.db_ops.init_db()
+
+    class FakeMockLLM:
+        name = "mock"
+        model = "mock-llm"
+
+    monkeypatch.setattr(agents, "build_llm_provider", lambda: FakeMockLLM())
+    monkeypatch.setattr(agents.wiki_db, "search_nodes", lambda *_args, **_kwargs: pytest.fail("direct questions should not search wiki"))
+
+    payload = agents.wiki_ask("user_test", "什么是 RAG？", persist_chat=True)
+
+    assert payload["session_id"].startswith("chat_")
+    listing = agents.chat_sessions("user_test", days=90)
+    assert listing["sessions"][0]["session_id"] == payload["session_id"]
+    assert listing["groups"][0]["sessions"][0]["message_count"] == 2
+
+    session = agents.chat_session("user_test", payload["session_id"])
+    assert [message["role"] for message in session["messages"]] == ["user", "assistant"]
+    assert session["messages"][0]["content"] == "什么是 RAG？"
+    assert session["messages"][1]["metadata"]["mode"] == "direct"
+    assert session["messages"][1]["metadata"]["retrieval_required"] is False
+
+
+def test_desktop_chat_history_persists_streaming_answers(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(agents.db_ops, "DB_PATH", tmp_path / "paperflow-chat-stream.db")
+    agents.db_ops.init_db()
+
+    class FakeStreamingLLM:
+        name = "fake"
+        model = "fake-stream"
+
+        def stream_generate(self, *_args, **_kwargs):
+            yield "RAG"
+            yield " 是检索增强生成"
+
+    monkeypatch.setattr(agents, "build_llm_provider", lambda: FakeStreamingLLM())
+    monkeypatch.setattr(agents.wiki_db, "search_nodes", lambda *_args, **_kwargs: pytest.fail("direct stream should not search wiki"))
+
+    events = list(agents.wiki_ask_stream("user_test", "什么是 RAG？", persist_chat=True))
+    session_id = events[-1]["data"]["session_id"]
+
+    session = agents.chat_session("user_test", session_id)
+    assert len(session["messages"]) == 2
+    assert session["messages"][1]["content"] == "RAG 是检索增强生成"
+    assert session["messages"][1]["metadata"]["streaming"]["transport"] == "sse"
 
 
 def test_desktop_wiki_answer_stream_uses_longer_default_completion_budget(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1597,7 +1651,23 @@ def test_desktop_wiki_chat_supports_clickable_citations_streaming_and_mentions()
 
     assert 'id="mentionSuggestions"' in html
     assert 'id="chatMentionChips"' in html
+    assert 'id="chatHistoryList"' in html
+    assert 'id="newChatBtn"' in html
+    assert "quick-prompts" not in html
+    assert "总结 RAG 趋势" not in html
+    assert "对比两篇方法" not in html
+    assert "找相关概念" not in html
     assert "/api/wiki/ask/stream" in script
+    assert "quick-prompts" not in script
+    assert "/api/chat/sessions" in script
+    assert "/api/chat/session" in script
+    assert "loadChatSessions({ openLatest: true })" in script
+    assert "session_id: state.chatSessionId || \"\"" in script
+    assert "state.chatSessionId = data.session_id" in script
+    assert "isUnknownApiRoute" in script
+    assert "renderChatHistoryUnavailable" in script
+    assert "后端还没加载聊天历史接口" in script
+    assert 'document.body.classList.toggle("chat-view", name === "chat")' in script
     assert "streamWikiAsk(payload, answerTarget, message)" in script
     assert "renderAnswerWithCitations" in script
     assert "let doneReceived = false" in script
@@ -1620,6 +1690,13 @@ def test_desktop_wiki_chat_supports_clickable_citations_streaming_and_mentions()
     assert "retrieval_required" in script
     assert ".citation-ref" in css
     assert ".mention-suggestions" in css
+    assert ".quick-prompts" not in css
+    assert ".chat-history-pane" in css
+    assert ".chat-session-button.active" in css
+    assert "body.chat-view #chat" in css
+    assert "body.chat-view .chat-layout" in css
+    assert "body.chat-view .source-list" in css
+    assert "scrollbar-gutter: stable" in css
     assert ".answer-meta .wiki" in css
     assert ".answer-text strong" in css
 

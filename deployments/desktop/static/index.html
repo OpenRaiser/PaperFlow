@@ -263,6 +263,17 @@
 
         <section id="chat" class="view" data-title="对话问答" data-kicker="Chat & Ask">
           <div class="chat-layout">
+            <aside class="chat-history-pane">
+              <div class="chat-history-head">
+                <div>
+                  <h2>历史对话</h2>
+                  <span id="chatHistoryHint">按日期保存</span>
+                </div>
+                <button id="newChatBtn" type="button">新建</button>
+              </div>
+              <div id="chatHistoryList" class="chat-history-list empty">暂无历史对话。</div>
+            </aside>
+
             <div class="chat-main">
               <div class="chat-thread" id="chatThread">
                 <div class="message assistant">
@@ -271,11 +282,6 @@
                     <p>可以围绕最近论文、精读报告和 Wiki 条目提问；回答会列出参考文献。</p>
                   </div>
                 </div>
-              </div>
-              <div class="quick-prompts">
-                <button data-prompt="总结最近一周和 RAG 相关的论文" type="button">总结 RAG 趋势</button>
-                <button data-prompt="对比这两篇论文的方法差异" type="button">对比两篇方法</button>
-                <button data-prompt="找出可加入 Wiki 的关键概念" type="button">找相关概念</button>
               </div>
               <div id="chatMentionChips" class="mention-chips" hidden></div>
               <div id="mentionSuggestions" class="mention-suggestions" hidden></div>
