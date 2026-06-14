@@ -32,7 +32,7 @@ GUI 与 CLI 共用同一套 SQLite 数据库和运行目录：
 ## 精读报告保存地址
 
 GUI 里填写的 `arXiv ID / URL` 或 `PDF 路径` 是**输入地址**，不是输出地址。
-精读报告生成之后保存到哪里，由 `.env` 里的路径变量控制：
+精读报告生成之后保存到哪里，由设置页“存储与导出”里的目录设置控制；点击“保存设置”后会写入 `.env`：
 
 ```env
 # 下载或缓存的论文 PDF 保存到这里
@@ -74,8 +74,7 @@ PAPERFLOW_STORAGE_CATEGORY_SUBDIR=true
 PAPERFLOW_STORAGE_MONTHLY_SUBDIR=true
 ```
 
-改完 `.env` 后重新启动 `paperflow gui`。GUI 的 `运行设置` 面板只负责查看当前路径，
-不负责在浏览器里改 `.env`。
+也可以直接改 `.env` 后重新启动 `paperflow gui`。
 
 主流程：
 

@@ -204,6 +204,12 @@ def _api_create_profile(_query_params: Dict[str, Any], body: Dict[str, Any]) -> 
         scholar_url=str(body.get("scholar_url") or ""),
         homepage_url=str(body.get("homepage_url") or ""),
         pdf_paths=list(body.get("pdf_paths") or []),
+        affiliation=str(body.get("affiliation") or ""),
+        core_directions_text=str(body.get("core_directions_text") or ""),
+        topic_weights_text=str(body.get("topic_weights_text") or ""),
+        must_read_keywords=list(body.get("must_read_keywords") or []),
+        must_read_authors=list(body.get("must_read_authors") or []),
+        must_read_institutions=list(body.get("must_read_institutions") or []),
         reset_existing=bool(body.get("reset_existing")),
     )
 

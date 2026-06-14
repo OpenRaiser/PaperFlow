@@ -2679,6 +2679,21 @@
     return values.length ? values.join("、") : "未记录";
   }
 
+  function editableListValue(items) {
+    return splitListValue(items).join("; ");
+  }
+
+  function editableWeightedValue(rawMap, items) {
+    const entries = Object.entries(rawMap || {});
+    if (entries.length) {
+      return entries
+        .sort((a, b) => Number(b[1]) - Number(a[1]))
+        .map(([key, value]) => `${key}:${Number(value || 1)}`)
+        .join("; ");
+    }
+    return splitListValue(items).join("; ");
+  }
+
   function profileEditableDescription(raw, userInfo) {
     return firstText(
       raw?.description,
@@ -2711,6 +2726,17 @@
     return `<div class="profile-info-item${variantClass}${emptyClass}"><span>${escapeHtml(label)}</span><strong>${escapeHtml(normalized)}</strong></div>`;
   }
 
+  function profileEditItem(label, id, value, variant = "wide", multiline = false, hint = "") {
+    const variantClass = variant ? ` ${variant}` : "";
+    const escapedValue = escapeHtml(value || "");
+    const placeholder = hint ? ` placeholder="${escapeHtml(hint)}"` : "";
+    const control = multiline
+      ? `<textarea id="${escapeHtml(id)}" rows="2"${placeholder}>${escapedValue}</textarea>`
+      : `<input id="${escapeHtml(id)}" value="${escapedValue}"${placeholder}>`;
+    const hintText = hint ? `<small>${escapeHtml(hint)}</small>` : "";
+    return `<label class="profile-info-item editable${variantClass}"><span>${escapeHtml(label)}</span>${control}${hintText}</label>`;
+  }
+
   function renderProfileInfoGrid(profile, raw, userInfo, details) {
     const target = $("profileInfoGrid");
     if (!target) return;
@@ -2722,12 +2748,12 @@
       profileInfoItem("角色", userInfo?.role_name || userInfo?.label || ""),
       profileInfoItem("版本", firstText(profile?.version, raw?.version)),
       profileInfoItem("更新时间", updatedAt),
-      profileInfoItem("所属机构", profileAffiliation(raw, userInfo), "wide"),
-      profileInfoItem("方向", listText(details.directions, 8), "wide"),
-      profileInfoItem("关键词", listText(mustRead.keywords, 10), "wide"),
-      profileInfoItem("作者", listText(mustRead.authors, 8), "wide"),
-      profileInfoItem("关注机构", listText(mustRead.institutions, 8), "wide"),
-      profileInfoItem("主题", listText(details.topics, 10), "wide"),
+      profileInfoItem("个人机构", profileAffiliation(raw, userInfo), "wide"),
+      profileEditItem("关注方向", "profileDirectionsInput", editableWeightedValue(raw?.core_directions || profile?.core_directions, details.directions), "wide", true, "用分号或换行分隔；可写 方向:0.8"),
+      profileEditItem("关注关键词", "profileKeywordsInput", editableListValue(mustRead.keywords), "wide", true, "用分号或换行分隔"),
+      profileEditItem("关注作者", "profileAuthorsInput", editableListValue(mustRead.authors), "wide", true, "用分号或换行分隔"),
+      profileEditItem("关注机构", "profileInstitutionsInput", editableListValue(mustRead.institutions), "wide", true, "用分号或换行分隔"),
+      profileEditItem("关注主题", "profileTopicsInput", editableWeightedValue(raw?.topic_weights || profile?.topic_weights, details.topics), "wide", true, "用分号或换行分隔；可写 主题:0.8"),
       profileInfoItem("漂移状态", firstText(drift.status, raw?.drift_status), "wide")
     ].join("");
   }
@@ -2879,15 +2905,20 @@
     const paths = data.paths || {};
     const storageStats = data.storage_stats || {};
     const rows = [
-      ["PDF 缓存目录", paths.pdf_dir],
-      ["精读报告目录", paths.reading_reports_dir],
-      ["知识库目录", paths.wiki_dir],
-      ["写入飞书", paths.write_feishu ? "是" : "否"],
-      ["Wiki 增量写入", paths.wiki_ingest ? "是" : "否"]
+      { label: "PDF 缓存目录", value: paths.pdf_dir, envKey: "PAPERFLOW_PDF_DIR" },
+      { label: "精读报告目录", value: paths.reading_reports_dir, envKey: "PAPERFLOW_READING_REPORTS_DIR" },
+      { label: "知识库目录", value: paths.wiki_dir, envKey: "PAPERFLOW_WIKI_DIR" },
+      { label: "写入飞书", value: paths.write_feishu ? "是" : "否" },
+      { label: "Wiki 增量写入", value: paths.wiki_ingest ? "是" : "否" }
     ];
     $("settingsList").className = "settings-list";
-    $("settingsList").innerHTML = rows.map(([key, value]) => `
-      <div class="setting-row"><strong>${escapeHtml(key)}</strong><span>${escapeHtml(value || "-")}</span></div>
+    $("settingsList").innerHTML = rows.map((row) => `
+      <div class="setting-row ${row.envKey ? "editable-path-row" : ""}">
+        <strong>${escapeHtml(row.label)}</strong>
+        ${row.envKey
+          ? `<input data-env-key="${escapeHtml(row.envKey)}" value="${escapeHtml(row.value || "")}" autocomplete="off">`
+          : `<span>${escapeHtml(row.value || "-")}</span>`}
+      </div>
     `).join("");
     if ($("cacheSizeStat")) $("cacheSizeStat").textContent = storageStats.cache_display || "-";
 
@@ -3017,6 +3048,11 @@
         scholar_url: $("scholarUrl").value,
         homepage_url: $("homepageUrl").value,
         pdf_paths: pdfPaths,
+        core_directions_text: $("profileDirectionsInput")?.value || "",
+        topic_weights_text: $("profileTopicsInput")?.value || "",
+        must_read_keywords: splitListValue($("profileKeywordsInput")?.value || ""),
+        must_read_authors: splitListValue($("profileAuthorsInput")?.value || ""),
+        must_read_institutions: splitListValue($("profileInstitutionsInput")?.value || ""),
         reset_existing: $("resetProfile").checked
       })
     });
@@ -3249,9 +3285,9 @@
       });
     });
 
-    $("refreshSettingsBtn").addEventListener("click", () => runAction(loadSettings, "加载设置"));
     $("saveSettingsBtn").addEventListener("click", () => runAction(saveSettings, "保存设置"));
-    $("saveAdvancedSettingsBtn").addEventListener("click", () => runAction(saveSettings, "保存高级参数"));
+    $("saveAdvancedSettingsBtn").addEventListener("click", () => runAction(saveSettings, "保存设置"));
+    $("saveStorageSettingsBtn").addEventListener("click", () => runAction(saveSettings, "保存设置"));
     $("testLlmBtn").addEventListener("click", () => runAction(() => testProvider("llm"), "测试 LLM"));
     $("testEmbedBtn").addEventListener("click", () => runAction(() => testProvider("embedding"), "测试 Embedding"));
     document.querySelectorAll('input[name="conferenceAccessMode"]').forEach((input) => {

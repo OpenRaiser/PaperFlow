@@ -66,7 +66,22 @@ def test_desktop_settings_exposes_storage_paths() -> None:
     assert "wiki_dir" in settings["paths"]
 
 
+def test_desktop_settings_page_renders_storage_paths_as_inputs() -> None:
+    html = (PROJECT_ROOT / "deployments" / "desktop" / "static" / "index.html").read_text(encoding="utf-8")
+    script = (PROJECT_ROOT / "deployments" / "desktop" / "static" / "desktop.js").read_text(encoding="utf-8")
+
+    assert '<script src="desktop.js"></script>' in html
+    assert 'id="saveStorageSettingsBtn" class="primary" type="button">保存设置</button>' in html
+    assert 'data-env-key="${escapeHtml(row.envKey)}"' in script
+    assert "editable-path-row" in script
+    assert '$("saveStorageSettingsBtn").addEventListener("click", () => runAction(saveSettings, "保存设置"));' in script
+    assert "PAPERFLOW_PDF_DIR" in script
+    assert "PAPERFLOW_READING_REPORTS_DIR" in script
+    assert "PAPERFLOW_WIKI_DIR" in script
+
+
 def test_desktop_wiki_graph_uses_user_nodes_and_edges(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(agents, "_configured_wiki_root", lambda: None)
     monkeypatch.setattr(
         agents.wiki_db,
         "list_nodes",
@@ -134,6 +149,7 @@ def test_desktop_wiki_graph_uses_user_nodes_and_edges(monkeypatch: pytest.Monkey
 
 
 def test_desktop_wiki_graph_prefers_edge_connected_nodes(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(agents, "_configured_wiki_root", lambda: None)
     monkeypatch.setattr(agents.wiki_db, "list_nodes", lambda user_id, limit: [])
 
     class FakeRows:
@@ -196,6 +212,44 @@ def test_desktop_wiki_graph_prefers_edge_connected_nodes(monkeypatch: pytest.Mon
 
     assert {node["node_id"] for node in graph["nodes"]} == {"paper:important", "topic:rag"}
     assert graph["edges"][0]["relation"] == "cites_method"
+
+
+def test_desktop_wiki_search_filters_to_configured_wiki_directory(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    wiki_root = tmp_path / "wiki"
+    kept = wiki_root / "user_test" / "papers" / "kept.md"
+    kept.parent.mkdir(parents=True)
+    kept.write_text("# kept", encoding="utf-8")
+    monkeypatch.setattr(agents, "_configured_wiki_root", lambda: wiki_root)
+    monkeypatch.setattr(
+        agents.wiki_db,
+        "search_nodes",
+        lambda *_args, **_kwargs: [
+            {
+                "node_id": "paper:kept",
+                "node_type": "paper",
+                "title": "Kept",
+                "body": "exists in configured wiki dir",
+                "metadata": {},
+                "keywords": "",
+                "file_path": "user_test/papers/kept.md",
+                "updated_at": "2026-06-01",
+            },
+            {
+                "node_id": "paper:old",
+                "node_type": "paper",
+                "title": "Old",
+                "body": "old mirror path",
+                "metadata": {},
+                "keywords": "",
+                "file_path": "user_test/papers/old.md",
+                "updated_at": "2026-06-01",
+            },
+        ],
+    )
+
+    result = agents.wiki_search("user_test", query="paper")
+
+    assert [node["node_id"] for node in result["nodes"]] == ["paper:kept"]
 
 
 def test_desktop_wiki_node_update_preserves_node_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -696,6 +750,9 @@ def test_desktop_save_settings_updates_env_file(tmp_path, monkeypatch: pytest.Mo
             "PAPERFLOW_DAILY_LIMIT": "17",
             "PAPERFLOW_RELEVANCE_THRESHOLD": "72",
             "PAPERFLOW_MAX_CONCURRENCY": "4",
+            "PAPERFLOW_PDF_DIR": str(tmp_path / "pdf-cache"),
+            "PAPERFLOW_READING_REPORTS_DIR": str(tmp_path / "reading-reports"),
+            "PAPERFLOW_WIKI_DIR": str(tmp_path / "knowledge-base"),
             "HTTP_PROXY": "http://127.0.0.1:18080",
             "UNSUPPORTED_KEY": "ignored",
         }
@@ -707,6 +764,12 @@ def test_desktop_save_settings_updates_env_file(tmp_path, monkeypatch: pytest.Mo
     assert "PAPERFLOW_WRITE_FEISHU=true" in text
     assert "PAPERFLOW_ENABLE_ARXIV=false" in text
     assert "PAPERFLOW_CUSTOM_RSS_URLS=https://example.com/rss.xml" in text
+    assert f"PAPERFLOW_PDF_DIR={tmp_path / 'pdf-cache'}" in text
+    assert f"PAPERFLOW_READING_REPORTS_DIR={tmp_path / 'reading-reports'}" in text
+    assert f"PAPERFLOW_WIKI_DIR={tmp_path / 'knowledge-base'}" in text
+    assert result["paths"]["pdf_dir"] == str(tmp_path / "pdf-cache")
+    assert result["paths"]["reading_reports_dir"] == str(tmp_path / "reading-reports")
+    assert result["paths"]["wiki_dir"] == str(tmp_path / "knowledge-base")
     assert "PAPERFLOW_CONFERENCE_ACCESS_MODE=credential" in text
     assert r"PAPERFLOW_CONFERENCE_COOKIE_FILE=C:\paperflow\cookies\neurips.txt" in text
     assert "SEMANTIC_SCHOLAR_API_KEY=s2-test-key" in text
@@ -999,16 +1062,66 @@ def test_desktop_user_picker_hydrates_settings_profile_form() -> None:
     assert "renderProfileForm(data);" in script
     assert "await loadCurrentProfile();" in script
     assert "$(\"profileUserId\").value = userId;" in script
-    assert 'profileInfoItem("所属机构", profileAffiliation(raw, userInfo), "wide")' in script
-    assert 'profileInfoItem("方向", listText(details.directions, 8), "wide")' in script
-    assert 'profileInfoItem("关键词", listText(mustRead.keywords, 10), "wide")' in script
-    assert 'profileInfoItem("作者", listText(mustRead.authors, 8), "wide")' in script
-    assert 'profileInfoItem("关注机构", listText(mustRead.institutions, 8), "wide")' in script
+    assert 'profileInfoItem("个人机构", profileAffiliation(raw, userInfo), "wide")' in script
+    assert 'profileEditItem("关注方向", "profileDirectionsInput"' in script
+    assert 'profileEditItem("关注关键词", "profileKeywordsInput"' in script
+    assert 'profileEditItem("关注作者", "profileAuthorsInput"' in script
+    assert 'profileEditItem("关注机构", "profileInstitutionsInput"' in script
+    assert 'profileEditItem("关注主题", "profileTopicsInput"' in script
+    assert 'profileAffiliationInput' not in script
+    assert "用分号或换行分隔；可写 方向:0.8" in script
+    assert "用分号或换行分隔；可写 主题:0.8" in script
     assert 'profileInfoItem("机构", listText(mustRead.institutions, 8), "wide")' not in script
+    assert 'core_directions_text: $("profileDirectionsInput")?.value || ""' in script
+    assert 'topic_weights_text: $("profileTopicsInput")?.value || ""' in script
+    assert 'must_read_keywords: splitListValue($("profileKeywordsInput")?.value || "")' in script
+    assert ".profile-info-item.editable" in css
+    assert ".profile-info-item.editable small" in css
     assert "$(\"naturalLanguage\").value = profileEditableDescription(raw, userInfo);" in script
     assert 'renderSettingTags("profileTagGrid"' not in script
     assert 'userInfo.has_profile ? "画像已加载" : "尚未生成画像，可在此补充"' in script
     assert "showSettingsMessage(`已加载 ${userId} 的画像信息。`);" in script
+
+
+def test_desktop_save_profile_applies_manual_editable_fields(monkeypatch: pytest.MonkeyPatch) -> None:
+    profile = {
+        "user_id": "user_test",
+        "version": "0.1",
+        "core_directions": {"old": 0.2},
+        "topic_weights": {"old topic": 0.1},
+        "must_read": {"authors": ["Old"], "institutions": [], "keywords": []},
+    }
+    saved = {}
+
+    monkeypatch.setattr(agents.coldstart_agent, "cold_start", lambda **kwargs: {"ok": True})
+    monkeypatch.setattr(agents.db_ops, "get_profile", lambda user_id: saved.get(user_id) or profile)
+
+    def fake_update_profile(user_id, updated):
+        saved[user_id] = updated
+        return True
+
+    monkeypatch.setattr(agents.db_ops, "update_profile", fake_update_profile)
+
+    result = agents.create_or_update_profile(
+        user_id="user_test",
+        affiliation="OpenAI",
+        core_directions_text="GUI Agent:0.8; Scientific Discovery=0.6",
+        topic_weights_text="paper recommendation:0.7",
+        must_read_keywords=["agent", "rag"],
+        must_read_authors=["Alice"],
+        must_read_institutions=["Stanford"],
+    )
+
+    updated = saved["user_test"]
+    assert updated["affiliation"] == "OpenAI"
+    assert updated["core_directions"] == {"GUI Agent": 0.8, "Scientific Discovery": 0.6}
+    assert updated["topic_weights"] == {"paper recommendation": 0.7}
+    assert updated["must_read"] == {
+        "authors": ["Alice"],
+        "institutions": ["Stanford"],
+        "keywords": ["agent", "rag"],
+    }
+    assert result["profile"]["top_directions"][0] == ("GUI Agent", 0.8)
 
 
 def test_desktop_health_is_json_ready() -> None:
@@ -1413,8 +1526,8 @@ def test_desktop_paper_date_and_metrics_sync_with_backend() -> None:
     assert 'target_date: $("paperDate").value' in script
     assert "每日上限 ${metadata.daily_limit}" in script
     assert "旧缓存参数不一致时会自动刷新" in script
-    assert 'id="saveAdvancedSettingsBtn"' in html
-    assert 'runAction(saveSettings, "保存高级参数")' in script
+    assert 'id="saveAdvancedSettingsBtn" class="primary" type="button">保存设置</button>' in html
+    assert 'runAction(saveSettings, "保存设置")' in script
     assert "/api/daily/status?task_id=" in script
     assert "/api/daily/status?user_id=" in script
     assert "pollDailyTask(taskId, data.push, userId, pollToken)" in script

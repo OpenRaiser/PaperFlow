@@ -1187,6 +1187,89 @@ def update_must_read(user_id: str, item_type: str, value: str, action: str) -> D
     }
 
 
+def _parse_weight_text(value: Any) -> Dict[str, float]:
+    result: Dict[str, float] = {}
+    for item in _string_list(str(value or "").replace("\n", ";").split(";")):
+        label = item
+        weight = 1.0
+        if ":" in item:
+            label, raw_weight = item.rsplit(":", 1)
+        elif "=" in item:
+            label, raw_weight = item.rsplit("=", 1)
+        else:
+            raw_weight = ""
+        label = str(label or "").strip()
+        if not label:
+            continue
+        if raw_weight:
+            weight = max(0.0, min(1.0, _to_float(raw_weight, 1.0)))
+        result[label] = round(weight, 4)
+    return result
+
+
+def _manual_profile_updates(
+    *,
+    affiliation: str = "",
+    core_directions_text: str = "",
+    topic_weights_text: str = "",
+    must_read_keywords: Optional[List[str]] = None,
+    must_read_authors: Optional[List[str]] = None,
+    must_read_institutions: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    updates: Dict[str, Any] = {}
+    cleaned_affiliation = str(affiliation or "").strip()
+    if cleaned_affiliation:
+        updates["affiliation"] = cleaned_affiliation
+    core_directions = _parse_weight_text(core_directions_text)
+    if core_directions:
+        updates["core_directions"] = core_directions
+    topic_weights = _parse_weight_text(topic_weights_text)
+    if topic_weights:
+        updates["topic_weights"] = topic_weights
+
+    must_read: Dict[str, List[str]] = {}
+    if must_read_keywords is not None:
+        must_read["keywords"] = _string_list(must_read_keywords)
+    if must_read_authors is not None:
+        must_read["authors"] = _string_list(must_read_authors)
+    if must_read_institutions is not None:
+        must_read["institutions"] = _string_list(must_read_institutions)
+    if must_read:
+        updates["must_read"] = must_read
+    return updates
+
+
+def _apply_manual_profile_updates(user_id: str, updates: Dict[str, Any]) -> None:
+    if not updates:
+        return
+    existing_profile = db_ops.get_profile(user_id)
+    profile = existing_profile or {
+        "user_id": user_id,
+        "version": "0.1",
+        "core_directions": {},
+        "topic_weights": {},
+        "must_read": {"authors": [], "institutions": [], "keywords": []},
+    }
+    profile["user_id"] = user_id
+    if "affiliation" in updates:
+        profile["affiliation"] = updates["affiliation"]
+    if "core_directions" in updates:
+        profile["core_directions"] = updates["core_directions"]
+    if "topic_weights" in updates:
+        profile["topic_weights"] = updates["topic_weights"]
+    if "must_read" in updates:
+        must_read = dict(profile.get("must_read") or {})
+        for key, values in updates["must_read"].items():
+            must_read[key] = values
+        for key in ("authors", "institutions", "keywords"):
+            must_read.setdefault(key, [])
+        profile["must_read"] = must_read
+    if existing_profile:
+        db_ops.update_profile(user_id, profile)
+    else:
+        db_ops.create_profile(user_id, profile)
+
+
 def create_or_update_profile(
     *,
     user_id: str,
@@ -1194,12 +1277,19 @@ def create_or_update_profile(
     scholar_url: str = "",
     homepage_url: str = "",
     pdf_paths: Optional[List[str]] = None,
+    affiliation: str = "",
+    core_directions_text: str = "",
+    topic_weights_text: str = "",
+    must_read_keywords: Optional[List[str]] = None,
+    must_read_authors: Optional[List[str]] = None,
+    must_read_institutions: Optional[List[str]] = None,
     reset_existing: bool = False,
 ) -> Dict[str, Any]:
     if not user_id.strip():
         raise ValueError("user_id is required")
+    normalized_user_id = user_id.strip()
     result = coldstart_agent.cold_start(
-        user_id=user_id.strip(),
+        user_id=normalized_user_id,
         natural_language=natural_language.strip() or None,
         pdf_paths=pdf_paths or None,
         scholar_url=scholar_url.strip() or None,
@@ -1207,7 +1297,17 @@ def create_or_update_profile(
         reset_existing=reset_existing,
         send_to_feishu=False,
     )
-    return {"result": result, "profile": _profile_summary(db_ops.get_profile(user_id.strip()))}
+    manual_updates = _manual_profile_updates(
+        affiliation=affiliation,
+        core_directions_text=core_directions_text,
+        topic_weights_text=topic_weights_text,
+        must_read_keywords=must_read_keywords,
+        must_read_authors=must_read_authors,
+        must_read_institutions=must_read_institutions,
+    )
+    _apply_manual_profile_updates(normalized_user_id, manual_updates)
+    profile = db_ops.get_profile(normalized_user_id)
+    return {"result": result, "profile": _profile_summary(profile), "raw": profile}
 
 
 def run_daily_push(
@@ -1974,11 +2074,68 @@ def submit_and_read(
 
 
 def wiki_stats(user_id: str) -> Dict[str, Any]:
-    return wiki_db.stats(user_id)
+    stats = wiki_db.stats(user_id)
+    nodes = _filter_wiki_nodes_for_configured_dir(wiki_db.list_nodes(user_id, limit=10000))
+    if nodes is None:
+        return stats
+
+    by_type: Dict[str, int] = {}
+    latest = None
+    for node in nodes:
+        node_type = str(node.get("node_type") or "node")
+        by_type[node_type] = by_type.get(node_type, 0) + 1
+        updated_at = node.get("updated_at")
+        if updated_at and (latest is None or str(updated_at) > str(latest)):
+            latest = updated_at
+
+    visible_ids = {str(node.get("node_id") or "") for node in nodes if node.get("node_id")}
+    edge_count = 0
+    citation_count = 0
+    if visible_ids:
+        conn = db_ops.get_connection()
+        placeholders = ",".join("?" for _ in visible_ids)
+        edge_count = int(
+            conn.execute(
+                f"""
+                SELECT COUNT(*) AS count
+                FROM wiki_edges
+                WHERE user_id = ?
+                  AND src_id IN ({placeholders})
+                  AND dst_id IN ({placeholders})
+                """,
+                [user_id, *visible_ids, *visible_ids],
+            ).fetchone()["count"]
+            or 0
+        )
+        citation_count = int(
+            conn.execute(
+                f"""
+                SELECT COUNT(*) AS count
+                FROM wiki_citations
+                WHERE user_id = ?
+                  AND node_id IN ({placeholders})
+                """,
+                [user_id, *visible_ids],
+            ).fetchone()["count"]
+            or 0
+        )
+        conn.close()
+
+    return {
+        **stats,
+        "nodes": len(nodes),
+        "nodes_by_type": by_type,
+        "edges": edge_count,
+        "citations": citation_count,
+        "latest_update": latest,
+    }
 
 
 def wiki_search(user_id: str, query: str = "", node_type: Optional[str] = None, limit: int = 12) -> Dict[str, Any]:
     nodes = wiki_db.search_nodes(user_id, query, node_type=node_type or None, limit=limit)
+    filtered_nodes = _filter_wiki_nodes_for_configured_dir(nodes)
+    if filtered_nodes is not None:
+        nodes = filtered_nodes
     return {
         "nodes": [
             {
@@ -1995,6 +2152,28 @@ def wiki_search(user_id: str, query: str = "", node_type: Optional[str] = None, 
             for node in nodes
         ]
     }
+
+
+def _configured_wiki_root() -> Optional[Path]:
+    raw = _env_text("PAPERFLOW_WIKI_DIR", "")
+    if not raw:
+        return None
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    return path
+
+
+def _filter_wiki_nodes_for_configured_dir(nodes: Iterable[Dict[str, Any]]) -> Optional[List[Dict[str, Any]]]:
+    root = _configured_wiki_root()
+    if root is None:
+        return None
+    filtered = []
+    for node in nodes or []:
+        relative_path = str(node.get("file_path") or "").strip()
+        if relative_path and (root / relative_path).exists():
+            filtered.append(node)
+    return filtered
 
 
 def _wiki_node_payload(node: Dict[str, Any]) -> Dict[str, Any]:
@@ -2114,6 +2293,14 @@ def wiki_graph(user_id: str, query: str = "", limit: int = 24) -> Dict[str, Any]
 
     rows = rows or fetch_edges_for_ids(list(node_by_id))
     conn.close()
+
+    filtered_nodes = _filter_wiki_nodes_for_configured_dir(node_by_id.values())
+    if filtered_nodes is not None:
+        node_by_id = {
+            str(node.get("node_id") or ""): node
+            for node in filtered_nodes
+            if str(node.get("node_id") or "")
+        }
 
     if not node_by_id:
         return {"nodes": [], "edges": [], "source": "wiki_db", "query": query}
