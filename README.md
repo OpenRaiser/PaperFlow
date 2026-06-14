@@ -106,7 +106,7 @@ all route through the local backend.
 
 ### Product Framework
 
-<img src="docs/assets/readme/paperflow-product-framework.png" alt="PaperFlow product framework diagram" width="100%">
+<img src="docs/assets/readme/paperflow-product-framework-clean.png" alt="PaperFlow product framework diagram" width="100%">
 
 The desktop loop is intentionally local: profile state, paper pushes, feedback,
 reading reports, and Wiki nodes stay on disk unless you explicitly enable
