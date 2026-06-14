@@ -240,6 +240,7 @@ def _api_daily(_query_params: Dict[str, Any], body: Dict[str, Any]) -> Dict[str,
         arxiv_categories=body.get("arxiv_categories"),
         conferences=body.get("conferences"),
         journals=body.get("journals"),
+        target_date=_target_date_from_body(body),
     )
 
 

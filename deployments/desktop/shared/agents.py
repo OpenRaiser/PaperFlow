@@ -414,6 +414,8 @@ def _storage_stats(paths: Dict[str, Any]) -> Dict[str, Any]:
 
 def _reading_report_dirs() -> List[Path]:
     configured = Path(_configured_path("PAPERFLOW_READING_REPORTS_DIR", "data/exports")).resolve()
+    if _env_text("PAPERFLOW_READING_REPORTS_DIR", ""):
+        return [configured] if configured.exists() and configured.is_dir() else [configured]
     fallback = (PROJECT_ROOT / "data" / "reading_reports").resolve()
     ordered = [configured, fallback]
     results: List[Path] = []
@@ -527,6 +529,16 @@ def _report_record(path: Path) -> Dict[str, Any]:
     }
 
 
+def _is_reading_report_record(report: Dict[str, Any]) -> bool:
+    metadata = report.get("metadata") or {}
+    if metadata.get("report_version") or metadata.get("generation_provider") or metadata.get("generation_model"):
+        return True
+    if metadata.get("pdf_path") or metadata.get("doc_token") or metadata.get("doc_url"):
+        return True
+    source_type = str(metadata.get("report_source_type") or metadata.get("source_type") or "").strip()
+    return source_type in {"arxiv", "pdf", "local_pdf", "feishu_file_key", "reading_report"}
+
+
 def _all_report_records() -> List[Dict[str, Any]]:
     reports: List[Dict[str, Any]] = []
     seen: Set[str] = set()
@@ -538,7 +550,10 @@ def _all_report_records() -> List[Dict[str, Any]]:
             if resolved_key in seen:
                 continue
             seen.add(resolved_key)
-            reports.append(_report_record(path))
+            report = _report_record(path)
+            if not _is_reading_report_record(report):
+                continue
+            reports.append(report)
     reports.sort(key=lambda item: item["_sort_ts"], reverse=True)
     return reports
 
@@ -834,6 +849,7 @@ def _daily_cache_matches_settings(
     *,
     days: int,
     limit_per_source: int,
+    target_date: str,
     sources: Dict[str, Any],
 ) -> bool:
     metadata = dict(cached_push.get("metadata") or {})
@@ -848,6 +864,12 @@ def _daily_cache_matches_settings(
     if int(_to_float(metadata.get("relevance_threshold"), -1)) != _configured_relevance_threshold():
         return False
     if int(_to_float(metadata.get("fetch_days"), -1)) != max(1, int(days or 1)):
+        return False
+    requested_target_date = str(target_date or "").strip()
+    cached_target_date = str(metadata.get("target_date") or "").strip()
+    if requested_target_date and cached_target_date != requested_target_date:
+        return False
+    if cached_target_date and cached_target_date != requested_target_date:
         return False
 
     for key in ("arxiv_categories", "conferences", "journals", "custom_rss_urls"):
@@ -974,6 +996,9 @@ def export_data(user_id: str, export_format: str = "markdown") -> Dict[str, Any]
         output = root / f"paperflow_{user_id or 'all'}_{timestamp}.md"
         reports = list_reports(user_id=user_id, days=3650, limit=200).get("reports") or []
         wiki_nodes = wiki_db.list_nodes(user_id, limit=200) if user_id else []
+        filtered_wiki_nodes = _filter_wiki_nodes_for_configured_dir(wiki_nodes)
+        if filtered_wiki_nodes is not None:
+            wiki_nodes = filtered_wiki_nodes
         lines = [
             f"# PaperFlow Export - {user_id or 'all'}",
             "",
@@ -1317,6 +1342,7 @@ def run_daily_push(
     arxiv_categories: Optional[Iterable[Any]] = None,
     conferences: Optional[Iterable[Any]] = None,
     journals: Optional[Iterable[Any]] = None,
+    target_date: Optional[str] = None,
     progress_callback: Optional[Any] = None,
 ) -> Dict[str, Any]:
     sources = _configured_daily_sources(
@@ -1335,6 +1361,7 @@ def run_daily_push(
         enable_custom_rss=sources["enable_custom_rss"],
         limit_per_source=_configured_daily_limit(limit_per_source),
         push_limit=_configured_daily_limit(limit_per_source),
+        target_date=_normalize_push_date(target_date) if target_date else None,
         send_to_feishu=False,
         progress_callback=progress_callback,
     )
@@ -1448,6 +1475,7 @@ def _finish_daily_task(task_id: str) -> None:
         arxiv_categories = task.get("arxiv_categories")
         conferences = task.get("conferences")
         journals = task.get("journals")
+        target_date = task.get("target_date")
 
     try:
         result = run_daily_push(
@@ -1457,6 +1485,7 @@ def _finish_daily_task(task_id: str) -> None:
             arxiv_categories=arxiv_categories,
             conferences=conferences,
             journals=journals,
+            target_date=target_date,
             progress_callback=_make_daily_progress_callback(task_id),
         )
     except Exception as exc:  # pragma: no cover - exercised through GUI/server boundary
@@ -1507,6 +1536,7 @@ def start_daily_push_task(
             cached_push,
             days=requested_days,
             limit_per_source=requested_limit,
+            target_date=normalized_target_date,
             sources=requested_sources,
         ):
             metadata = dict(cached_push.get("metadata") or {})
@@ -2176,6 +2206,20 @@ def _filter_wiki_nodes_for_configured_dir(nodes: Iterable[Dict[str, Any]]) -> Op
     return filtered
 
 
+def _visible_wiki_node_ids(user_id: str) -> Optional[Set[str]]:
+    nodes = _filter_wiki_nodes_for_configured_dir(wiki_db.list_nodes(user_id, limit=10000))
+    if nodes is None:
+        return None
+    return {str(node.get("node_id") or "") for node in nodes if str(node.get("node_id") or "")}
+
+
+def _wiki_node_is_visible(node: Optional[Dict[str, Any]]) -> bool:
+    if not node:
+        return False
+    filtered = _filter_wiki_nodes_for_configured_dir([node])
+    return filtered is None or bool(filtered)
+
+
 def _wiki_node_payload(node: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "node_id": node.get("node_id"),
@@ -2564,10 +2608,15 @@ def _resolve_wiki_mentions(
         node: Optional[Dict[str, Any]] = None
         if node_id:
             node = wiki_db.get_node(user_id, node_id)
+            if not _wiki_node_is_visible(node):
+                node = None
         if node is None:
             query = title or node_id
             if query:
                 hits = wiki_db.search_nodes(user_id, query, limit=5)
+                filtered_hits = _filter_wiki_nodes_for_configured_dir(hits)
+                if filtered_hits is not None:
+                    hits = filtered_hits
                 lowered_title = title.lower()
                 lowered_node_id = node_id.lower()
                 exact = next(
@@ -3094,6 +3143,7 @@ def wiki_ask(
             f"{cleaned_question}{scope_hint}",
             limit=safe_limit,
             pinned_nodes=pinned_nodes,
+            allowed_node_ids=_visible_wiki_node_ids(user_id),
         )
         result["streaming"] = {"provider": False, "transport": "json"}
         _apply_chat_metadata(
@@ -3205,6 +3255,7 @@ def wiki_ask_stream(
         f"{cleaned_question}{scope_hint}",
         limit=safe_limit,
         pinned_nodes=pinned_nodes,
+        allowed_node_ids=_visible_wiki_node_ids(user_id),
     ):
         if event["event"] in {"meta", "done"}:
             _apply_chat_metadata(

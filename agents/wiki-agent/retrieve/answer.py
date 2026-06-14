@@ -111,6 +111,7 @@ def _prepare_hits(
     question: str,
     limit: int,
     pinned_nodes: Optional[List[Dict[str, Any]]],
+    allowed_node_ids: Optional[Iterable[str]] = None,
 ) -> tuple[List[Dict[str, Any]], Optional[str]]:
     embedding_error = None
     try:
@@ -118,6 +119,9 @@ def _prepare_hits(
     except Exception as exc:
         embedding_error = str(exc)
     retrieved = wiki_db.search_nodes(user_id, question, limit=max(limit, limit + len(pinned_nodes or [])))
+    if allowed_node_ids is not None:
+        allowed = {str(node_id) for node_id in allowed_node_ids if str(node_id or "").strip()}
+        retrieved = [node for node in retrieved or [] if str(node.get("node_id") or "") in allowed]
     return _merge_hits(pinned_nodes or [], retrieved, limit), embedding_error
 
 
@@ -186,10 +190,11 @@ def answer_question(
     *,
     limit: int = 8,
     pinned_nodes: Optional[List[Dict[str, Any]]] = None,
+    allowed_node_ids: Optional[Iterable[str]] = None,
 ) -> Dict[str, Any]:
     """Return an LLM answer with local wiki citations."""
     started = time.time()
-    hits, embedding_error = _prepare_hits(user_id, question, limit, pinned_nodes)
+    hits, embedding_error = _prepare_hits(user_id, question, limit, pinned_nodes, allowed_node_ids=allowed_node_ids)
     if not hits:
         return _empty_answer(started)
 
@@ -218,10 +223,11 @@ def answer_question_stream(
     *,
     limit: int = 8,
     pinned_nodes: Optional[List[Dict[str, Any]]] = None,
+    allowed_node_ids: Optional[Iterable[str]] = None,
 ) -> Iterator[Dict[str, Any]]:
     """Yield answer events with local citations and provider-native chunks."""
     started = time.time()
-    hits, embedding_error = _prepare_hits(user_id, question, limit, pinned_nodes)
+    hits, embedding_error = _prepare_hits(user_id, question, limit, pinned_nodes, allowed_node_ids=allowed_node_ids)
     if not hits:
         result = _empty_answer(started)
         yield {"event": "meta", "data": {key: value for key, value in result.items() if key != "text"}}

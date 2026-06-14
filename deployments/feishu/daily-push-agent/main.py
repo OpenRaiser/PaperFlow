@@ -220,7 +220,12 @@ def semantic_scholar_queries_from_profile(profile: Dict, limit: int = 3) -> List
     return dedupe_preserve_order(cleaned)[:limit]
 
 
-def fetch_semantic_scholar_papers(queries: List[str], days: int, limit_per_source: int) -> List[Dict]:
+def fetch_semantic_scholar_papers(
+    queries: List[str],
+    days: int,
+    limit_per_source: int,
+    target_date: Optional[str] = None,
+) -> List[Dict]:
     api_key = os.environ.get("SEMANTIC_SCHOLAR_API_KEY", "").strip()
     if not api_key:
         print("Skipping Semantic Scholar fetch: SEMANTIC_SCHOLAR_API_KEY is not configured")
@@ -230,7 +235,11 @@ def fetch_semantic_scholar_papers(queries: List[str], days: int, limit_per_sourc
         return []
 
     per_query_limit = max(1, int(math.ceil(limit_per_source / max(1, len(queries)))))
-    min_date = (datetime.now() - timedelta(days=max(1, int(days or 1)))).date()
+    try:
+        end_date = datetime.strptime(str(target_date or "").strip(), "%Y-%m-%d").date() if target_date else datetime.now().date()
+    except ValueError:
+        end_date = datetime.now().date()
+    min_date = end_date - timedelta(days=max(1, int(days or 1)))
     fields = "title,abstract,authors,year,url,venue,externalIds,publicationDate"
 
     def fetch_one_query(query: str) -> List[Dict]:
@@ -255,7 +264,8 @@ def fetch_semantic_scholar_papers(queries: List[str], days: int, limit_per_sourc
             published = str(item.get("publicationDate") or "").strip()
             if published:
                 try:
-                    if datetime.strptime(published[:10], "%Y-%m-%d").date() < min_date:
+                    published_date = datetime.strptime(published[:10], "%Y-%m-%d").date()
+                    if published_date < min_date or published_date > end_date:
                         continue
                 except ValueError:
                     pass
@@ -1061,6 +1071,7 @@ def fetch_and_process_papers(
     enable_semantic_scholar: bool = False,
     enable_custom_rss: bool = False,
     limit_per_source: int = DEFAULT_LIMIT_PER_SOURCE,
+    target_date: Optional[str] = None,
     progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> List[Dict]:
     """
@@ -1097,7 +1108,10 @@ def fetch_and_process_papers(
         for paper in papers:
             emit({"phase": "fetched", "source": source, "paper": paper})
 
-    today = datetime.now()
+    try:
+        today = datetime.strptime(str(target_date or "").strip(), "%Y-%m-%d") if target_date else datetime.now()
+    except ValueError:
+        today = datetime.now()
     end_date = today.strftime("%Y%m%d")
 
     def fetch_arxiv_papers(fetch_days: int) -> List[Dict]:
@@ -1236,7 +1250,7 @@ def fetch_and_process_papers(
     # 4. Optional Semantic Scholar search, enabled from desktop settings.
     if enable_semantic_scholar:
         try:
-            semantic_papers = fetch_semantic_scholar_papers(semantic_queries or [], days, limit_per_source)
+            semantic_papers = fetch_semantic_scholar_papers(semantic_queries or [], days, limit_per_source, target_date=target_date)
             all_papers.extend(semantic_papers)
             if semantic_papers:
                 emit_fetched("semantic_scholar", semantic_papers)
@@ -1591,6 +1605,7 @@ def daily_push(
     enable_custom_rss: Optional[bool] = None,
     limit_per_source: int = DEFAULT_LIMIT_PER_SOURCE,
     push_limit: Optional[int] = None,
+    target_date: Optional[str] = None,
     output_file: str = None,
     send_to_feishu: bool = False,
     feishu_chat_id: str = None,  # 飞书群 ID（可选，用于多角色）
@@ -1668,6 +1683,7 @@ def daily_push(
         enable_semantic_scholar=bool(enable_semantic_scholar),
         enable_custom_rss=bool(enable_custom_rss),
         limit_per_source=limit_per_source,
+        target_date=target_date,
         progress_callback=progress_callback,
     )
     print(f"Fetched {len(papers)} papers from all sources")
@@ -1701,6 +1717,7 @@ def daily_push(
             enable_semantic_scholar=bool(enable_semantic_scholar),
             enable_custom_rss=bool(enable_custom_rss),
             limit_per_source=limit_per_source,
+            target_date=target_date,
             progress_callback=progress_callback,
         )
         fallback_total_fetched = len(fallback_papers)
@@ -1770,6 +1787,7 @@ def daily_push(
                 "custom_rss_urls": custom_rss_urls or [],
                 "reason": "all_candidates_filtered",
                 "days": days,
+                "target_date": target_date,
                 "push_context": "daily_push",
                 **fallback_metadata,
             },
@@ -1824,6 +1842,7 @@ def daily_push(
                     "push_max_count": weights.get("push_max_count"),
                     "limit_per_source": limit_per_source,
                     "fetch_days": days,
+                    "target_date": target_date,
                     "relevance_threshold": weights.get("paperflow_relevance_threshold"),
                     "arxiv_categories": arxiv_categories or [],
                     "conferences": conferences or [],
@@ -1926,6 +1945,7 @@ def daily_push(
         "total_fetched": len(papers),
         "limit_per_source": limit_per_source,
         "fetch_days": days,
+        "target_date": target_date,
         "relevance_threshold": weights.get("paperflow_relevance_threshold"),
         "arxiv_categories": arxiv_categories or [],
         "conferences": conferences or [],
