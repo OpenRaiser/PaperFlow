@@ -460,6 +460,11 @@ def test_desktop_save_settings_updates_env_file(tmp_path, monkeypatch: pytest.Mo
             "PAPERFLOW_CONFERENCE_COOKIE_FILE": r"C:\paperflow\cookies\neurips.txt",
             "SEMANTIC_SCHOLAR_API_KEY": "s2-test-key",
             "OPENREVIEW_TOKEN": "or-test-token",
+            "PAPERFLOW_REPORT_STYLE": "deep",
+            "PAPERFLOW_DAILY_LIMIT": "17",
+            "PAPERFLOW_RELEVANCE_THRESHOLD": "72",
+            "PAPERFLOW_MAX_CONCURRENCY": "4",
+            "HTTP_PROXY": "http://127.0.0.1:18080",
             "UNSUPPORTED_KEY": "ignored",
         }
     )
@@ -474,10 +479,142 @@ def test_desktop_save_settings_updates_env_file(tmp_path, monkeypatch: pytest.Mo
     assert r"PAPERFLOW_CONFERENCE_COOKIE_FILE=C:\paperflow\cookies\neurips.txt" in text
     assert "SEMANTIC_SCHOLAR_API_KEY=s2-test-key" in text
     assert "OPENREVIEW_TOKEN=or-test-token" in text
+    assert "PAPERFLOW_REPORT_STYLE=deep" in text
+    assert "PAPERFLOW_DAILY_LIMIT=17" in text
+    assert "PAPERFLOW_RELEVANCE_THRESHOLD=72" in text
+    assert "PAPERFLOW_MAX_CONCURRENCY=4" in text
+    assert "HTTP_PROXY=http://127.0.0.1:18080" in text
     assert "UNSUPPORTED_KEY" not in text
     assert result["paths"]["write_feishu"] is True
+    assert result["report_preferences"]["style"] == "deep"
+    assert result["advanced"]["daily_limit"] == 17
+    assert result["advanced"]["relevance_threshold"] == 72
+    assert result["advanced"]["http_proxy"] == "http://127.0.0.1:18080"
     assert result["source_preferences"]["conference_access_mode"] == "credential"
     assert result["source_preferences"]["auth_status"]["semantic_scholar_api_key"] is True
+
+
+def test_desktop_daily_push_uses_saved_settings_when_gui_omits_filters(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "\n".join(
+            [
+                "PAPERFLOW_DAILY_LIMIT=17",
+                "PAPERFLOW_ENABLE_ARXIV=false",
+                "PAPERFLOW_ENABLE_OPENREVIEW=false",
+                "PAPERFLOW_ENABLE_SEMANTIC_SCHOLAR=true",
+                "PAPERFLOW_ENABLE_CUSTOM_RSS=true",
+                "PAPERFLOW_DEFAULT_ARXIV_CATEGORIES=cs.LG,cs.CV",
+                "PAPERFLOW_DEFAULT_CONFERENCES=ICLR,NeurIPS",
+                "PAPERFLOW_DEFAULT_JOURNALS=Nature",
+                "PAPERFLOW_CUSTOM_RSS_URLS=https://example.com/feed.xml",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(agents, "ENV_PATH", env_path)
+    captured: dict[str, object] = {}
+
+    def fake_daily_push(**kwargs):
+        captured.update(kwargs)
+        return {"push_id": "push_settings_effect"}
+
+    monkeypatch.setattr(agents.daily_agent, "daily_push", fake_daily_push)
+    monkeypatch.setattr(agents.db_ops, "get_push_papers", lambda push_id: None)
+    monkeypatch.setattr(agents.db_ops, "get_latest_push", lambda user_id: None)
+
+    agents.run_daily_push("user_settings", days=2)
+
+    assert captured["limit_per_source"] == 17
+    assert captured["arxiv_categories"] == []
+    assert captured["conferences"] == []
+    assert captured["journals"] == ["Nature"]
+    assert captured["enable_semantic_scholar"] is True
+    assert captured["enable_custom_rss"] is True
+    assert captured["custom_rss_urls"] == ["https://example.com/feed.xml"]
+
+
+def test_desktop_relevance_threshold_changes_daily_push_weights(monkeypatch: pytest.MonkeyPatch) -> None:
+    base = {
+        "threshold_high_relevant": 0.40,
+        "threshold_maybe_interested": 0.25,
+        "threshold_edge_relevant": 0.15,
+        "min_relevance_signal": 0.08,
+    }
+
+    monkeypatch.setenv("PAPERFLOW_RELEVANCE_THRESHOLD", "90")
+    strict = agents.daily_agent.apply_relevance_threshold_override(base)
+    monkeypatch.setenv("PAPERFLOW_RELEVANCE_THRESHOLD", "30")
+    relaxed = agents.daily_agent.apply_relevance_threshold_override(base)
+
+    assert strict["threshold_edge_relevant"] > base["threshold_edge_relevant"]
+    assert relaxed["threshold_edge_relevant"] < base["threshold_edge_relevant"]
+    assert strict["paperflow_relevance_threshold"] == 90
+
+
+def test_daily_push_custom_rss_fetcher_builds_paper_cards(monkeypatch: pytest.MonkeyPatch) -> None:
+    rss = b"""<?xml version="1.0"?>
+    <rss><channel><item>
+      <title>RSS Paper</title>
+      <link>https://example.com/paper</link>
+      <description>RSS abstract</description>
+      <pubDate>Mon, 01 Jun 2026 00:00:00 GMT</pubDate>
+    </item></channel></rss>
+    """
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return rss
+
+    monkeypatch.setattr(agents.daily_agent.urllib.request, "urlopen", lambda *args, **kwargs: FakeResponse())
+
+    papers = agents.daily_agent.fetch_custom_rss_papers(["https://example.com/rss.xml"], 5)
+
+    assert papers[0]["title"] == "RSS Paper"
+    assert papers[0]["source"] == "custom_rss"
+    assert papers[0]["paper_url"] == "https://example.com/paper"
+
+
+def test_daily_push_semantic_scholar_fetcher_uses_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    payload = (
+        b'{"data":[{"title":"Semantic Paper","abstract":"Graph result",'
+        b'"authors":[{"name":"Ada"}],"publicationDate":"2026-06-01",'
+        b'"url":"https://semanticscholar.org/paper/1","venue":"ACL",'
+        b'"externalIds":{"ArXiv":"2606.00001","DOI":"10.0000/test"}}]}'
+    )
+    captured_headers = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return payload
+
+    def fake_urlopen(request, timeout=20):
+        captured_headers.update(dict(request.header_items()))
+        return FakeResponse()
+
+    monkeypatch.setenv("SEMANTIC_SCHOLAR_API_KEY", "s2-live-test")
+    monkeypatch.setattr(agents.daily_agent.urllib.request, "urlopen", fake_urlopen)
+
+    papers = agents.daily_agent.fetch_semantic_scholar_papers(["retrieval"], days=30, limit_per_source=5)
+
+    assert captured_headers["X-api-key"] == "s2-live-test"
+    assert papers[0]["title"] == "Semantic Paper"
+    assert papers[0]["source"] == "semantic_scholar"
+    assert papers[0]["arxiv_id"] == "2606.00001"
 
 
 def test_desktop_source_settings_explain_conference_auth() -> None:
@@ -506,6 +643,10 @@ def test_desktop_source_settings_explain_conference_auth() -> None:
     assert "settingEnableCustomRss" in script
     assert 'input.disabled = normalized !== "credential"' in script
     assert "PAPERFLOW_CONFERENCE_ACCESS_MODE" in script
+    assert "state.settings = data || {}" in script
+    assert "syncDailySourceControls(sourcePrefs)" in script
+    assert "limit_per_source: configuredDailyLimit()" in script
+    assert "PAPERFLOW_LLM_MODEL" in script
     assert ".source-auth-panel" in css
     assert ".conference-source-list" in css
     assert ".conference-source-item.active" in css
@@ -682,6 +823,48 @@ def test_desktop_submit_and_read_forwards_feishu_choice(monkeypatch: pytest.Monk
     assert captured["write_feishu"] is True
 
 
+def test_desktop_reading_reports_forward_saved_report_style(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    env_path = tmp_path / ".env"
+    env_path.write_text("PAPERFLOW_REPORT_STYLE=brief\n", encoding="utf-8")
+    monkeypatch.setattr(agents, "ENV_PATH", env_path)
+    monkeypatch.setattr(
+        agents.db_ops,
+        "get_push_papers",
+        lambda push_id: {"papers": [{"id": 1, "title": "Styled Paper"}]},
+    )
+    captured: dict[str, object] = {}
+
+    def fake_create_reading_report(**kwargs):
+        captured.update(kwargs)
+        return []
+
+    monkeypatch.setattr(agents.reading_agent, "create_reading_report", fake_create_reading_report)
+
+    agents.create_reading_reports(
+        user_id="user_style",
+        push_id="push_style",
+        paper_numbers=[1],
+        write_feishu=False,
+    )
+
+    assert captured["request_metadata"]["report_style"] == "brief"
+
+
+def test_reading_report_template_changes_with_saved_style() -> None:
+    report = agents.reading_agent.generate_reading_report(
+        {"title": "Styled Paper", "abstract": "A structured abstract."},
+        {"core_directions": {}},
+        report_payload={
+            "report_style": "deep",
+            "one_sentence_summary": "A concise summary.",
+            "abstract": "A structured abstract.",
+            "recommendation_label": "maybe_interested",
+        },
+    )
+
+    assert "Deep-Dive Checklist" in report
+
+
 def test_desktop_backfills_reused_reading_report_to_wiki(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     report_path = tmp_path / "reading-report.md"
     report_path.write_text(
@@ -710,15 +893,25 @@ def test_desktop_backfills_reused_reading_report_to_wiki(tmp_path, monkeypatch: 
     assert docs[0]["wiki_ingest"]["paper_node"] == "paper:2606.12087v1"
 
 
-def test_desktop_paper_card_read_button_generates_single_report() -> None:
+def test_desktop_paper_card_actions_are_mutually_exclusive_before_submit() -> None:
     script = (PROJECT_ROOT / "deployments/desktop/static/desktop.js").read_text(encoding="utf-8")
+    css = (PROJECT_ROOT / "deployments/desktop/static/desktop.css").read_text(encoding="utf-8")
 
     assert 'data-action="read"' in script
     assert '"加载中"' in script
     assert '"精读报告"' in script
+    assert '"已选精读"' in script
     assert "readSinglePaper" in script
-    assert "selected_numbers: [number]" in script
+    assert "setPaperDisposition(number, \"read\")" in script
+    assert "setPaperDisposition(number, \"skip\")" in script
+    assert "setPaperDisposition(number, \"later\")" in script
+    assert "同一篇论文只能选择精读、不感兴趣、稍后看中的一种" in script
+    assert "selected_numbers: selectedNumbers" in script
+    assert "请先选择精读论文" in script
+    assert "selected_numbers: [number]" not in script
     assert 'button.dataset.action === "select"' not in script
+    assert '.paper-actions button[data-action="read"].active' in css
+    assert '.paper-actions button[data-action="later"].active' in css
 
 
 def test_desktop_wiki_frontend_derives_architecture_from_backend_graph() -> None:

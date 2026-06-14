@@ -30,7 +30,8 @@
     dailyTaskId: "",
     dailyTaskUserId: "",
     dailyPollToken: 0,
-    dailyPolling: false
+    dailyPolling: false,
+    settings: null
   };
 
   const demoPapers = [
@@ -676,10 +677,65 @@
     return Array.from($(id).querySelectorAll("input:checked")).map((input) => input.value);
   }
 
+  function selectedSettingTagValues(id) {
+    return Array.from($(id)?.querySelectorAll("span") || [])
+      .map((item) => item.textContent.trim())
+      .filter((value) => value && value !== "未配置");
+  }
+
+  function syncChoiceListFromSettings(id, values, enabled = true) {
+    const target = $(id);
+    if (!target) return;
+    const configured = new Set(splitListValue(values));
+    const inputs = Array.from(target.querySelectorAll("input[type='checkbox']"));
+    inputs.forEach((input, index) => {
+      if (configured.size) {
+        input.checked = configured.has(input.value);
+      } else if (!state.settings) {
+        input.checked = index < 3;
+      }
+      input.disabled = !enabled;
+      input.closest("label")?.classList.toggle("disabled", !enabled);
+    });
+  }
+
+  function syncDailySourceControls(sourcePrefs = {}) {
+    syncChoiceListFromSettings(
+      "arxivCategories",
+      sourcePrefs.arxiv_categories || [],
+      sourcePrefs.enable_arxiv !== false
+    );
+    syncChoiceListFromSettings(
+      "conferenceSources",
+      sourcePrefs.conferences || [],
+      sourcePrefs.enable_openreview !== false
+    );
+    syncChoiceListFromSettings("journalSources", sourcePrefs.journals || [], true);
+  }
+
+  function configuredDailyLimit() {
+    const value = Number($("dailyLimitInput")?.value || state.settings?.advanced?.daily_limit || 30);
+    if (!Number.isFinite(value)) return 30;
+    return Math.max(1, Math.min(100, Math.round(value)));
+  }
+
   function collectDailyOptions() {
+    const sourcePrefs = state.settings?.source_preferences || {};
+    const arxivEnabled = $("settingEnableArxiv") ? $("settingEnableArxiv").checked : sourcePrefs.enable_arxiv !== false;
+    const openReviewEnabled = $("settingEnableOpenReview") ? $("settingEnableOpenReview").checked : sourcePrefs.enable_openreview !== false;
+    const arxivCategories = arxivEnabled
+      ? selectedSourceValues("arxivCategories").length
+        ? selectedSourceValues("arxivCategories")
+        : selectedSettingTagValues("settingArxivCategories")
+      : [];
+    const conferences = openReviewEnabled
+      ? selectedSourceValues("conferenceSources").length
+        ? selectedSourceValues("conferenceSources")
+        : selectedSettingConferences()
+      : [];
     return {
-      arxiv_categories: selectedSourceValues("arxivCategories"),
-      conferences: selectedSourceValues("conferenceSources"),
+      arxiv_categories: arxivCategories,
+      conferences,
       journals: selectedSourceValues("journalSources")
     };
   }
@@ -759,7 +815,7 @@
     try {
       const data = await api("/api/daily/start", {
         method: "POST",
-        body: JSON.stringify({ user_id: userId, days, target_date: $("paperDate").value, limit_per_source: 100, ...options })
+        body: JSON.stringify({ user_id: userId, days, target_date: $("paperDate").value, limit_per_source: configuredDailyLimit(), ...options })
       });
       const taskId = data.task?.task_id || "";
       if (taskId) setDailyTaskState(taskId, userId, true);
@@ -843,6 +899,7 @@
     $("selectionSummary").textContent = `${state.selected.size} 篇待精读，${state.skipped.size} 篇不感兴趣，${state.later.size} 篇稍后看`;
     document.querySelectorAll(".paper-actions button").forEach((button) => {
       const number = Number(button.dataset.number);
+      button.classList.toggle("active", button.dataset.action === "read" && state.selected.has(number));
       button.classList.toggle("active", button.dataset.action === "skip" && state.skipped.has(number));
       button.classList.toggle("active", button.dataset.action === "later" && state.later.has(number));
     });
@@ -856,10 +913,39 @@
       const reportId = state.paperReports.get(reportKey);
       const isReading = state.paperReading.has(reportKey);
       button.disabled = isReading;
-      button.textContent = isReading ? "加载中" : reportId ? "精读报告" : "精读";
+      button.textContent = isReading ? "加载中" : reportId ? "精读报告" : state.selected.has(number) ? "已选精读" : "精读";
       button.classList.toggle("loading", isReading);
       button.classList.toggle("ready", Boolean(reportId) && !isReading);
     });
+  }
+
+  function setPaperDisposition(number, action) {
+    const isSelected = action === "read" && state.selected.has(number);
+    const isSkipped = action === "skip" && state.skipped.has(number);
+    const isLater = action === "later" && state.later.has(number);
+    const alreadyActive = isSelected || isSkipped || isLater;
+
+    state.selected.delete(number);
+    state.skipped.delete(number);
+    state.later.delete(number);
+
+    if (!alreadyActive) {
+      if (action === "read") state.selected.add(number);
+      if (action === "skip") state.skipped.add(number);
+      if (action === "later") state.later.add(number);
+    }
+
+    updateSelectionSummary();
+    if (alreadyActive) {
+      showPaperFeedback("success", "已取消选择", `论文 ${number} 已恢复为未选择状态。`);
+      return;
+    }
+    const labels = { read: "待精读", skip: "不感兴趣", later: "稍后看" };
+    showPaperFeedback(
+      "success",
+      `已标记为${labels[action]}`,
+      "同一篇论文只能选择精读、不感兴趣、稍后看中的一种；点击底部按钮后才会提交到后端。"
+    );
   }
 
   function itemCount(value) {
@@ -924,34 +1010,7 @@
       await openReport(existingReportId);
       return;
     }
-
-    state.paperReading.add(reportKey);
-    state.selected.add(number);
-    state.skipped.delete(number);
-    state.later.delete(number);
-    updateSelectionSummary();
-
-    try {
-      const data = await api("/api/submit", {
-        method: "POST",
-        body: JSON.stringify({
-          user_id: currentUser(),
-          push_id: state.push.push_id,
-          selected_numbers: [number],
-          skipped_numbers: [],
-          later_numbers: [],
-          generate_reports: true,
-          write_feishu: $("writeFeishuReports")?.checked || false
-        })
-      });
-      const doc = data.reports?.created_docs?.[0];
-      if (!doc?.report_id) throw new Error("精读报告已生成，但后端没有返回 report_id");
-      state.paperReports.set(reportKey, doc.report_id);
-      await loadWiki();
-    } finally {
-      state.paperReading.delete(reportKey);
-      updateSelectionSummary();
-    }
+    setPaperDisposition(number, "read");
   }
 
   async function submitFeedback(generateReports) {
@@ -959,8 +1018,17 @@
       showPaperFeedback("error", "无法提交反馈", "请先拉取今日论文或加载最近一次推荐批次。");
       throw new Error("请先加载推荐批次");
     }
+    const selectedNumbers = Array.from(state.selected);
+    if (generateReports && !selectedNumbers.length) {
+      showPaperFeedback("warning", "请先选择精读论文", "先在论文卡片上点击“精读”，再点击“提交并精读”开始生成报告。");
+      showFeedbackToast("warning", "请先选择精读论文", "精读、不感兴趣、稍后看三种状态互斥，只有已选精读的论文会生成报告。");
+      return;
+    }
     const endpoint = generateReports ? "/api/submit" : "/api/feedback";
+    const readingKeys = generateReports ? selectedNumbers.map((number) => paperReportKey(number)) : [];
     setSubmitButtonsBusy(true, generateReports);
+    readingKeys.forEach((key) => state.paperReading.add(key));
+    updateSelectionSummary();
     showPaperFeedback(
       "pending",
       generateReports ? "正在提交反馈并生成精读报告" : "正在提交反馈",
@@ -972,13 +1040,19 @@
         body: JSON.stringify({
           user_id: currentUser(),
           push_id: state.push.push_id,
-          selected_numbers: Array.from(state.selected),
+          selected_numbers: selectedNumbers,
           skipped_numbers: Array.from(state.skipped),
           later_numbers: Array.from(state.later),
           generate_reports: generateReports,
           write_feishu: $("writeFeishuReports")?.checked || false
         })
       });
+      if (generateReports) {
+        (data.reports?.created_docs || []).forEach((doc, index) => {
+          const number = selectedNumbers[index];
+          if (number && doc?.report_id) state.paperReports.set(paperReportKey(number), doc.report_id);
+        });
+      }
       showSubmitResult(data, generateReports);
       await loadWiki();
       if (generateReports) {
@@ -993,6 +1067,8 @@
       showPaperFeedback("error", "反馈提交失败", error.message || String(error));
       throw error;
     } finally {
+      readingKeys.forEach((key) => state.paperReading.delete(key));
+      updateSelectionSummary();
       setSubmitButtonsBusy(false, generateReports);
     }
   }
@@ -2289,6 +2365,25 @@
 
   function setConferenceAccessMode(mode) {
     const normalized = ["public", "credential", "manual"].includes(mode) ? mode : "public";
+    $("fallbackModelInput").addEventListener("input", () => {
+      const modelInput = document.querySelector('[data-env-key="PAPERFLOW_LLM_MODEL"]');
+      if (modelInput) modelInput.value = $("fallbackModelInput").value;
+    });
+    document.addEventListener("input", (event) => {
+      const input = event.target.closest?.("[data-env-key]");
+      if (input?.dataset.envKey === "PAPERFLOW_LLM_MODEL") {
+        $("fallbackModelInput").value = input.value;
+      }
+    });
+    ["settingEnableArxiv", "settingEnableOpenReview"].forEach((id) => {
+      $(id).addEventListener("change", () => syncDailySourceControls({
+        ...(state.settings?.source_preferences || {}),
+        enable_arxiv: $("settingEnableArxiv").checked,
+        enable_openreview: $("settingEnableOpenReview").checked,
+        arxiv_categories: selectedSettingTagValues("settingArxivCategories"),
+        conferences: selectedSettingConferences()
+      }));
+    });
     document.querySelectorAll('input[name="conferenceAccessMode"]').forEach((input) => {
       input.checked = input.value === normalized;
     });
@@ -2608,6 +2703,7 @@
   }
 
   function renderSettings(data) {
+    state.settings = data || {};
     const paths = data.paths || {};
     const storageStats = data.storage_stats || {};
     const rows = [
@@ -2644,6 +2740,7 @@
     updateSourceAuthStatus(sourcePrefs, env);
     renderConferenceSettings(sourcePrefs);
     renderRssUrls(sourcePrefs.custom_rss_urls || []);
+    syncDailySourceControls(sourcePrefs);
     document.querySelectorAll("[data-pref-mode]").forEach((button) => {
       button.classList.toggle("active", button.dataset.prefMode === (reportPrefs.style || "standard"));
     });
@@ -2797,18 +2894,13 @@
       if (!button) return;
       const number = Number(button.dataset.number);
       if (button.dataset.action === "read") {
-        runAction(() => readSinglePaper(number), "生成精读报告");
+        runAction(() => readSinglePaper(number), "选择精读论文");
         return;
       } else if (button.dataset.action === "skip") {
-        state.skipped.has(number) ? state.skipped.delete(number) : state.skipped.add(number);
-        state.selected.delete(number);
-        state.later.delete(number);
+        setPaperDisposition(number, "skip");
       } else if (button.dataset.action === "later") {
-        state.later.has(number) ? state.later.delete(number) : state.later.add(number);
-        state.selected.delete(number);
-        state.skipped.delete(number);
+        setPaperDisposition(number, "later");
       }
-      updateSelectionSummary();
     });
     $("selectAllSourcesBtn").addEventListener("click", () => toggleAllSources(true));
     $("clearSourcesBtn").addEventListener("click", () => toggleAllSources(false));

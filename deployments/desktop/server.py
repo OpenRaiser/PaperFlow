@@ -13,7 +13,7 @@ from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Callable, Dict, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -89,6 +89,12 @@ def _daily_days_from_body(body: Dict[str, Any]) -> int:
     if selected > today:
         return 1
     return max(1, min(14, (today - selected).days + 1))
+
+
+def _optional_positive_int(value: Any) -> Optional[int]:
+    if value in (None, ""):
+        return None
+    return max(1, int(value))
 
 
 def _api_health(_query_params: Dict[str, Any], _body: Dict[str, Any]) -> Dict[str, Any]:
@@ -214,7 +220,7 @@ def _api_daily(_query_params: Dict[str, Any], body: Dict[str, Any]) -> Dict[str,
     return agents.run_daily_push(
         user_id=user_id,
         days=_daily_days_from_body(body),
-        limit_per_source=int(body.get("limit_per_source") or 100),
+        limit_per_source=_optional_positive_int(body.get("limit_per_source")),
         arxiv_categories=body.get("arxiv_categories"),
         conferences=body.get("conferences"),
         journals=body.get("journals"),
@@ -228,7 +234,7 @@ def _api_daily_start(_query_params: Dict[str, Any], body: Dict[str, Any]) -> Dic
     return agents.start_daily_push_task(
         user_id=user_id,
         days=_daily_days_from_body(body),
-        limit_per_source=int(body.get("limit_per_source") or 100),
+        limit_per_source=_optional_positive_int(body.get("limit_per_source")),
         arxiv_categories=body.get("arxiv_categories"),
         conferences=body.get("conferences"),
         journals=body.get("journals"),

@@ -3117,12 +3117,26 @@ def _resolve_doc_url_from_meta(doc_token: Optional[str]) -> Optional[str]:
     return None
 
 
+def _normalize_report_style(value: Any) -> str:
+    style = _clean_text(value).lower()
+    return style if style in {"standard", "deep", "brief"} else "standard"
+
+
+def _report_style_label(style: str) -> str:
+    return {
+        "standard": "standard",
+        "deep": "deep technical analysis",
+        "brief": "brief scan",
+    }.get(style, "standard")
+
+
 def generate_reading_report(
     paper: Dict[str, Any],
     user_profile: Dict[str, Any],
     report_payload: Optional[Dict[str, Any]] = None,
 ) -> str:
     payload = report_payload or build_heuristic_report_payload(paper, user_profile)
+    report_style = _normalize_report_style(payload.get("report_style"))
     title = _clean_text(paper.get("title")) or "Untitled Paper"
     abstract = _clean_abstract_text(payload.get("abstract") or paper.get("abstract"))
     clean_abstract_summary = _clean_text(payload.get("clean_abstract_summary"))
@@ -3178,6 +3192,19 @@ def generate_reading_report(
 
     lines.append(f"> {recommendation_stars} {recommendation_label} · 约 {int(payload.get('estimated_reading_minutes') or 8)} 分钟 · 模型 {generation_provider}/{generation_model} · 证据 {analysis_source_label}")
     lines.append("")
+
+    if report_style == "brief":
+        lines.append("## Brief Scan")
+        lines.append("")
+        lines.append(payload.get("one_sentence_summary") or "No one-sentence summary is available yet.")
+        lines.append("")
+    elif report_style == "deep":
+        lines.append("## Deep-Dive Checklist")
+        lines.append("")
+        lines.append("- Verify the core assumption against the method section.")
+        lines.append("- Check whether the evidence supports the claimed improvement.")
+        lines.append("- Compare the limitation section with your current research direction.")
+        lines.append("")
 
     keywords = payload.get("keywords") or []
     if isinstance(keywords, (list, tuple)):
@@ -3497,6 +3524,7 @@ def create_reading_report(
     target_id = chat_id or feishu_user_id
     use_chat_id = chat_id is not None
     request_metadata = dict(request_metadata or {})
+    report_style = _normalize_report_style(request_metadata.get("report_style"))
 
     profile = get_profile(user_id)
     if not profile:
@@ -3625,6 +3653,7 @@ def create_reading_report(
                 report_payload.get("recommendation_label"),
                 report_payload.get("analysis_source"),
             )
+            report_payload["report_style"] = report_style
             report_content = generate_reading_report(
                 enriched_paper,
                 profile,
@@ -3693,6 +3722,7 @@ def create_reading_report(
                 "pdf_path": enriched_paper.get("pdf_path"),
                 "analysis_source": report_payload.get("analysis_source"),
                 "report_version": READING_REPORT_OUTPUT_VERSION,
+                "report_style": report_style,
             }
             if feishu_error:
                 behavior_metadata["feishu_error"] = feishu_error

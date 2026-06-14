@@ -9,6 +9,12 @@ import sys
 import os
 import math
 import re
+import json
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+from email.utils import parsedate_to_datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, List, Dict, Optional, Set
@@ -85,6 +91,202 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(_
 EMPTY_PUSH_FALLBACK_DAYS = 7
 EMPTY_PUSH_FALLBACK_TOP_K = 7
 DEFAULT_LIMIT_PER_SOURCE = 100
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _env_list(name: str) -> List[str]:
+    raw = os.environ.get(name, "")
+    return [item.strip() for item in re.split(r"[,;\n]", raw) if item.strip()]
+
+
+def _env_positive_int(name: str, default: int = 5, cap: int = 10) -> int:
+    try:
+        value = int(float(os.environ.get(name, default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(1, min(cap, value))
+
+
+def _strip_html(text: Any) -> str:
+    return re.sub(r"<[^>]+>", " ", str(text or "")).replace("&nbsp;", " ").strip()
+
+
+def _parse_feed_date(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    for fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S%z"):
+        try:
+            return datetime.strptime(text, fmt).date().isoformat()
+        except ValueError:
+            pass
+    try:
+        return parsedate_to_datetime(text).date().isoformat()
+    except Exception:
+        return text[:10]
+
+
+def _xml_text(node: ET.Element, *paths: str) -> str:
+    namespaces = {
+        "atom": "http://www.w3.org/2005/Atom",
+        "dc": "http://purl.org/dc/elements/1.1/",
+    }
+    for path in paths:
+        try:
+            found = node.find(path, namespaces)
+        except SyntaxError:
+            found = None
+        if found is not None and found.text:
+            return found.text.strip()
+    return ""
+
+
+def fetch_custom_rss_papers(urls: List[str], limit_per_source: int) -> List[Dict]:
+    """Fetch user-configured RSS/Atom sources for the desktop offline GUI."""
+    if not urls:
+        return []
+
+    per_feed_limit = max(1, int(math.ceil(limit_per_source / max(1, len(urls)))))
+    namespaces = {
+        "atom": "http://www.w3.org/2005/Atom",
+        "dc": "http://purl.org/dc/elements/1.1/",
+    }
+
+    def fetch_one_feed(feed_url: str) -> List[Dict]:
+        try:
+            request = urllib.request.Request(feed_url, headers={"User-Agent": "PaperFlow Desktop"})
+            with urllib.request.urlopen(request, timeout=20) as response:
+                raw = response.read()
+            root = ET.fromstring(raw)
+        except Exception as exc:
+            print(f"  Custom RSS fetch error for {feed_url}: {exc}")
+            return []
+
+        items = root.findall(".//item") or root.findall(".//atom:entry", namespaces)
+        feed_papers: List[Dict] = []
+        for item in items[:per_feed_limit]:
+            title = _strip_html(_xml_text(item, "title", "atom:title"))
+            link = _xml_text(item, "link")
+            if not link:
+                atom_link = item.find("atom:link", namespaces)
+                link = atom_link.get("href", "") if atom_link is not None else ""
+            abstract = _strip_html(_xml_text(item, "description", "summary", "atom:summary", "atom:content"))
+            author = _xml_text(item, "dc:creator", "author", "atom:author/atom:name")
+            published = _parse_feed_date(_xml_text(item, "pubDate", "published", "updated", "atom:published", "atom:updated"))
+            if not title:
+                continue
+            feed_papers.append(
+                {
+                    "title": title,
+                    "authors": [author] if author else [],
+                    "abstract": abstract,
+                    "url": link,
+                    "paper_url": link,
+                    "source": "custom_rss",
+                    "venue": feed_url,
+                    "publish_date": published,
+                    "categories": ["custom_rss"],
+                    "metadata": {"feed_url": feed_url},
+                }
+            )
+        return feed_papers
+
+    papers: List[Dict] = []
+    max_workers = min(_env_positive_int("PAPERFLOW_MAX_CONCURRENCY", default=5), len(urls))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(fetch_one_feed, feed_url) for feed_url in urls]
+        for future in as_completed(futures):
+            papers.extend(future.result())
+    print(f"  Fetched {len(papers)} papers from custom RSS")
+    return papers[:limit_per_source]
+
+
+def semantic_scholar_queries_from_profile(profile: Dict, limit: int = 3) -> List[str]:
+    candidates: List[str] = []
+    for key in ("core_directions", "topic_weights"):
+        values = profile.get(key, {}) if isinstance(profile, dict) else {}
+        if isinstance(values, dict):
+            candidates.extend(str(item) for item in values.keys())
+    must_read = (profile or {}).get("must_read", {}) if isinstance(profile, dict) else {}
+    if isinstance(must_read, dict):
+        candidates.extend(str(item) for item in must_read.get("keywords", []) or [])
+    cleaned = [item.strip().replace("_", " ") for item in candidates if str(item).strip()]
+    return dedupe_preserve_order(cleaned)[:limit]
+
+
+def fetch_semantic_scholar_papers(queries: List[str], days: int, limit_per_source: int) -> List[Dict]:
+    api_key = os.environ.get("SEMANTIC_SCHOLAR_API_KEY", "").strip()
+    if not api_key:
+        print("Skipping Semantic Scholar fetch: SEMANTIC_SCHOLAR_API_KEY is not configured")
+        return []
+    if not queries:
+        print("Skipping Semantic Scholar fetch: no profile query terms")
+        return []
+
+    per_query_limit = max(1, int(math.ceil(limit_per_source / max(1, len(queries)))))
+    min_date = (datetime.now() - timedelta(days=max(1, int(days or 1)))).date()
+    fields = "title,abstract,authors,year,url,venue,externalIds,publicationDate"
+
+    def fetch_one_query(query: str) -> List[Dict]:
+        params = urllib.parse.urlencode({"query": query, "limit": per_query_limit, "fields": fields})
+        url = f"https://api.semanticscholar.org/graph/v1/paper/search?{params}"
+        try:
+            request = urllib.request.Request(
+                url,
+                headers={"User-Agent": "PaperFlow Desktop", "x-api-key": api_key},
+            )
+            with urllib.request.urlopen(request, timeout=20) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except Exception as exc:
+            print(f"  Semantic Scholar fetch error for {query}: {exc}")
+            return []
+
+        query_papers: List[Dict] = []
+        for item in payload.get("data", []) or []:
+            title = str(item.get("title") or "").strip()
+            if not title:
+                continue
+            published = str(item.get("publicationDate") or "").strip()
+            if published:
+                try:
+                    if datetime.strptime(published[:10], "%Y-%m-%d").date() < min_date:
+                        continue
+                except ValueError:
+                    pass
+            external_ids = item.get("externalIds") or {}
+            authors = [author.get("name", "") for author in item.get("authors", []) or [] if author.get("name")]
+            query_papers.append(
+                {
+                    "title": title,
+                    "authors": authors,
+                    "abstract": item.get("abstract") or "",
+                    "arxiv_id": external_ids.get("ArXiv", ""),
+                    "doi": external_ids.get("DOI", ""),
+                    "url": item.get("url") or "",
+                    "paper_url": item.get("url") or "",
+                    "source": "semantic_scholar",
+                    "venue": item.get("venue") or "Semantic Scholar",
+                    "publish_date": published or str(item.get("year") or ""),
+                    "categories": ["semantic_scholar", query],
+                    "metadata": {"semantic_scholar_query": query, "semantic_scholar_ids": external_ids},
+                }
+            )
+        return query_papers
+
+    papers: List[Dict] = []
+    max_workers = min(_env_positive_int("PAPERFLOW_MAX_CONCURRENCY", default=5), len(queries))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(fetch_one_query, query) for query in queries]
+        for future in as_completed(futures):
+            papers.extend(future.result())
+    print(f"  Fetched {len(papers)} papers from Semantic Scholar")
+    return papers[:limit_per_source]
 
 
 def _wiki_ingest_enabled() -> bool:
@@ -190,9 +392,9 @@ def load_scoring_weights() -> Dict:
     config_file = os.path.join(CONFIG_PATH, "scoring_weights.yaml")
     if os.path.exists(config_file):
         with open(config_file, 'r', encoding='utf-8') as f:
-            return yaml.safe_load(f)
+            return apply_relevance_threshold_override(yaml.safe_load(f) or {})
     # 默认配置
-    return {
+    return apply_relevance_threshold_override({
         "w1_interest_vector": 0.35,
         "w2_topic_weight": 0.25,
         "w3_author_institution": 0.20,
@@ -204,7 +406,42 @@ def load_scoring_weights() -> Dict:
         "drift_bonus_recovered": 0.04,
         "drift_short_topic_bonus": 0.03,
         "reading_signal_short_term_bonus": 0.05,
+    })
+
+
+def apply_relevance_threshold_override(weights: Dict) -> Dict:
+    """Apply the desktop relevance slider to ranking thresholds."""
+    raw = str(os.environ.get("PAPERFLOW_RELEVANCE_THRESHOLD", "") or "").strip()
+    if not raw:
+        return weights
+    try:
+        slider_value = max(0.0, min(100.0, float(raw)))
+    except ValueError:
+        return weights
+
+    # The UI default is 60, so 60 keeps the checked-in scoring config unchanged.
+    factor = slider_value / 60.0 if slider_value else 0.0
+    adjusted = dict(weights or {})
+    defaults = {
+        "threshold_high_relevant": 0.40,
+        "threshold_maybe_interested": 0.25,
+        "threshold_edge_relevant": 0.15,
+        "min_relevance_signal": 0.08,
     }
+    caps = {
+        "threshold_high_relevant": 0.95,
+        "threshold_maybe_interested": 0.90,
+        "threshold_edge_relevant": 0.80,
+        "min_relevance_signal": 0.50,
+    }
+    for key, default in defaults.items():
+        try:
+            base = float(adjusted.get(key, default))
+        except (TypeError, ValueError):
+            base = default
+        adjusted[key] = max(0.0, min(caps[key], base * factor))
+    adjusted["paperflow_relevance_threshold"] = slider_value
+    return adjusted
 
 
 @dataclass
@@ -809,6 +1046,10 @@ def fetch_and_process_papers(
     arxiv_categories: List[str] = None,
     conferences: List[str] = None,
     journals: List[str] = None,
+    semantic_queries: List[str] = None,
+    custom_rss_urls: List[str] = None,
+    enable_semantic_scholar: bool = False,
+    enable_custom_rss: bool = False,
     limit_per_source: int = DEFAULT_LIMIT_PER_SOURCE,
     progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> List[Dict]:
@@ -958,6 +1199,8 @@ def fetch_and_process_papers(
     arxiv_papers = []
     openreview_papers = []
     journal_papers = []
+    semantic_papers = []
+    custom_rss_papers = []
 
     # 1. 从 arXiv 获取论文
     try:
@@ -979,6 +1222,28 @@ def fetch_and_process_papers(
         all_papers.extend(journal_papers)
     except Exception as e:
         print(f"  Journal fetch error: {e}")
+
+    # 4. Optional Semantic Scholar search, enabled from desktop settings.
+    if enable_semantic_scholar:
+        try:
+            semantic_papers = fetch_semantic_scholar_papers(semantic_queries or [], days, limit_per_source)
+            all_papers.extend(semantic_papers)
+            if semantic_papers:
+                emit_fetched("semantic_scholar", semantic_papers)
+            emit({"phase": "source_complete", "source": "semantic_scholar", "count": len(semantic_papers)})
+        except Exception as e:
+            print(f"  Semantic Scholar fetch error: {e}")
+
+    # 5. Optional user-provided RSS/Atom feeds.
+    if enable_custom_rss:
+        try:
+            custom_rss_papers = fetch_custom_rss_papers(custom_rss_urls or [], limit_per_source)
+            all_papers.extend(custom_rss_papers)
+            if custom_rss_papers:
+                emit_fetched("custom_rss", custom_rss_papers)
+            emit({"phase": "source_complete", "source": "custom_rss", "count": len(custom_rss_papers)})
+        except Exception as e:
+            print(f"  Custom RSS fetch error: {e}")
 
     if not all_papers:
         all_papers.extend(fetch_cached_arxiv_papers())
@@ -1310,6 +1575,10 @@ def daily_push(
     arxiv_categories: List[str] = None,
     conferences: List[str] = None,
     journals: List[str] = None,
+    semantic_queries: List[str] = None,
+    custom_rss_urls: List[str] = None,
+    enable_semantic_scholar: Optional[bool] = None,
+    enable_custom_rss: Optional[bool] = None,
     limit_per_source: int = DEFAULT_LIMIT_PER_SOURCE,
     output_file: str = None,
     send_to_feishu: bool = False,
@@ -1359,6 +1628,14 @@ def daily_push(
     else:
         profile = normalized_profile
     print(f"Profile loaded: {profile.get('version', 'unknown')}")
+    if semantic_queries is None:
+        semantic_queries = semantic_scholar_queries_from_profile(profile)
+    if custom_rss_urls is None:
+        custom_rss_urls = _env_list("PAPERFLOW_CUSTOM_RSS_URLS")
+    if enable_semantic_scholar is None:
+        enable_semantic_scholar = _env_bool("PAPERFLOW_ENABLE_SEMANTIC_SCHOLAR", default=False)
+    if enable_custom_rss is None:
+        enable_custom_rss = _env_bool("PAPERFLOW_ENABLE_CUSTOM_RSS", default=False)
 
     # 2. 加载权重配置
     weights = load_scoring_weights()
@@ -1369,6 +1646,10 @@ def daily_push(
         arxiv_categories=arxiv_categories,
         conferences=conferences,
         journals=journals,
+        semantic_queries=semantic_queries,
+        custom_rss_urls=custom_rss_urls,
+        enable_semantic_scholar=bool(enable_semantic_scholar),
+        enable_custom_rss=bool(enable_custom_rss),
         limit_per_source=limit_per_source,
         progress_callback=progress_callback,
     )
@@ -1398,6 +1679,10 @@ def daily_push(
             arxiv_categories=arxiv_categories,
             conferences=[],
             journals=[],
+            semantic_queries=semantic_queries,
+            custom_rss_urls=custom_rss_urls,
+            enable_semantic_scholar=bool(enable_semantic_scholar),
+            enable_custom_rss=bool(enable_custom_rss),
             limit_per_source=limit_per_source,
             progress_callback=progress_callback,
         )

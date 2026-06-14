@@ -630,6 +630,7 @@ textarea {
   text-align: center;
 }
 
+.paper-actions button[data-action="read"].active,
 .paper-actions button[data-action="read"]:hover {
   border-color: #9bb9ea;
   color: var(--blue);
@@ -657,6 +658,7 @@ textarea {
   background: var(--red-soft);
 }
 
+.paper-actions button[data-action="later"].active,
 .paper-actions button[data-action="later"]:hover {
   border-color: #d7dee9;
   color: #5c6c81;

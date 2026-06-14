@@ -116,6 +116,14 @@ def _to_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _to_positive_int(value: Any, default: int) -> int:
+    try:
+        parsed = int(float(value))
+    except (TypeError, ValueError):
+        parsed = default
+    return max(1, parsed)
+
+
 def _unique_ints(values: Iterable[Any], *, minimum: int = 1, maximum: Optional[int] = None) -> List[int]:
     seen: Set[int] = set()
     result: List[int] = []
@@ -793,6 +801,57 @@ def settings() -> Dict[str, Any]:
     }
 
 
+def _configured_daily_limit(value: Any = None) -> int:
+    if value in (None, ""):
+        return _to_positive_int(_env_text("PAPERFLOW_DAILY_LIMIT", "30"), 30)
+    return _to_positive_int(value, 30)
+
+
+def _configured_report_style() -> str:
+    style = (_env_text("PAPERFLOW_REPORT_STYLE", "standard") or "standard").strip().lower()
+    return style if style in {"standard", "deep", "brief"} else "standard"
+
+
+def _configured_daily_sources(
+    *,
+    arxiv_categories: Optional[Iterable[Any]],
+    conferences: Optional[Iterable[Any]],
+    journals: Optional[Iterable[Any]],
+) -> Dict[str, List[str]]:
+    source_preferences = settings().get("source_preferences", {})
+    resolved_arxiv = (
+        _string_list(arxiv_categories)
+        if arxiv_categories is not None
+        else _string_list(source_preferences.get("arxiv_categories"))
+    )
+    resolved_conferences = (
+        _string_list(conferences)
+        if conferences is not None
+        else _string_list(source_preferences.get("conferences"))
+    )
+    resolved_journals = (
+        _string_list(journals)
+        if journals is not None
+        else _string_list(source_preferences.get("journals"))
+    )
+
+    if arxiv_categories is None and source_preferences.get("enable_arxiv") is False:
+        resolved_arxiv = []
+    if conferences is None and source_preferences.get("enable_openreview") is False:
+        resolved_conferences = []
+
+    return {
+        "arxiv_categories": resolved_arxiv,
+        "conferences": resolved_conferences,
+        "journals": resolved_journals,
+        "custom_rss_urls": _string_list(source_preferences.get("custom_rss_urls"))
+        if source_preferences.get("enable_custom_rss")
+        else [],
+        "enable_semantic_scholar": bool(source_preferences.get("enable_semantic_scholar")),
+        "enable_custom_rss": bool(source_preferences.get("enable_custom_rss")),
+    }
+
+
 def test_provider(kind: str) -> Dict[str, Any]:
     """Run an opt-in provider smoke test for the settings page."""
     normalized = (kind or "").strip().lower()
@@ -1092,19 +1151,27 @@ def create_or_update_profile(
 def run_daily_push(
     user_id: str,
     days: int = 1,
-    limit_per_source: int = 100,
+    limit_per_source: Optional[int] = None,
     arxiv_categories: Optional[Iterable[Any]] = None,
     conferences: Optional[Iterable[Any]] = None,
     journals: Optional[Iterable[Any]] = None,
     progress_callback: Optional[Any] = None,
 ) -> Dict[str, Any]:
+    sources = _configured_daily_sources(
+        arxiv_categories=arxiv_categories,
+        conferences=conferences,
+        journals=journals,
+    )
     result = daily_agent.daily_push(
         user_id=user_id,
         days=max(1, int(days or 1)),
-        arxiv_categories=_string_list(arxiv_categories) if arxiv_categories is not None else None,
-        conferences=_string_list(conferences) if conferences is not None else None,
-        journals=_string_list(journals) if journals is not None else None,
-        limit_per_source=max(1, int(limit_per_source or 100)),
+        arxiv_categories=sources["arxiv_categories"],
+        conferences=sources["conferences"],
+        journals=sources["journals"],
+        custom_rss_urls=sources["custom_rss_urls"],
+        enable_semantic_scholar=sources["enable_semantic_scholar"],
+        enable_custom_rss=sources["enable_custom_rss"],
+        limit_per_source=_configured_daily_limit(limit_per_source),
         send_to_feishu=False,
         progress_callback=progress_callback,
     )
@@ -1214,7 +1281,7 @@ def _finish_daily_task(task_id: str) -> None:
         task["updated_at"] = task["started_at"]
         user_id = str(task["user_id"])
         days = int(task.get("days") or 1)
-        limit_per_source = int(task.get("limit_per_source") or 100)
+        limit_per_source = _configured_daily_limit(task.get("limit_per_source"))
         arxiv_categories = task.get("arxiv_categories")
         conferences = task.get("conferences")
         journals = task.get("journals")
@@ -1252,7 +1319,7 @@ def _finish_daily_task(task_id: str) -> None:
 def start_daily_push_task(
     user_id: str,
     days: int = 1,
-    limit_per_source: int = 100,
+    limit_per_source: Optional[int] = None,
     arxiv_categories: Optional[Iterable[Any]] = None,
     conferences: Optional[Iterable[Any]] = None,
     journals: Optional[Iterable[Any]] = None,
@@ -1269,16 +1336,21 @@ def start_daily_push_task(
 
         now = _task_timestamp()
         task_id = f"daily_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid4().hex[:8]}"
+        sources = _configured_daily_sources(
+            arxiv_categories=arxiv_categories,
+            conferences=conferences,
+            journals=journals,
+        )
         task: Dict[str, Any] = {
             "task_id": task_id,
             "kind": "daily_push",
             "user_id": cleaned_user_id,
             "status": "queued",
             "days": max(1, int(days or 1)),
-            "limit_per_source": max(1, int(limit_per_source or 100)),
-            "arxiv_categories": _string_list(arxiv_categories) if arxiv_categories is not None else None,
-            "conferences": _string_list(conferences) if conferences is not None else None,
-            "journals": _string_list(journals) if journals is not None else None,
+            "limit_per_source": _configured_daily_limit(limit_per_source),
+            "arxiv_categories": sources["arxiv_categories"],
+            "conferences": sources["conferences"],
+            "journals": sources["journals"],
             "created_at": now,
             "updated_at": now,
             "started_at": None,
@@ -1520,7 +1592,11 @@ def create_reading_reports(
             paper_ids=selected,
             papers=papers,
             send_to_feishu=should_write_feishu,
-            request_metadata={"selection_push_id": push_id, "report_source_type": "desktop_gui"},
+            request_metadata={
+                "selection_push_id": push_id,
+                "report_source_type": "desktop_gui",
+                "report_style": _configured_report_style(),
+            },
         )
 
     wiki_backfilled = _backfill_docs_to_wiki(user_id, docs)
@@ -1569,6 +1645,7 @@ def read_arxiv(user_id: str, arxiv_id: str, write_feishu: Optional[bool] = None)
                 "report_source_type": "desktop_arxiv",
                 "report_source_key": normalized_arxiv_id,
                 "report_source_name": normalized_arxiv_id,
+                "report_style": _configured_report_style(),
             },
         )
     wiki_backfilled = _backfill_docs_to_wiki(user_id, docs)
@@ -1608,6 +1685,7 @@ def read_local_pdf(
                 "report_source_type": "desktop_pdf_path",
                 "report_source_key": str(path),
                 "report_source_name": path.name,
+                "report_style": _configured_report_style(),
             },
         )
     wiki_backfilled = _backfill_docs_to_wiki(user_id, docs)
