@@ -27,7 +27,7 @@ and adapt tomorrow's recommendations.
 [Feishu/Lark Bot](#feishu--lark-bot) |
 [PaperFlow-Bench](#paperflow-bench) | [Reproduce](experiments/REPRODUCE.md)
 
-<img src="docs/assets/paperflow-readme-hero.png" alt="PaperFlow personalized scientific reading banner" width="100%">
+<img src="https://github.com/user-attachments/assets/fd31a62b-00a4-4210-82cb-1ffd080de254" alt="PaperFlow personalized scientific reading banner" width="100%">
 
 </div>
 
@@ -67,7 +67,11 @@ mock: paper pulls, feedback, reading reports, Wiki graph updates, and settings
 all route through the local backend.
 
 <div align="center">
-  <img src="docs/assets/readme/paperflow-desktop-demo.gif" alt="PaperFlow offline desktop workflow demo" width="92%">
+  <img src="https://github.com/user-attachments/assets/c852c134-5ddb-478e-8a13-3fa313dcd812" alt="PaperFlow offline desktop workflow demo" width="92%">
+  <br>
+  <a href="https://github.com/user-attachments/assets/d491949a-f86b-4894-825b-31c16b29248c">Watch the MP4 demo</a>
+  ·
+  <a href="https://github.com/OpenRaiser/PaperFlow/issues/1">Media gallery</a>
 </div>
 
 <br>
@@ -78,24 +82,24 @@ all route through the local backend.
 <table>
   <tr>
     <td width="50%">
-      <img src="docs/assets/readme/paperflow-desktop-papers.png" alt="PaperFlow daily paper recommendation stream">
+      <img src="https://github.com/user-attachments/assets/018aa646-41fa-4967-b4d4-6d6a54df51cf" alt="PaperFlow daily paper recommendation stream">
       <br><b>Daily paper stream</b><br>
       Date-aware pulls, source filters, candidate metrics, paper actions, and backend task state.
     </td>
     <td width="50%">
-      <img src="docs/assets/readme/paperflow-desktop-wiki.png" alt="PaperFlow knowledge Wiki graph">
+      <img src="https://github.com/user-attachments/assets/305279b3-1350-4169-887c-99c0cac29a15" alt="PaperFlow knowledge Wiki graph">
       <br><b>Knowledge Wiki graph</b><br>
       Backend-derived paper, topic, method, profile, and citation relationships.
     </td>
   </tr>
   <tr>
     <td width="50%">
-      <img src="docs/assets/readme/paperflow-desktop-chat.png" alt="PaperFlow cited local Wiki question answering">
+      <img src="https://github.com/user-attachments/assets/6685dd75-e2e2-45d1-b440-1ca5325eca1d" alt="PaperFlow cited local Wiki question answering">
       <br><b>Cited Wiki Q&A</b><br>
       Streamed answers with clickable reference markers and source cards.
     </td>
     <td width="50%">
-      <img src="docs/assets/readme/paperflow-desktop-settings.png" alt="PaperFlow local settings and source configuration">
+      <img src="https://github.com/user-attachments/assets/a629cc1e-e26e-4878-9eb3-97565153b711" alt="PaperFlow local settings and source configuration">
       <br><b>Local settings</b><br>
       Provider keys, storage paths, paper-source modes, conference access, and export controls.
     </td>
@@ -106,7 +110,7 @@ all route through the local backend.
 
 ### Product Framework
 
-<img src="docs/assets/readme/paperflow-product-framework-clean.png" alt="PaperFlow product framework diagram" width="100%">
+<img src="https://github.com/user-attachments/assets/60ff5a52-5d09-46c2-be0d-1933c19515b6" alt="PaperFlow product framework diagram" width="100%">
 
 The desktop loop is intentionally local: profile state, paper pushes, feedback,
 reading reports, and Wiki nodes stay on disk unless you explicitly enable
