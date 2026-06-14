@@ -14,6 +14,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_desktop_server_routes_are_registered() -> None:
+    server_source = (PROJECT_ROOT / "deployments/desktop/server.py").read_text(encoding="utf-8")
+
     assert "/api/health" in server.GET_ROUTES
     assert "/api/source-options" in server.GET_ROUTES
     assert "/api/settings" in server.POST_ROUTES
@@ -29,6 +31,7 @@ def test_desktop_server_routes_are_registered() -> None:
     assert "/api/daily/status" in server.GET_ROUTES
     assert "/api/daily/start" in server.POST_ROUTES
     assert "/api/wiki/ask/stream" in server.POST_ROUTES
+    assert 'self.send_header("Cache-Control", "no-store")' in server_source
 
 
 def test_desktop_wiki_stream_helpers_emit_sse_frames() -> None:
@@ -278,6 +281,163 @@ def test_desktop_wiki_ask_routes_mentions_into_local_cited_answer(monkeypatch: p
     assert payload["sources"][0]["url"] == "https://example.com/paper"
 
 
+def test_desktop_wiki_ask_pins_recent_papers_for_trend_questions(monkeypatch: pytest.MonkeyPatch) -> None:
+    recent_papers = [
+        {
+            "id": "paper-1",
+            "title": "Agentic Memory for Scientific Reading",
+            "abstract": "Agentic memory improves long horizon paper triage and report grounding.",
+            "authors": ["A. Researcher", "B. Scientist"],
+            "subjects": ["cs.AI", "cs.CL"],
+            "category": "high_match",
+            "rank": 1,
+            "score": 0.94,
+            "push_id": "push_20260614",
+            "url": "https://example.com/agentic-memory",
+        },
+        {
+            "id": "paper-2",
+            "title": "Multimodal Retrieval Agents",
+            "summary": "Retrieval agents connect paper figures, text, and user feedback.",
+            "authors": "C. Author, D. Author",
+            "categories": "cs.IR, cs.MM",
+            "category": "explore",
+            "rank": 2,
+            "score": 0.88,
+            "push_id": "push_20260614",
+        },
+    ]
+    captured = {}
+
+    monkeypatch.setattr(agents.db_ops, "get_recent_pushes", lambda user_id, limit=8: recent_papers)
+    monkeypatch.setattr(agents.db_ops, "get_latest_push", lambda user_id: {})
+
+    def fake_answer_question(user_id, question, *, limit=8, pinned_nodes=None):
+        captured["question"] = question
+        captured["pinned_nodes"] = pinned_nodes or []
+        return {
+            "text": "最近推送集中在 agentic memory 和 multimodal retrieval。[1][2]",
+            "citations": [],
+        }
+
+    monkeypatch.setattr(agents.wiki_answer, "answer_question", fake_answer_question)
+
+    payload = agents.wiki_ask("user_test", "总结一下我的论文趋势")
+
+    assert payload["mode"] == "wiki"
+    assert payload["routing_reason"] == "local_research_context"
+    assert [node["title"] for node in captured["pinned_nodes"]] == [
+        "Agentic Memory for Scientific Reading",
+        "Multimodal Retrieval Agents",
+    ]
+    first = captured["pinned_nodes"][0]
+    second = captured["pinned_nodes"][1]
+    assert first["node_type"] == "paper"
+    assert first["metadata"]["source"] == "recent_daily_push"
+    assert "Agentic memory improves long horizon" in first["body"]
+    assert "Category: high_match" in first["body"]
+    assert "cs.IR" in second["body"]
+
+
+def test_desktop_wiki_ask_stream_pins_recent_papers_for_trend_questions(monkeypatch: pytest.MonkeyPatch) -> None:
+    recent_paper = {
+        "id": "paper-stream-1",
+        "title": "Personalized Research Trend Mining",
+        "abstract": "User feedback is aggregated into daily research trend summaries.",
+        "authors": ["E. Analyst"],
+        "subjects": ["cs.DL"],
+        "category": "profile_match",
+        "rank": 1,
+        "score": 0.91,
+        "push_id": "push_stream",
+    }
+    captured = {}
+
+    monkeypatch.setattr(agents.db_ops, "get_recent_pushes", lambda user_id, limit=8: [recent_paper])
+    monkeypatch.setattr(agents.db_ops, "get_latest_push", lambda user_id: {})
+
+    def fake_answer_question_stream(user_id, question, *, limit=8, pinned_nodes=None):
+        captured["pinned_nodes"] = pinned_nodes or []
+        yield {"event": "meta", "data": {"citations": [], "streaming": {"provider": True, "transport": "sse"}}}
+        yield {"event": "chunk", "data": {"text": "趋势摘要"}}
+        yield {"event": "done", "data": {"text": "趋势摘要", "citations": [], "streaming": {"provider": True, "transport": "sse"}}}
+
+    monkeypatch.setattr(agents.wiki_answer, "answer_question_stream", fake_answer_question_stream)
+
+    events = list(agents.wiki_ask_stream("user_test", "最近论文趋势是什么"))
+
+    assert [event["event"] for event in events] == ["meta", "chunk", "done"]
+    assert captured["pinned_nodes"][0]["title"] == "Personalized Research Trend Mining"
+    assert captured["pinned_nodes"][0]["metadata"]["source"] == "recent_daily_push"
+    assert events[-1]["data"]["mode"] == "wiki"
+
+
+def test_desktop_wiki_ask_pins_filtered_recent_papers_for_rag_summary(monkeypatch: pytest.MonkeyPatch) -> None:
+    recent_papers = [
+        {
+            "id": "rag-paper",
+            "title": "RAG Agents for Literature Review",
+            "abstract": "Retrieval augmented generation agents summarize recent papers with citations.",
+            "authors": ["A. RAG"],
+            "subjects": ["cs.IR"],
+            "category": "high_match",
+            "rank": 1,
+            "score": 0.93,
+            "push_id": "push_rag",
+        },
+        {
+            "id": "vision-paper",
+            "title": "Vision Transformers for Segmentation",
+            "abstract": "A segmentation model unrelated to retrieval augmented generation.",
+            "authors": ["V. Author"],
+            "subjects": ["cs.CV"],
+            "category": "explore",
+            "rank": 2,
+            "score": 0.75,
+            "push_id": "push_rag",
+        },
+    ]
+    captured = {}
+
+    monkeypatch.setattr(agents.db_ops, "get_recent_pushes", lambda user_id, limit=32: recent_papers)
+    monkeypatch.setattr(agents.db_ops, "get_latest_push", lambda user_id: {})
+
+    def fake_answer_question(user_id, question, *, limit=8, pinned_nodes=None):
+        captured["pinned_nodes"] = pinned_nodes or []
+        return {"text": "RAG 相关论文集中在带引用的综述代理。[1]", "citations": []}
+
+    monkeypatch.setattr(agents.wiki_answer, "answer_question", fake_answer_question)
+
+    payload = agents.wiki_ask("user_test", "总结最近一周和 RAG 相关的论文")
+
+    assert payload["mode"] == "wiki"
+    assert [node["title"] for node in captured["pinned_nodes"]] == ["RAG Agents for Literature Review"]
+    assert "Retrieval augmented generation" in captured["pinned_nodes"][0]["body"]
+
+
+def test_desktop_wiki_ask_requires_mentions_for_ambiguous_two_paper_comparison(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(agents.wiki_answer, "answer_question", lambda *_args, **_kwargs: pytest.fail("ambiguous comparisons should not call LLM"))
+
+    payload = agents.wiki_ask("user_test", "对比这两篇论文的方法差异")
+
+    assert payload["mode"] == "wiki"
+    assert payload["routing_reason"] == "mention_required"
+    assert payload["citations"] == []
+    assert "@ 选择两篇具体论文" in payload["text"]
+
+
+def test_desktop_wiki_ask_stream_requires_mentions_for_ambiguous_two_paper_comparison(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(agents.wiki_answer, "answer_question_stream", lambda *_args, **_kwargs: pytest.fail("ambiguous comparisons should not stream LLM"))
+
+    events = list(agents.wiki_ask_stream("user_test", "对比这两篇论文的方法差异"))
+
+    assert events[0]["event"] == "meta"
+    assert events[-1]["event"] == "done"
+    assert any(event["event"] == "chunk" for event in events)
+    assert events[-1]["data"]["routing_reason"] == "mention_required"
+    assert "@ 选择两篇具体论文" in events[-1]["data"]["text"]
+
+
 def test_desktop_wiki_ask_rolls_section_citations_up_to_paper_reference(monkeypatch: pytest.MonkeyPatch) -> None:
     section_node = {
         "node_id": "section:paper-1#Q1-problem-analysis",
@@ -411,11 +571,14 @@ def test_desktop_wiki_ask_can_answer_general_question_without_local_retrieval(mo
 
 
 def test_desktop_wiki_ask_stream_can_direct_answer_without_wiki(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured = {}
+
     class FakeStreamingLLM:
         name = "fake"
         model = "fake-stream"
 
         def stream_generate(self, *_args, **_kwargs):
+            captured.update(_kwargs)
             yield "RAG"
             yield " 是检索增强生成"
 
@@ -429,6 +592,75 @@ def test_desktop_wiki_ask_stream_can_direct_answer_without_wiki(monkeypatch: pyt
     assert events[0]["data"]["retrieval_required"] is False
     assert "".join(event["data"].get("text", "") for event in events if event["event"] == "chunk") == "RAG 是检索增强生成"
     assert events[-1]["data"]["text"] == "RAG 是检索增强生成"
+    assert captured["max_tokens"] >= 1400
+
+
+def test_desktop_wiki_answer_stream_uses_longer_default_completion_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured = {}
+    node = {
+        "node_id": "paper:rag",
+        "node_type": "paper",
+        "title": "RAG Paper",
+        "body": "Retrieval augmented generation needs enough answer budget.",
+        "metadata": {},
+    }
+
+    class FakeStreamingLLM:
+        name = "fake"
+        model = "fake-stream"
+
+        def stream_generate(self, *_args, **_kwargs):
+            captured.update(_kwargs)
+            yield "完整回答"
+
+    monkeypatch.delenv("PAPERFLOW_WIKI_ANSWER_MAX_TOKENS", raising=False)
+    monkeypatch.setattr(agents.wiki_answer.wiki_db, "embed_nodes_for_user", lambda *_args, **_kwargs: {"embedded": 1})
+    monkeypatch.setattr(agents.wiki_answer.wiki_db, "search_nodes", lambda *_args, **_kwargs: [node])
+    monkeypatch.setattr(agents.wiki_answer.wiki_db, "get_citations_for_nodes", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(agents.wiki_answer, "build_llm_provider", lambda: FakeStreamingLLM())
+
+    events = list(agents.wiki_answer.answer_question_stream("user_test", "总结 RAG", limit=4))
+
+    assert events[-1]["data"]["text"] == "完整回答"
+    assert captured["max_tokens"] >= 1800
+
+
+def test_desktop_wiki_answer_stream_recovers_obviously_incomplete_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    node = {
+        "node_id": "paper:weekly-work",
+        "node_type": "paper",
+        "title": "Weekly Work",
+        "body": "The user accepted paper recommendations and drafted a reading plan this week.",
+        "metadata": {},
+    }
+    captured = {"fallback_called": False}
+
+    class FakeStreamingLLM:
+        name = "fake"
+        model = "fake-stream"
+
+        def stream_generate(self, *_args, **_kwargs):
+            yield "您本周的工作主要集中在论文推荐接收与阅读计划制定：在2026年6月"
+
+        def generate(self, *_args, **_kwargs):
+            captured["fallback_called"] = True
+
+            class Response:
+                text = "您本周的工作主要集中在论文推荐接收与阅读计划制定：在2026年6月12日和6月14日接收了推荐论文，并围绕阅读计划推进了后续精读。"
+                prompt_tokens = 0
+                completion_tokens = 0
+
+            return Response()
+
+    monkeypatch.setattr(agents.wiki_answer.wiki_db, "embed_nodes_for_user", lambda *_args, **_kwargs: {"embedded": 1})
+    monkeypatch.setattr(agents.wiki_answer.wiki_db, "search_nodes", lambda *_args, **_kwargs: [node])
+    monkeypatch.setattr(agents.wiki_answer.wiki_db, "get_citations_for_nodes", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(agents.wiki_answer, "build_llm_provider", lambda: FakeStreamingLLM())
+
+    events = list(agents.wiki_answer.answer_question_stream("user_test", "总结一下我这一周的工作", limit=4))
+
+    assert captured["fallback_called"] is True
+    assert events[-1]["data"]["text"].endswith("后续精读。")
 
 
 def test_desktop_source_options_exposes_push_sources() -> None:
@@ -502,6 +734,7 @@ def test_desktop_daily_push_uses_saved_settings_when_gui_omits_filters(
         "\n".join(
             [
                 "PAPERFLOW_DAILY_LIMIT=17",
+                "PAPERFLOW_RELEVANCE_THRESHOLD=60",
                 "PAPERFLOW_ENABLE_ARXIV=false",
                 "PAPERFLOW_ENABLE_OPENREVIEW=false",
                 "PAPERFLOW_ENABLE_SEMANTIC_SCHOLAR=true",
@@ -528,6 +761,7 @@ def test_desktop_daily_push_uses_saved_settings_when_gui_omits_filters(
     agents.run_daily_push("user_settings", days=2)
 
     assert captured["limit_per_source"] == 17
+    assert captured["push_limit"] == 17
     assert captured["arxiv_categories"] == []
     assert captured["conferences"] == []
     assert captured["journals"] == ["Nature"]
@@ -545,13 +779,18 @@ def test_desktop_relevance_threshold_changes_daily_push_weights(monkeypatch: pyt
     }
 
     monkeypatch.setenv("PAPERFLOW_RELEVANCE_THRESHOLD", "90")
+    monkeypatch.setenv("PAPERFLOW_DAILY_LIMIT", "12")
     strict = agents.daily_agent.apply_relevance_threshold_override(base)
     monkeypatch.setenv("PAPERFLOW_RELEVANCE_THRESHOLD", "30")
+    monkeypatch.setenv("PAPERFLOW_DAILY_LIMIT", "8")
     relaxed = agents.daily_agent.apply_relevance_threshold_override(base)
 
     assert strict["threshold_edge_relevant"] > base["threshold_edge_relevant"]
     assert relaxed["threshold_edge_relevant"] < base["threshold_edge_relevant"]
     assert strict["paperflow_relevance_threshold"] == 90
+    assert strict["push_target_count"] == 12
+    assert strict["push_max_count"] == 12
+    assert relaxed["push_target_count"] == 8
 
 
 def test_daily_push_custom_rss_fetcher_builds_paper_cards(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -624,6 +863,9 @@ def test_latest_push_metadata_lifts_generation_settings_from_paper_rows() -> Non
                 "metadata": {
                     "paper_count": 17,
                     "total_fetched": 50,
+                    "daily_limit": 17,
+                    "push_target_count": 17,
+                    "push_max_count": 17,
                     "limit_per_source": 17,
                     "fetch_days": 1,
                     "relevance_threshold": 72,
@@ -640,6 +882,9 @@ def test_latest_push_metadata_lifts_generation_settings_from_paper_rows() -> Non
 
     assert metadata["paper_count"] == 17
     assert metadata["total_fetched"] == 50
+    assert metadata["daily_limit"] == 17
+    assert metadata["push_target_count"] == 17
+    assert metadata["push_max_count"] == 17
     assert metadata["limit_per_source"] == 17
     assert metadata["relevance_threshold"] == 72
     assert metadata["custom_rss_urls"] == ["https://example.com/feed.xml"]
@@ -1166,6 +1411,10 @@ def test_desktop_paper_date_and_metrics_sync_with_backend() -> None:
     assert "selectedDateFetchDays()" in script
     assert "runButton.disabled = false" in script
     assert 'target_date: $("paperDate").value' in script
+    assert "每日上限 ${metadata.daily_limit}" in script
+    assert "旧缓存参数不一致时会自动刷新" in script
+    assert 'id="saveAdvancedSettingsBtn"' in html
+    assert 'runAction(saveSettings, "保存高级参数")' in script
     assert "/api/daily/status?task_id=" in script
     assert "/api/daily/status?user_id=" in script
     assert "pollDailyTask(taskId, data.push, userId, pollToken)" in script
@@ -1223,6 +1472,9 @@ def test_desktop_chat_sources_do_not_fallback_to_demo_in_real_mode() -> None:
     assert "function renderChatSources(sources = DEMO_MODE ? demoSources : [])" in script
     assert "data.sources || demoSources" not in script
     assert "暂无参考文献" in script
+    assert 'mention_required: "需要选择论文"' in script
+    assert 'data.routing_reason !== "mention_required" ? "" : routingLabel(data.routing_reason)' in script
+    assert 'replace(/\\*\\*([^*\\n]+?)\\*\\*/g, "<strong>$1</strong>")' in script
 
 
 def test_desktop_wiki_chat_supports_clickable_citations_streaming_and_mentions() -> None:
@@ -1256,6 +1508,7 @@ def test_desktop_wiki_chat_supports_clickable_citations_streaming_and_mentions()
     assert ".citation-ref" in css
     assert ".mention-suggestions" in css
     assert ".answer-meta .wiki" in css
+    assert ".answer-text strong" in css
 
 
 def test_desktop_daily_push_preserves_empty_push_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1368,11 +1621,36 @@ def test_desktop_daily_push_task_completes(monkeypatch: pytest.MonkeyPatch) -> N
 
 
 def test_desktop_daily_push_task_reuses_cached_target_date(monkeypatch: pytest.MonkeyPatch) -> None:
+    env_path = PROJECT_ROOT / ".missing-test-env"
+    monkeypatch.setattr(agents, "ENV_PATH", env_path)
+    monkeypatch.setenv("PAPERFLOW_DAILY_LIMIT", "30")
+    monkeypatch.setenv("PAPERFLOW_RELEVANCE_THRESHOLD", "60")
+    monkeypatch.setenv("PAPERFLOW_ENABLE_ARXIV", "true")
+    monkeypatch.setenv("PAPERFLOW_ENABLE_OPENREVIEW", "true")
+    monkeypatch.setenv("PAPERFLOW_ENABLE_SEMANTIC_SCHOLAR", "false")
+    monkeypatch.setenv("PAPERFLOW_ENABLE_CUSTOM_RSS", "false")
+    monkeypatch.setenv("PAPERFLOW_DEFAULT_ARXIV_CATEGORIES", "cs.CL,cs.AI,cs.IR,cs.LG")
+    monkeypatch.setenv("PAPERFLOW_DEFAULT_CONFERENCES", "ICLR,NeurIPS,ACL,SIGIR")
+    monkeypatch.setenv("PAPERFLOW_DEFAULT_JOURNALS", "")
+    monkeypatch.setenv("PAPERFLOW_CUSTOM_RSS_URLS", "https://arxiv.org/rss/cs.CL")
     cached_push = {
         "push_id": "push_cached_today",
         "push_time": "2026-06-14 08:00:00",
         "papers": [{"id": 1, "title": "Cached Paper"}],
-        "metadata": {"paper_count": 1, "total_fetched": 8, "limit_per_source": 30},
+        "metadata": {
+            "paper_count": 1,
+            "total_fetched": 8,
+            "daily_limit": 30,
+            "limit_per_source": 30,
+            "fetch_days": 1,
+            "relevance_threshold": 60,
+            "arxiv_categories": ["cs.CL", "cs.AI", "cs.IR", "cs.LG"],
+            "conferences": ["ICLR", "NeurIPS", "ACL", "SIGIR"],
+            "journals": [],
+            "enable_semantic_scholar": False,
+            "enable_custom_rss": False,
+            "custom_rss_urls": [],
+        },
     }
 
     monkeypatch.setattr(agents.db_ops, "get_push_for_date", lambda user_id, target_date: cached_push)
@@ -1393,6 +1671,80 @@ def test_desktop_daily_push_task_reuses_cached_target_date(monkeypatch: pytest.M
     assert started["task"]["cached"] is True
     assert started["task"]["push"]["push_id"] == "push_cached_today"
     assert started["task"]["push"]["metadata"]["cached_for_date"] == "2026-06-14"
+
+
+def test_desktop_daily_push_task_ignores_cached_target_date_when_settings_change(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "\n".join(
+            [
+                "PAPERFLOW_DAILY_LIMIT=12",
+                "PAPERFLOW_RELEVANCE_THRESHOLD=80",
+                "PAPERFLOW_ENABLE_ARXIV=true",
+                "PAPERFLOW_ENABLE_OPENREVIEW=false",
+                "PAPERFLOW_ENABLE_SEMANTIC_SCHOLAR=false",
+                "PAPERFLOW_ENABLE_CUSTOM_RSS=false",
+                "PAPERFLOW_DEFAULT_ARXIV_CATEGORIES=cs.CL",
+                "PAPERFLOW_DEFAULT_CONFERENCES=",
+                "PAPERFLOW_DEFAULT_JOURNALS=",
+                "PAPERFLOW_CUSTOM_RSS_URLS=",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(agents, "ENV_PATH", env_path)
+    cached_push = {
+        "push_id": "push_old_settings",
+        "push_time": "2026-06-14 08:00:00",
+        "papers": [{"id": 1, "title": "Old Cached Paper"}],
+        "metadata": {
+            "paper_count": 1,
+            "total_fetched": 8,
+            "daily_limit": 30,
+            "limit_per_source": 30,
+            "fetch_days": 1,
+            "relevance_threshold": 60,
+            "arxiv_categories": ["cs.CL"],
+            "conferences": [],
+            "journals": [],
+            "enable_semantic_scholar": False,
+            "enable_custom_rss": False,
+            "custom_rss_urls": [],
+        },
+    }
+    started_event = threading.Event()
+    release_event = threading.Event()
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(agents.db_ops, "get_push_for_date", lambda user_id, target_date: cached_push)
+
+    def fake_run_daily_push(user_id, **kwargs):
+        captured["user_id"] = user_id
+        captured.update(kwargs)
+        started_event.set()
+        release_event.wait(timeout=2)
+        return {
+            "result": {"push_id": "push_new_settings"},
+            "push": {"push_id": "push_new_settings", "papers": [], "metadata": {}},
+        }
+
+    monkeypatch.setattr(agents, "run_daily_push", fake_run_daily_push)
+
+    started = agents.start_daily_push_task(
+        "user_task_cache_mismatch",
+        days=1,
+        target_date="2026-06-14",
+    )
+
+    try:
+        assert started.get("cached") is not True
+        assert started["task"]["status"] == "queued"
+        assert started_event.wait(timeout=2)
+        assert captured["limit_per_source"] == 12
+    finally:
+        release_event.set()
 
 
 def test_desktop_daily_push_task_reuses_running_user_task(monkeypatch: pytest.MonkeyPatch) -> None:

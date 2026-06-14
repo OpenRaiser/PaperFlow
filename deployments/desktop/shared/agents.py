@@ -341,6 +341,14 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _env_int(name: str, default: int, *, min_value: int = 1, max_value: int = 100000) -> int:
+    try:
+        value = int(str(os.environ.get(name, default)).strip())
+    except (TypeError, ValueError):
+        value = default
+    return max(min_value, min(max_value, value))
+
+
 def _configured_path(env_name: str, default_relative: str) -> str:
     raw = os.environ.get(env_name, "").strip()
     if raw:
@@ -807,6 +815,50 @@ def _configured_daily_limit(value: Any = None) -> int:
     return _to_positive_int(value, 30)
 
 
+def _configured_relevance_threshold() -> int:
+    return int(_to_float(_env_text("PAPERFLOW_RELEVANCE_THRESHOLD", "60"), 60))
+
+
+def _normalized_cache_list(value: Any) -> List[str]:
+    return sorted(_string_list(value))
+
+
+def _cache_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _daily_cache_matches_settings(
+    cached_push: Dict[str, Any],
+    *,
+    days: int,
+    limit_per_source: int,
+    sources: Dict[str, Any],
+) -> bool:
+    metadata = dict(cached_push.get("metadata") or {})
+    try:
+        cached_daily_limit = int(_to_float(metadata.get("daily_limit"), -1))
+    except (TypeError, ValueError):
+        cached_daily_limit = -1
+    if cached_daily_limit != int(limit_per_source):
+        return False
+    if int(_to_float(metadata.get("limit_per_source"), -1)) != int(limit_per_source):
+        return False
+    if int(_to_float(metadata.get("relevance_threshold"), -1)) != _configured_relevance_threshold():
+        return False
+    if int(_to_float(metadata.get("fetch_days"), -1)) != max(1, int(days or 1)):
+        return False
+
+    for key in ("arxiv_categories", "conferences", "journals", "custom_rss_urls"):
+        if _normalized_cache_list(metadata.get(key)) != _normalized_cache_list(sources.get(key)):
+            return False
+    for key in ("enable_semantic_scholar", "enable_custom_rss"):
+        if _cache_bool(metadata.get(key)) != bool(sources.get(key)):
+            return False
+    return True
+
+
 def _normalize_push_date(value: Any = None) -> str:
     raw = str(value or "").strip()
     if raw:
@@ -1182,6 +1234,7 @@ def run_daily_push(
         enable_semantic_scholar=sources["enable_semantic_scholar"],
         enable_custom_rss=sources["enable_custom_rss"],
         limit_per_source=_configured_daily_limit(limit_per_source),
+        push_limit=_configured_daily_limit(limit_per_source),
         send_to_feishu=False,
         progress_callback=progress_callback,
     )
@@ -1340,10 +1393,22 @@ def start_daily_push_task(
     if not cleaned_user_id:
         raise ValueError("user_id is required")
     normalized_target_date = _normalize_push_date(target_date)
+    requested_days = max(1, int(days or 1))
+    requested_limit = _configured_daily_limit(limit_per_source)
+    requested_sources = _configured_daily_sources(
+        arxiv_categories=arxiv_categories,
+        conferences=conferences,
+        journals=journals,
+    )
 
     if not force_refresh:
         cached_push = _push_payload(db_ops.get_push_for_date(cleaned_user_id, normalized_target_date))
-        if cached_push is not None:
+        if cached_push is not None and _daily_cache_matches_settings(
+            cached_push,
+            days=requested_days,
+            limit_per_source=requested_limit,
+            sources=requested_sources,
+        ):
             metadata = dict(cached_push.get("metadata") or {})
             metadata["cached"] = True
             metadata["cached_for_date"] = normalized_target_date
@@ -1354,8 +1419,8 @@ def start_daily_push_task(
                 "kind": "daily_push",
                 "user_id": cleaned_user_id,
                 "status": "completed",
-                "days": max(1, int(days or 1)),
-                "limit_per_source": _configured_daily_limit(limit_per_source),
+                "days": requested_days,
+                "limit_per_source": requested_limit,
                 "arxiv_categories": cached_push.get("metadata", {}).get("arxiv_categories"),
                 "conferences": cached_push.get("metadata", {}).get("conferences"),
                 "journals": cached_push.get("metadata", {}).get("journals"),
@@ -1389,21 +1454,16 @@ def start_daily_push_task(
 
         now = _task_timestamp()
         task_id = f"daily_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid4().hex[:8]}"
-        sources = _configured_daily_sources(
-            arxiv_categories=arxiv_categories,
-            conferences=conferences,
-            journals=journals,
-        )
         task: Dict[str, Any] = {
             "task_id": task_id,
             "kind": "daily_push",
             "user_id": cleaned_user_id,
             "status": "queued",
-            "days": max(1, int(days or 1)),
-            "limit_per_source": _configured_daily_limit(limit_per_source),
-            "arxiv_categories": sources["arxiv_categories"],
-            "conferences": sources["conferences"],
-            "journals": sources["journals"],
+            "days": requested_days,
+            "limit_per_source": requested_limit,
+            "arxiv_categories": requested_sources["arxiv_categories"],
+            "conferences": requested_sources["conferences"],
+            "journals": requested_sources["journals"],
             "target_date": normalized_target_date,
             "created_at": now,
             "updated_at": now,
@@ -2151,6 +2211,10 @@ _LOCAL_WIKI_TERMS = (
     "比较",
     "差异",
     "总结",
+    "趋势",
+    "动态",
+    "热点",
+    "主题",
     "最近",
     "一周",
     "今天",
@@ -2165,6 +2229,74 @@ _LOCAL_WIKI_TERMS = (
     "条目",
     "节点",
 )
+
+_TREND_QUESTION_TERMS = (
+    "趋势",
+    "动态",
+    "方向",
+    "热点",
+    "主题",
+    "总结一下我的论文",
+    "总结我的论文",
+    "阅读趋势",
+    "论文趋势",
+    "research trend",
+    "paper trend",
+)
+
+_RECENT_PAPER_QUERY_TERMS = (
+    "论文",
+    "文献",
+    "paper",
+    "papers",
+    "arxiv",
+)
+
+_RECENT_CONTEXT_QUERY_TERMS = (
+    "最近",
+    "一周",
+    "7天",
+    "七天",
+    "今天",
+    "今日",
+    "推送",
+    "推荐",
+    "候选",
+    "相关",
+    "总结",
+    "趋势",
+    "动态",
+    "方向",
+    "热点",
+    "主题",
+    "rag",
+)
+
+_COMPARE_QUERY_TERMS = (
+    "对比",
+    "比较",
+    "差异",
+    "不同",
+    "这两篇",
+    "两篇",
+)
+
+_LOCAL_PAPER_STOP_TOKENS = {
+    "paper",
+    "papers",
+    "arxiv",
+    "research",
+    "trend",
+    "trends",
+    "related",
+    "recent",
+    "week",
+    "summary",
+    "summarize",
+    "compare",
+    "method",
+    "methods",
+}
 
 _DIRECT_STARTERS = (
     "什么是",
@@ -2184,6 +2316,10 @@ The user asked a general question that does not require local Wiki retrieval.
 Answer directly and concisely in Chinese by default. Do not add fake citations
 or [N] markers. If the question asks for local papers, reports, user profile,
 or Wiki evidence, say that local Wiki retrieval is required instead."""
+
+
+def _direct_answer_max_tokens() -> int:
+    return _env_int("PAPERFLOW_DIRECT_ANSWER_MAX_TOKENS", 1400, min_value=512, max_value=4096)
 
 
 def _extract_question_mentions(question: str) -> List[Dict[str, str]]:
@@ -2289,6 +2425,183 @@ def _question_route(question: str, scope: str, resolved_mentions: List[Dict[str,
     return "direct", "no_local_context_signal"
 
 
+def _is_trend_question(question: str) -> bool:
+    normalized = str(question or "").strip().lower()
+    if not normalized:
+        return False
+    return any(term in normalized for term in _TREND_QUESTION_TERMS)
+
+
+def _should_pin_recent_papers(question: str, scope: str) -> bool:
+    normalized = str(question or "").strip().lower()
+    normalized_scope = str(scope or "").strip().lower()
+    if not normalized:
+        return False
+    if normalized_scope == "recent" or _is_trend_question(normalized):
+        return True
+    has_paper_signal = any(term in normalized for term in _RECENT_PAPER_QUERY_TERMS)
+    has_recent_signal = any(term in normalized for term in _RECENT_CONTEXT_QUERY_TERMS)
+    return has_paper_signal and has_recent_signal
+
+
+def _comparison_needs_mentions(question: str, resolved_nodes: List[Dict[str, Any]]) -> bool:
+    normalized = str(question or "").strip().lower()
+    if len(resolved_nodes or []) >= 2:
+        return False
+    has_deictic_pair = any(term in normalized for term in ("这两篇", "这两个", "上述两篇", "上面两篇"))
+    return has_deictic_pair and any(term in normalized for term in _COMPARE_QUERY_TERMS)
+
+
+def _local_paper_query_tokens(question: str) -> List[str]:
+    tokens: List[str] = []
+    for token in re.findall(r"[a-zA-Z][a-zA-Z0-9_+-]{1,}", str(question or "").lower()):
+        if token not in _LOCAL_PAPER_STOP_TOKENS and token not in tokens:
+            tokens.append(token)
+    return tokens[:8]
+
+
+def _compact_list(value: Any, limit: int = 6) -> List[str]:
+    if isinstance(value, list):
+        items = value
+    else:
+        parsed = _load_json(value, None)
+        if isinstance(parsed, list):
+            items = parsed
+        else:
+            items = re.split(r"[,;，、]\s*", str(value or ""))
+    if not isinstance(items, list):
+        return []
+    return [str(item).strip() for item in items[: max(1, int(limit))] if str(item or "").strip()]
+
+
+def _paper_query_haystack(paper: Dict[str, Any]) -> str:
+    raw_metadata = paper.get("metadata") or {}
+    metadata = raw_metadata if isinstance(raw_metadata, dict) else _load_json(raw_metadata, {})
+    if not isinstance(metadata, dict):
+        metadata = {}
+    pieces = [
+        paper.get("title"),
+        paper.get("abstract"),
+        paper.get("summary"),
+        paper.get("keywords"),
+        paper.get("category"),
+        paper.get("source"),
+        paper.get("subjects"),
+        paper.get("categories"),
+        metadata.get("category"),
+        metadata.get("keywords"),
+        metadata.get("subjects"),
+        metadata.get("categories"),
+    ]
+    return " ".join(
+        " ".join(_compact_list(piece, limit=12)) if isinstance(piece, (list, tuple)) else str(piece or "")
+        for piece in pieces
+    ).lower()
+
+
+def _recent_paper_context_nodes(user_id: str, question: str = "", limit: int = 8) -> List[Dict[str, Any]]:
+    try:
+        papers = db_ops.get_recent_pushes(user_id, limit=max(12, min(50, int(limit or 8) * 4))) or []
+    except Exception:
+        papers = []
+    if not papers:
+        try:
+            latest = db_ops.get_latest_push(user_id) or {}
+        except Exception:
+            latest = {}
+        papers = list(latest.get("papers") or [])[: max(12, min(50, int(limit or 8) * 4))]
+    query_tokens = _local_paper_query_tokens(question)
+    if query_tokens:
+        matched = [paper for paper in papers if isinstance(paper, dict) and any(token in _paper_query_haystack(paper) for token in query_tokens)]
+        if matched:
+            papers = matched
+
+    nodes: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+    for index, paper in enumerate(papers, start=1):
+        if not isinstance(paper, dict):
+            continue
+        title = str(paper.get("title") or "").strip()
+        if not title:
+            continue
+        arxiv_id = _paper_arxiv_id(paper)
+        key = arxiv_id or str(paper.get("doi") or paper.get("id") or title).strip()
+        node_id = f"paper:{hashlib.sha1(key.encode('utf-8')).hexdigest()[:16]}"
+        if node_id in seen:
+            continue
+        seen.add(node_id)
+        authors = _compact_list(paper.get("authors"), limit=6)
+        subjects = _compact_list(paper.get("subjects") or paper.get("categories"), limit=8)
+        abstract = str(paper.get("abstract") or paper.get("summary") or "").strip()
+        raw_metadata = paper.get("metadata") or {}
+        metadata = raw_metadata if isinstance(raw_metadata, dict) else _load_json(raw_metadata, {})
+        if not isinstance(metadata, dict):
+            metadata = {}
+        push_id = paper.get("push_id") or metadata.get("push_id")
+        rank = paper.get("rank") or metadata.get("rank")
+        score = paper.get("score") or paper.get("relevance") or metadata.get("score")
+        category = paper.get("category") or metadata.get("category")
+        body_parts = [
+            f"Recent PaperFlow pushed paper #{index}.",
+            f"Title: {title}",
+            f"Authors: {', '.join(authors)}" if authors else "",
+            f"Subjects: {', '.join(subjects)}" if subjects else "",
+            f"Category: {category}" if category else "",
+            f"Rank: {rank}" if rank else "",
+            f"Score: {score}" if score else "",
+            f"Push batch: {push_id}" if push_id else "",
+            f"Abstract: {abstract}" if abstract else "Abstract: no abstract stored; use title/category as weak evidence.",
+        ]
+        nodes.append(
+            {
+                "node_id": node_id,
+                "node_type": "paper",
+                "title": title,
+                "body": "\n".join(part for part in body_parts if part),
+                "keywords": " ".join([title, category or "", " ".join(subjects), "recent trend daily push"]).strip(),
+                "file_path": "",
+                "metadata": {
+                    "paper_id": paper.get("id"),
+                    "arxiv_id": arxiv_id,
+                    "doi": paper.get("doi"),
+                    "authors": authors,
+                    "subjects": subjects,
+                    "url": paper.get("url") or paper.get("abs_url") or "",
+                    "pdf_url": paper.get("pdf_url") or "",
+                    "push_id": push_id,
+                    "rank": rank,
+                    "score": score,
+                    "category": category,
+                    "source": "recent_daily_push",
+                },
+                "score": _to_float(score, 1.0),
+                "updated_at": paper.get("pushed_at") or paper.get("updated_at") or "",
+            }
+        )
+        if len(nodes) >= max(1, int(limit or 8)):
+            break
+    return nodes
+
+
+def _chat_pinned_nodes(
+    *,
+    user_id: str,
+    question: str,
+    resolved_nodes: List[Dict[str, Any]],
+    limit: int,
+    scope: str = "all",
+) -> List[Dict[str, Any]]:
+    pinned = list(resolved_nodes or [])
+    if _should_pin_recent_papers(question, scope):
+        seen = {str(node.get("node_id") or "") for node in pinned}
+        for node in _recent_paper_context_nodes(user_id, question=question, limit=limit):
+            node_id = str(node.get("node_id") or "")
+            if node_id and node_id not in seen:
+                pinned.append(node)
+                seen.add(node_id)
+    return pinned
+
+
 def _citation_source_payload(citation: Dict[str, Any]) -> Dict[str, Any]:
     metadata = citation.get("metadata") or {}
     node_type = str(citation.get("node_type") or "").strip()
@@ -2329,7 +2642,7 @@ def _direct_answer(question: str) -> Dict[str, Any]:
                 question,
                 system=DIRECT_ANSWER_PROMPT,
                 temperature=0.0,
-                max_tokens=700,
+                max_tokens=_direct_answer_max_tokens(),
             )
             text = response.text
         except Exception as exc:
@@ -2354,6 +2667,25 @@ def _text_chunks(text: str, size: int = 24) -> Iterator[str]:
     content = str(text or "")
     for index in range(0, len(content), max(1, int(size))):
         yield content[index : index + size]
+
+
+def _selection_required_answer(message: str) -> Dict[str, Any]:
+    return {
+        "text": message,
+        "citations": [],
+        "sources": [],
+        "elapsed_ms": 0,
+        "token_usage": {},
+        "streaming": {"provider": False, "transport": "json"},
+    }
+
+
+def _selection_required_answer_stream(message: str) -> Iterator[Dict[str, Any]]:
+    result = _selection_required_answer(message)
+    yield {"event": "meta", "data": {key: value for key, value in result.items() if key != "text"}}
+    for chunk in _text_chunks(message):
+        yield {"event": "chunk", "data": {"text": chunk}}
+    yield {"event": "done", "data": result}
 
 
 def _apply_chat_metadata(
@@ -2411,7 +2743,7 @@ def _direct_answer_stream(question: str) -> Iterator[Dict[str, Any]]:
                 question,
                 system=DIRECT_ANSWER_PROMPT,
                 temperature=0.0,
-                max_tokens=700,
+                max_tokens=_direct_answer_max_tokens(),
             ):
                 if not chunk:
                     continue
@@ -2465,6 +2797,20 @@ def wiki_ask(
         limit=6,
     )
     mode, routing_reason = _question_route(cleaned_question, normalized_scope, resolved_mentions)
+    if _comparison_needs_mentions(cleaned_question, resolved_nodes):
+        result = _selection_required_answer(
+            "请先在输入框用 @ 选择两篇具体论文，或从右侧参考文献点“查看来源”后再对比。否则本地 Wiki 无法判断你说的“这两篇”是哪两篇。"
+        )
+        _apply_chat_metadata(
+            result,
+            mode="wiki",
+            retrieval_required=True,
+            routing_reason="mention_required",
+            mentions=resolved_mentions,
+            unresolved_mentions=unresolved_mentions,
+            scope=normalized_scope,
+        )
+        return result
     if mode == "direct":
         result = _direct_answer(cleaned_question)
         result["streaming"] = {"provider": False, "transport": "json"}
@@ -2478,11 +2824,18 @@ def wiki_ask(
             scope=normalized_scope,
         )
     else:
+        pinned_nodes = _chat_pinned_nodes(
+            user_id=user_id,
+            question=cleaned_question,
+            resolved_nodes=resolved_nodes,
+            limit=safe_limit,
+            scope=normalized_scope,
+        )
         result = wiki_answer.answer_question(
             user_id,
             f"{cleaned_question}{scope_hint}",
             limit=safe_limit,
-            pinned_nodes=resolved_nodes,
+            pinned_nodes=pinned_nodes,
         )
         result["streaming"] = {"provider": False, "transport": "json"}
         _apply_chat_metadata(
@@ -2522,6 +2875,22 @@ def wiki_ask_stream(
         limit=6,
     )
     mode, routing_reason = _question_route(cleaned_question, normalized_scope, resolved_mentions)
+    if _comparison_needs_mentions(cleaned_question, resolved_nodes):
+        for event in _selection_required_answer_stream(
+            "请先在输入框用 @ 选择两篇具体论文，或从右侧参考文献点“查看来源”后再对比。否则本地 Wiki 无法判断你说的“这两篇”是哪两篇。"
+        ):
+            if event["event"] in {"meta", "done"}:
+                _apply_chat_metadata(
+                    event["data"],
+                    mode="wiki",
+                    retrieval_required=True,
+                    routing_reason="mention_required",
+                    mentions=resolved_mentions,
+                    unresolved_mentions=unresolved_mentions,
+                    scope=normalized_scope,
+                )
+            yield event
+        return
     if mode == "direct":
         for event in _direct_answer_stream(cleaned_question):
             if event["event"] in {"meta", "done"}:
@@ -2537,11 +2906,18 @@ def wiki_ask_stream(
             yield event
         return
 
+    pinned_nodes = _chat_pinned_nodes(
+        user_id=user_id,
+        question=cleaned_question,
+        resolved_nodes=resolved_nodes,
+        limit=safe_limit,
+        scope=normalized_scope,
+    )
     for event in wiki_answer.answer_question_stream(
         user_id,
         f"{cleaned_question}{scope_hint}",
         limit=safe_limit,
-        pinned_nodes=resolved_nodes,
+        pinned_nodes=pinned_nodes,
     ):
         if event["event"] in {"meta", "done"}:
             _apply_chat_metadata(

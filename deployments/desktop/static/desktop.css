@@ -1907,6 +1907,10 @@ button.result-item {
   margin-bottom: 0;
 }
 
+.answer-text strong {
+  font-weight: 700;
+}
+
 .answer-text.loading {
   color: var(--muted);
 }

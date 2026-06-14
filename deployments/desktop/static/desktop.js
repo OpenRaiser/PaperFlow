@@ -827,6 +827,7 @@
     parts.push(`批次 ${push.push_id}`);
     parts.push(push.push_time || "本地时间");
     parts.push(`${papers.length} 篇推荐`);
+    if (metadata.daily_limit) parts.push(`每日上限 ${metadata.daily_limit}`);
     if (metadata.limit_per_source) parts.push(`单源上限 ${metadata.limit_per_source}`);
     if (metadata.relevance_threshold) parts.push(`阈值 ${metadata.relevance_threshold}`);
     const sourceParts = [
@@ -2141,7 +2142,7 @@
       if (!refs.has(String(index))) return match;
       const citation = refs.get(String(index));
       return `<button type="button" class="citation-ref" data-citation-index="${index}" title="${escapeHtml(citation.title)}">[${index}]</button>`;
-    });
+    }).replace(/\*\*([^*\n]+?)\*\*/g, "<strong>$1</strong>");
     return linked
       .split(/\n{2,}/)
       .map((block) => `<p>${block.replace(/\n/g, "<br>")}</p>`)
@@ -2155,14 +2156,15 @@
       scope_recent: "最近 7 天",
       scope_profile: "当前方向",
       general_question: "通用问题",
-      no_local_context_signal: "直接回答"
+      no_local_context_signal: "直接回答",
+      mention_required: "需要选择论文"
     }[reason] || reason || "";
   }
 
   function renderAnswerMeta(data = {}, citations = []) {
     const wikiMode = data.retrieval_required !== false && data.mode !== "direct";
     const modeText = wikiMode ? `参考文献 · ${citations.length} 条` : "直接回答";
-    const route = wikiMode ? "" : routingLabel(data.routing_reason);
+    const route = wikiMode && data.routing_reason !== "mention_required" ? "" : routingLabel(data.routing_reason);
     return `
       <div class="answer-meta">
         <span class="${wikiMode ? "wiki" : "direct"}">${escapeHtml(modeText)}</span>
@@ -2966,6 +2968,8 @@
     values.HTTPS_PROXY = $("proxyInput").value;
     const data = await api("/api/settings", { method: "POST", body: JSON.stringify({ values }) });
     renderSettings(data);
+    showSettingsMessage("设置已保存。每日推荐上限、相关性阈值和代理会用于下一次论文拉取；如果当天缓存参数不同，后端会自动重新拉取。");
+    showFeedbackToast("success", "设置已保存", "新参数会用于下一次论文拉取，旧缓存参数不一致时会自动刷新。");
   }
 
   async function testProvider(kind) {
@@ -3247,6 +3251,7 @@
 
     $("refreshSettingsBtn").addEventListener("click", () => runAction(loadSettings, "加载设置"));
     $("saveSettingsBtn").addEventListener("click", () => runAction(saveSettings, "保存设置"));
+    $("saveAdvancedSettingsBtn").addEventListener("click", () => runAction(saveSettings, "保存高级参数"));
     $("testLlmBtn").addEventListener("click", () => runAction(() => testProvider("llm"), "测试 LLM"));
     $("testEmbedBtn").addEventListener("click", () => runAction(() => testProvider("embedding"), "测试 Embedding"));
     document.querySelectorAll('input[name="conferenceAccessMode"]').forEach((input) => {

@@ -411,36 +411,46 @@ def load_scoring_weights() -> Dict:
 
 def apply_relevance_threshold_override(weights: Dict) -> Dict:
     """Apply the desktop relevance slider to ranking thresholds."""
-    raw = str(os.environ.get("PAPERFLOW_RELEVANCE_THRESHOLD", "") or "").strip()
-    if not raw:
-        return weights
-    try:
-        slider_value = max(0.0, min(100.0, float(raw)))
-    except ValueError:
-        return weights
-
-    # The UI default is 60, so 60 keeps the checked-in scoring config unchanged.
-    factor = slider_value / 60.0 if slider_value else 0.0
     adjusted = dict(weights or {})
-    defaults = {
-        "threshold_high_relevant": 0.40,
-        "threshold_maybe_interested": 0.25,
-        "threshold_edge_relevant": 0.15,
-        "min_relevance_signal": 0.08,
-    }
-    caps = {
-        "threshold_high_relevant": 0.95,
-        "threshold_maybe_interested": 0.90,
-        "threshold_edge_relevant": 0.80,
-        "min_relevance_signal": 0.50,
-    }
-    for key, default in defaults.items():
+    raw = str(os.environ.get("PAPERFLOW_RELEVANCE_THRESHOLD", "") or "").strip()
+    if raw:
         try:
-            base = float(adjusted.get(key, default))
-        except (TypeError, ValueError):
-            base = default
-        adjusted[key] = max(0.0, min(caps[key], base * factor))
-    adjusted["paperflow_relevance_threshold"] = slider_value
+            slider_value = max(0.0, min(100.0, float(raw)))
+        except ValueError:
+            slider_value = None
+        if slider_value is not None:
+            # The UI default is 60, so 60 keeps the checked-in scoring config unchanged.
+            factor = slider_value / 60.0 if slider_value else 0.0
+            defaults = {
+                "threshold_high_relevant": 0.40,
+                "threshold_maybe_interested": 0.25,
+                "threshold_edge_relevant": 0.15,
+                "min_relevance_signal": 0.08,
+            }
+            caps = {
+                "threshold_high_relevant": 0.95,
+                "threshold_maybe_interested": 0.90,
+                "threshold_edge_relevant": 0.80,
+                "min_relevance_signal": 0.50,
+            }
+            for key, default in defaults.items():
+                try:
+                    base = float(adjusted.get(key, default))
+                except (TypeError, ValueError):
+                    base = default
+                adjusted[key] = max(0.0, min(caps[key], base * factor))
+            adjusted["paperflow_relevance_threshold"] = slider_value
+
+    raw_daily_limit = str(os.environ.get("PAPERFLOW_DAILY_LIMIT", "") or "").strip()
+    if raw_daily_limit:
+        try:
+            daily_limit = max(1, min(100, int(float(raw_daily_limit))))
+        except ValueError:
+            daily_limit = None
+        if daily_limit is not None:
+            adjusted["push_target_count"] = daily_limit
+            adjusted["push_max_count"] = daily_limit
+            adjusted["paperflow_daily_limit"] = daily_limit
     return adjusted
 
 
@@ -1580,6 +1590,7 @@ def daily_push(
     enable_semantic_scholar: Optional[bool] = None,
     enable_custom_rss: Optional[bool] = None,
     limit_per_source: int = DEFAULT_LIMIT_PER_SOURCE,
+    push_limit: Optional[int] = None,
     output_file: str = None,
     send_to_feishu: bool = False,
     feishu_chat_id: str = None,  # 飞书群 ID（可选，用于多角色）
@@ -1595,6 +1606,7 @@ def daily_push(
         conferences: 会议列表
         journals: 期刊列表
         limit_per_source: 每个数据源的最大论文数
+        push_limit: 最终推送推荐数量上限
         output_file: 输出文件路径（可选）
         send_to_feishu: 是否发送到飞书
         feishu_chat_id: 飞书群 ID（可选，用于多角色）
@@ -1639,6 +1651,11 @@ def daily_push(
 
     # 2. 加载权重配置
     weights = load_scoring_weights()
+    if push_limit is not None:
+        resolved_push_limit = max(1, min(100, int(push_limit)))
+        weights["push_target_count"] = resolved_push_limit
+        weights["push_max_count"] = resolved_push_limit
+        weights["paperflow_daily_limit"] = resolved_push_limit
 
     # 3. 从多个数据源抓取论文
     papers = fetch_and_process_papers(
@@ -1740,6 +1757,17 @@ def daily_push(
             metadata={
                 "paper_count": 0,
                 "total_fetched": len(papers),
+                "daily_limit": weights.get("paperflow_daily_limit"),
+                "push_target_count": weights.get("push_target_count"),
+                "push_max_count": weights.get("push_max_count"),
+                "limit_per_source": limit_per_source,
+                "relevance_threshold": weights.get("paperflow_relevance_threshold"),
+                "arxiv_categories": arxiv_categories or [],
+                "conferences": conferences or [],
+                "journals": journals or [],
+                "enable_semantic_scholar": bool(enable_semantic_scholar),
+                "enable_custom_rss": bool(enable_custom_rss),
+                "custom_rss_urls": custom_rss_urls or [],
                 "reason": "all_candidates_filtered",
                 "days": days,
                 "push_context": "daily_push",
@@ -1791,6 +1819,9 @@ def daily_push(
                     "rank": i + 1,
                     "paper_count": len(scored_papers),
                     "total_fetched": len(papers),
+                    "daily_limit": weights.get("paperflow_daily_limit"),
+                    "push_target_count": weights.get("push_target_count"),
+                    "push_max_count": weights.get("push_max_count"),
                     "limit_per_source": limit_per_source,
                     "fetch_days": days,
                     "relevance_threshold": weights.get("paperflow_relevance_threshold"),

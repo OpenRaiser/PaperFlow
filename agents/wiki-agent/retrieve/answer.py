@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import os
 import time
 from typing import Any, Dict, Iterable, Iterator, List, Optional
 
@@ -21,6 +22,28 @@ the snippets do not contain enough evidence, say that the local wiki does not
 have enough material yet. Do not expose internal section labels such as Q1/Q2
 unless the user explicitly asks for report-section structure. Use concise
 Chinese by default unless the user asks otherwise."""
+
+
+def _answer_max_tokens() -> int:
+    try:
+        value = int(str(os.environ.get("PAPERFLOW_WIKI_ANSWER_MAX_TOKENS", "1800")).strip())
+    except (TypeError, ValueError):
+        value = 1800
+    return max(512, min(4096, value))
+
+
+def _looks_incomplete_answer(text: str) -> bool:
+    content = str(text or "").strip()
+    if not content:
+        return True
+    terminal = "。！？!?.）)]】」』》\"'"
+    if content[-1] in terminal:
+        return False
+    if content.count("[") > content.count("]") or content.count("**") % 2:
+        return True
+    if len(content) < 320:
+        return True
+    return False
 
 
 def _snippet(node: Dict[str, Any], max_chars: int = 700) -> str:
@@ -175,7 +198,7 @@ def answer_question(
     llm_error = None
     response = None
     try:
-        response = llm.generate(prompt, system=SYSTEM_PROMPT, temperature=0.0, max_tokens=900)
+        response = llm.generate(prompt, system=SYSTEM_PROMPT, temperature=0.0, max_tokens=_answer_max_tokens())
         answer_text = response.text
     except Exception as exc:
         llm_error = str(exc)
@@ -219,7 +242,7 @@ def answer_question_stream(
     }
     yield {"event": "meta", "data": meta}
     try:
-        for chunk in llm.stream_generate(prompt, system=SYSTEM_PROMPT, temperature=0.0, max_tokens=900):
+        for chunk in llm.stream_generate(prompt, system=SYSTEM_PROMPT, temperature=0.0, max_tokens=_answer_max_tokens()):
             if not chunk:
                 continue
             text_parts.append(chunk)
@@ -230,10 +253,20 @@ def answer_question_stream(
         text_parts = [fallback]
         yield {"event": "chunk", "data": {"text": fallback}}
 
+    answer_text = "".join(text_parts)
+    response = None
+    if llm_error is None and _looks_incomplete_answer(answer_text):
+        try:
+            response = llm.generate(prompt, system=SYSTEM_PROMPT, temperature=0.0, max_tokens=_answer_max_tokens())
+            if response.text and len(response.text.strip()) > len(answer_text.strip()):
+                answer_text = response.text
+        except Exception as exc:
+            llm_error = f"incomplete stream fallback failed: {exc}"
+
     result = {
-        "text": "".join(text_parts),
+        "text": answer_text,
         "citations": citations,
         "elapsed_ms": int((time.time() - started) * 1000),
-        "token_usage": _token_usage(llm, None, embedding_error, llm_error),
+        "token_usage": _token_usage(llm, response, embedding_error, llm_error),
     }
     yield {"event": "done", "data": result}
