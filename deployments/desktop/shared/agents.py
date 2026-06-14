@@ -807,6 +807,16 @@ def _configured_daily_limit(value: Any = None) -> int:
     return _to_positive_int(value, 30)
 
 
+def _normalize_push_date(value: Any = None) -> str:
+    raw = str(value or "").strip()
+    if raw:
+        try:
+            return datetime.strptime(raw, "%Y-%m-%d").date().isoformat()
+        except ValueError:
+            pass
+    return datetime.now().date().isoformat()
+
+
 def _configured_report_style() -> str:
     style = (_env_text("PAPERFLOW_REPORT_STYLE", "standard") or "standard").strip().lower()
     return style if style in {"standard", "deep", "brief"} else "standard"
@@ -1323,10 +1333,53 @@ def start_daily_push_task(
     arxiv_categories: Optional[Iterable[Any]] = None,
     conferences: Optional[Iterable[Any]] = None,
     journals: Optional[Iterable[Any]] = None,
+    target_date: Optional[str] = None,
+    force_refresh: bool = False,
 ) -> Dict[str, Any]:
     cleaned_user_id = str(user_id or "").strip()
     if not cleaned_user_id:
         raise ValueError("user_id is required")
+    normalized_target_date = _normalize_push_date(target_date)
+
+    if not force_refresh:
+        cached_push = _push_payload(db_ops.get_push_for_date(cleaned_user_id, normalized_target_date))
+        if cached_push is not None:
+            metadata = dict(cached_push.get("metadata") or {})
+            metadata["cached"] = True
+            metadata["cached_for_date"] = normalized_target_date
+            cached_push["metadata"] = metadata
+            now = _task_timestamp()
+            cached_task = {
+                "task_id": f"cached_{normalized_target_date}_{cleaned_user_id}",
+                "kind": "daily_push",
+                "user_id": cleaned_user_id,
+                "status": "completed",
+                "days": max(1, int(days or 1)),
+                "limit_per_source": _configured_daily_limit(limit_per_source),
+                "arxiv_categories": cached_push.get("metadata", {}).get("arxiv_categories"),
+                "conferences": cached_push.get("metadata", {}).get("conferences"),
+                "journals": cached_push.get("metadata", {}).get("journals"),
+                "target_date": normalized_target_date,
+                "cached": True,
+                "created_at": now,
+                "updated_at": now,
+                "started_at": now,
+                "completed_at": now,
+                "error": None,
+                "result": {
+                    "success": True,
+                    "push_id": cached_push.get("push_id"),
+                    "cached": True,
+                    "target_date": normalized_target_date,
+                },
+                "push": cached_push,
+                "preview_items": [],
+                "preview_mode": "cached",
+                "progress_phase": "cached",
+                "fetched_count": cached_push.get("metadata", {}).get("total_fetched", len(cached_push.get("papers") or [])),
+                "ranked_count": cached_push.get("metadata", {}).get("paper_count", len(cached_push.get("papers") or [])),
+            }
+            return {"task": _daily_task_payload(cached_task), "already_running": False, "cached": True}
 
     with _DAILY_TASK_LOCK:
         existing_id = _DAILY_TASK_BY_USER.get(cleaned_user_id)
@@ -1351,6 +1404,7 @@ def start_daily_push_task(
             "arxiv_categories": sources["arxiv_categories"],
             "conferences": sources["conferences"],
             "journals": sources["journals"],
+            "target_date": normalized_target_date,
             "created_at": now,
             "updated_at": now,
             "started_at": None,

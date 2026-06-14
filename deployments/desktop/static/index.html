@@ -73,8 +73,8 @@
               </div>
 
               <div class="metric-strip">
-                <div><span>今日候选</span><strong id="candidateStat">-</strong><em>篇</em></div>
-                <div><span>筛选后</span><strong id="filteredStat">-</strong><em>篇</em></div>
+                <div><span>当前批次候选</span><strong id="candidateStat">-</strong><em>篇</em></div>
+                <div><span>推荐数</span><strong id="filteredStat">-</strong><em>篇</em></div>
                 <div><span>已标记精读</span><strong id="selectedStat">0</strong><em>篇</em></div>
                 <div><span>知识节点</span><strong id="wikiNodeStat">-</strong><em>个</em></div>
               </div>
@@ -203,12 +203,14 @@
                   <h3>精读 arXiv</h3>
                   <input id="directArxivId" placeholder="2606.03963 或 https://arxiv.org/abs/2606.03963">
                   <button id="readArxivBtn" class="primary" type="button">生成报告</button>
+                  <div id="directArxivStatus" class="direct-read-status" role="status" aria-live="polite" hidden></div>
                 </div>
                 <div class="direct-card">
                   <h3>精读本地 PDF</h3>
                   <input id="directPdfPath" placeholder="D:/papers/example.pdf">
                   <input id="directPdfTitle" placeholder="可选标题">
                   <button id="readPdfBtn" class="primary" type="button">生成报告</button>
+                  <div id="directPdfStatus" class="direct-read-status" role="status" aria-live="polite" hidden></div>
                 </div>
               </div>
             </article>

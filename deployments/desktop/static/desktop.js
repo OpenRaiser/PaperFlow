@@ -9,6 +9,8 @@
     selected: new Set(),
     skipped: new Set(),
     later: new Set(),
+    buttonFeedbackTimers: new WeakMap(),
+    lastActionButton: null,
     paperReports: new Map(),
     paperReading: new Set(),
     feedbackTimer: null,
@@ -375,15 +377,89 @@
     readButton.textContent = busy && generateReports ? "生成中" : "提交并精读";
   }
 
-  async function runAction(action, busyText = "处理中") {
+  function directReadElements(kind) {
+    return {
+      button: $(kind === "pdf" ? "readPdfBtn" : "readArxivBtn"),
+      status: $(kind === "pdf" ? "directPdfStatus" : "directArxivStatus")
+    };
+  }
+
+  function setDirectReadStatus(kind, type, title, detail = "") {
+    const { status } = directReadElements(kind);
+    if (!status) return;
+    status.className = `direct-read-status ${type || "success"}`;
+    status.innerHTML = `
+      <strong>${escapeHtml(title)}</strong>
+      ${detail ? `<span>${escapeHtml(detail)}</span>` : ""}
+    `;
+    status.hidden = false;
+  }
+
+  function setDirectReadBusy(kind, busy) {
+    const { button } = directReadElements(kind);
+    if (!button) return;
+    button.disabled = busy;
+    button.classList.toggle("loading", busy);
+    button.textContent = busy ? "生成中" : "生成报告";
+  }
+
+  function flashButtonFeedback(button, type = "click") {
+    if (!button || (button.disabled && type === "click")) return;
+    const previousTimer = state.buttonFeedbackTimers.get(button);
+    if (previousTimer) window.clearTimeout(previousTimer);
+    button.classList.remove("feedback-click", "feedback-success", "feedback-error");
+    button.classList.add(`feedback-${type}`);
+    const timer = window.setTimeout(() => {
+      button.classList.remove("feedback-click", "feedback-success", "feedback-error");
+      state.buttonFeedbackTimers.delete(button);
+    }, type === "click" ? 520 : 760);
+    state.buttonFeedbackTimers.set(button, timer);
+  }
+
+  function setActionButtonBusy(button, busy) {
+    if (!button) return;
+    if (busy) {
+      if (!button.dataset.wasDisabled) button.dataset.wasDisabled = button.disabled ? "true" : "false";
+      button.classList.add("is-busy");
+      button.setAttribute("aria-busy", "true");
+      button.disabled = true;
+      return;
+    }
+    button.classList.remove("is-busy");
+    button.removeAttribute("aria-busy");
+    if (button.dataset.wasDisabled) {
+      button.disabled = button.dataset.wasDisabled === "true";
+      delete button.dataset.wasDisabled;
+    }
+  }
+
+  function bindButtonFeedback() {
+    document.addEventListener("click", (event) => {
+      const button = event.target.closest("button");
+      if (!button || button.disabled) return;
+      state.lastActionButton = button;
+      flashButtonFeedback(button, "click");
+      window.setTimeout(() => {
+        if (state.lastActionButton === button) state.lastActionButton = null;
+      }, 0);
+    }, true);
+  }
+
+  async function runAction(action, busyText = "处理中", options = {}) {
+    const actionButton = options.button || state.lastActionButton;
     try {
+      setActionButtonBusy(actionButton, true);
       setStatus(busyText);
       await action();
       setStatus("就绪");
+      flashButtonFeedback(actionButton, "success");
     } catch (error) {
       setStatus("出错");
       console.error(error);
+      flashButtonFeedback(actionButton, "error");
       showFeedbackToast("error", "操作失败", error.message || String(error));
+    } finally {
+      setActionButtonBusy(actionButton, false);
     }
   }
 
@@ -744,7 +820,27 @@
     return [currentUser(), pushId || "no-push", Number(number)].join("::");
   }
 
-  function renderPush(push) {
+  function pushMetaText(push, papers, metadata = {}, options = {}) {
+    if (!push?.push_id) return "尚未加载推荐批次。";
+    const parts = [];
+    if (options.fromCache) parts.push("最近缓存批次");
+    parts.push(`批次 ${push.push_id}`);
+    parts.push(push.push_time || "本地时间");
+    parts.push(`${papers.length} 篇推荐`);
+    if (metadata.limit_per_source) parts.push(`单源上限 ${metadata.limit_per_source}`);
+    if (metadata.relevance_threshold) parts.push(`阈值 ${metadata.relevance_threshold}`);
+    const sourceParts = [
+      metadata.arxiv_categories?.length ? `arXiv ${metadata.arxiv_categories.length}` : "",
+      metadata.conferences?.length ? `会议 ${metadata.conferences.length}` : "",
+      metadata.journals?.length ? `期刊 ${metadata.journals.length}` : "",
+      metadata.enable_semantic_scholar ? "Semantic Scholar" : "",
+      metadata.enable_custom_rss ? "RSS" : ""
+    ].filter(Boolean);
+    if (sourceParts.length) parts.push(`来源 ${sourceParts.join("/")}`);
+    return parts.join(" · ");
+  }
+
+  function renderPush(push, options = {}) {
     state.push = push;
     state.selected.clear();
     state.skipped.clear();
@@ -755,9 +851,7 @@
     $("filteredStat").textContent = metadata.paper_count ?? metadata.filtered_count ?? metadata.ranked_count ?? papers.length ?? 0;
     $("latestPushStat").textContent = papers.length || "-";
     $("readingQueueStat").textContent = "0";
-    $("pushMeta").textContent = push?.push_id
-      ? `批次 ${push.push_id} · ${push.push_time || "本地时间"} · ${papers.length} 篇推荐`
-      : "尚未加载推荐批次。";
+    $("pushMeta").textContent = pushMetaText(push, papers, metadata, options);
     if (!papers.length) {
       $("paperList").className = "paper-list empty";
       $("paperList").textContent = "暂无推荐论文。";
@@ -795,7 +889,7 @@
 
   async function loadLatestPush() {
     const data = await api(`/api/latest-push?user_id=${encodeURIComponent(currentUser())}`);
-    renderPush(data.push || data.result?.push || data);
+    renderPush(data.push || data.result?.push || data, { fromCache: true });
   }
 
   async function runDaily() {
@@ -810,7 +904,7 @@
     const userId = currentUser();
     const runButton = $("runDailyBtn");
     runButton.disabled = true;
-    runButton.textContent = "后台运行中";
+    runButton.textContent = "检查当天缓存";
     const pollToken = ++state.dailyPollToken;
     try {
       const data = await api("/api/daily/start", {
@@ -818,6 +912,12 @@
         body: JSON.stringify({ user_id: userId, days, target_date: $("paperDate").value, limit_per_source: configuredDailyLimit(), ...options })
       });
       const taskId = data.task?.task_id || "";
+      if (data.cached || data.task?.status === "completed") {
+        if (data.task?.push) renderPush(data.task.push, { fromCache: Boolean(data.cached || data.task.cached) });
+        if (data.cached) showFeedbackToast("success", "已加载当天缓存", "今天已经有推荐批次，本次没有重新爬取。");
+        await loadWiki();
+        return;
+      }
       if (taskId) setDailyTaskState(taskId, userId, true);
       if (data.task) renderDailyTaskStatus(data.task);
       await pollDailyTask(taskId, data.push, userId, pollToken);
@@ -896,12 +996,28 @@
   function updateSelectionSummary() {
     $("selectedStat").textContent = state.selected.size;
     $("readingQueueStat").textContent = state.selected.size;
-    $("selectionSummary").textContent = `${state.selected.size} 篇待精读，${state.skipped.size} 篇不感兴趣，${state.later.size} 篇稍后看`;
-    document.querySelectorAll(".paper-actions button").forEach((button) => {
-      const number = Number(button.dataset.number);
-      button.classList.toggle("active", button.dataset.action === "read" && state.selected.has(number));
-      button.classList.toggle("active", button.dataset.action === "skip" && state.skipped.has(number));
-      button.classList.toggle("active", button.dataset.action === "later" && state.later.has(number));
+    $("selectionSummary").textContent = `待提交：${state.selected.size} 篇精读，${state.skipped.size} 篇不感兴趣，${state.later.size} 篇稍后看`;
+    document.querySelectorAll(".paper-card").forEach((card) => {
+      const number = Number(card.dataset.paperNumber);
+      const disposition = state.selected.has(number)
+        ? "read"
+        : state.skipped.has(number)
+          ? "skip"
+          : state.later.has(number)
+            ? "later"
+            : "";
+      if (disposition) {
+        card.dataset.disposition = disposition;
+      } else {
+        delete card.dataset.disposition;
+      }
+      card.querySelectorAll(".paper-actions button").forEach((button) => {
+        button.classList.toggle("active", button.dataset.action === disposition);
+      });
+      const skipButton = card.querySelector('.paper-actions button[data-action="skip"]');
+      const laterButton = card.querySelector('.paper-actions button[data-action="later"]');
+      if (skipButton) skipButton.textContent = disposition === "skip" ? "已不感兴趣" : "不感兴趣";
+      if (laterButton) laterButton.textContent = disposition === "later" ? "已加入稍后看" : "稍后看";
     });
     updateReadButtons();
   }
@@ -1168,23 +1284,61 @@
   }
 
   async function directRead(kind) {
+    const isPdf = kind === "pdf";
+    const sourceLabel = isPdf ? "本地 PDF" : "arXiv";
     const payload = {
       user_id: currentUser(),
-      write_feishu: kind === "pdf" ? $("directPdfWriteFeishu").checked : $("directWriteFeishu").checked
+      write_feishu: isPdf ? Boolean($("directPdfWriteFeishu")?.checked) : Boolean($("directWriteFeishu")?.checked)
     };
     let route = "/api/read/arxiv";
-    if (kind === "arxiv") {
+    if (!isPdf) {
       const raw = $("directArxivId").value.trim();
       payload.arxiv_id = raw.replace(/^https?:\/\/arxiv\.org\/abs\//, "");
+      if (!payload.arxiv_id) {
+        setDirectReadStatus("arxiv", "warning", "请先填写 arXiv ID", "支持 2606.03963 或 https://arxiv.org/abs/2606.03963。");
+        throw new Error("请先填写 arXiv ID");
+      }
     } else {
       route = "/api/read/pdf";
       payload.pdf_path = $("directPdfPath").value.trim();
       payload.title = $("directPdfTitle").value.trim();
+      if (!payload.pdf_path) {
+        setDirectReadStatus("pdf", "warning", "请先填写 PDF 路径", "请输入本机可访问的 PDF 文件路径。");
+        throw new Error("请先填写 PDF 路径");
+      }
     }
-    const data = await api(route, { method: "POST", body: JSON.stringify(payload) });
-    const doc = data.reports?.created_docs?.[0];
-    if (doc?.report_id) await openReport(doc.report_id);
-    await loadWiki();
+    setDirectReadBusy(kind, true);
+    setDirectReadStatus(
+      kind,
+      "pending",
+      `正在生成${sourceLabel}精读报告`,
+      "后端正在拉取论文信息、调用模型并写入本地报告库；完成后会自动打开报告。"
+    );
+    try {
+      const data = await api(route, { method: "POST", body: JSON.stringify(payload) });
+      const reports = data.reports || data;
+      const doc = reports?.created_docs?.[0];
+      if (!doc?.report_id) {
+        throw new Error("后端没有返回精读报告 ID，请检查模型 Provider、PDF 路径或本地报告目录。");
+      }
+      const reportTitle = doc.title || doc.paper?.title || "精读报告";
+      const reportPath = doc.report_path || "";
+      const warning = reports.feishu_warning || "";
+      setDirectReadStatus(
+        kind,
+        warning ? "warning" : "success",
+        warning ? "报告已生成，飞书同步有警告" : "报告已生成",
+        `${reportTitle}${reportPath ? ` · ${reportPath}` : ""}${warning ? ` · ${warning}` : ""}`
+      );
+      showFeedbackToast(warning ? "warning" : "success", "精读报告已生成", reportTitle);
+      await openReport(doc.report_id);
+      await loadWiki();
+    } catch (error) {
+      setDirectReadStatus(kind, "error", "报告生成失败", error.message || String(error));
+      throw error;
+    } finally {
+      setDirectReadBusy(kind, false);
+    }
   }
 
   function graphId(node) {
@@ -2098,45 +2252,60 @@
     let text = "";
     let result = {};
     let citations = [];
+    let doneReceived = false;
+
+    const processFrame = (frame) => {
+      if (!frame.trim()) return;
+      const parsed = parseSseFrame(frame);
+      if (!parsed) return;
+      if (parsed.event === "error") throw new Error(parsed.data.error || "流式问答失败");
+      if (parsed.event === "status" && !text) {
+        answerTarget.innerHTML = `<p>${escapeHtml(parsed.data.text || "正在生成回答")}</p>`;
+      }
+      if (parsed.event === "meta") {
+        result = { ...result, ...parsed.data };
+        citations = normalizeCitations(parsed.data);
+        const metaTarget = message.querySelector(".answer-meta");
+        if (metaTarget) metaTarget.outerHTML = renderAnswerMeta(parsed.data, citations);
+        renderChatSources(citations);
+      }
+      if (parsed.event === "chunk") {
+        text += parsed.data.text || "";
+        answerTarget.classList.remove("loading");
+        answerTarget.innerHTML = renderAnswerWithCitations(text, citations);
+        $("chatThread").scrollTop = $("chatThread").scrollHeight;
+      }
+      if (parsed.event === "done") {
+        doneReceived = true;
+        result = { ...result, ...parsed.data };
+        text = parsed.data.text || text;
+        citations = normalizeCitations(parsed.data);
+        const metaTarget = message.querySelector(".answer-meta");
+        if (metaTarget) metaTarget.outerHTML = renderAnswerMeta(parsed.data, citations);
+        answerTarget.classList.remove("loading");
+        answerTarget.innerHTML = renderAnswerWithCitations(text, citations);
+        renderChatSources(citations);
+      }
+    };
 
     while (true) {
       const { value, done } = await reader.read();
-      if (done) break;
+      if (done) {
+        buffer += decoder.decode();
+        break;
+      }
       buffer += decoder.decode(value, { stream: true });
       const frames = buffer.split(/\n\n/);
       buffer = frames.pop() || "";
-      for (const frame of frames) {
-        if (!frame.trim()) continue;
-        const parsed = parseSseFrame(frame);
-        if (!parsed) continue;
-        if (parsed.event === "error") throw new Error(parsed.data.error || "流式问答失败");
-        if (parsed.event === "status") {
-          answerTarget.innerHTML = `<p>${escapeHtml(parsed.data.text || "正在生成回答")}</p>`;
-        }
-        if (parsed.event === "meta") {
-          result = { ...result, ...parsed.data };
-          citations = normalizeCitations(parsed.data);
-          const metaTarget = message.querySelector(".answer-meta");
-          if (metaTarget) metaTarget.outerHTML = renderAnswerMeta(parsed.data, citations);
-          renderChatSources(citations);
-        }
-        if (parsed.event === "chunk") {
-          text += parsed.data.text || "";
-          answerTarget.classList.remove("loading");
-          answerTarget.innerHTML = renderAnswerWithCitations(text, citations);
-          $("chatThread").scrollTop = $("chatThread").scrollHeight;
-        }
-        if (parsed.event === "done") {
-          result = { ...result, ...parsed.data };
-          text = parsed.data.text || text;
-          citations = normalizeCitations(parsed.data);
-          const metaTarget = message.querySelector(".answer-meta");
-          if (metaTarget) metaTarget.outerHTML = renderAnswerMeta(parsed.data, citations);
-          answerTarget.classList.remove("loading");
-          answerTarget.innerHTML = renderAnswerWithCitations(text, citations);
-          renderChatSources(citations);
-        }
-      }
+      frames.forEach(processFrame);
+    }
+    if (buffer.trim()) {
+      processFrame(buffer);
+    }
+    if (!doneReceived) {
+      answerTarget.classList.add("loading");
+      answerTarget.innerHTML = `${text ? renderAnswerWithCitations(text, citations) : ""}<p>流式连接中断，正在切换到完整回答...</p>`;
+      throw new Error("流式回答中断，已自动切换到完整回答");
     }
     return { ...result, text, citations };
   }
@@ -2300,6 +2469,7 @@
           data = await streamWikiAsk(payload, answerTarget, message);
         } catch (streamError) {
           console.warn("Streaming Wiki ask failed, falling back to JSON.", streamError);
+          showFeedbackToast("warning", "流式输出中断", "已自动切换到完整回答。");
           data = await api("/api/wiki/ask", { method: "POST", body: JSON.stringify(payload) });
           const citations = normalizeCitations(data);
           const currentMeta = message.querySelector(".answer-meta");
@@ -2857,6 +3027,7 @@
   }
 
   function bindEvents() {
+    bindButtonFeedback();
     document.querySelectorAll(".rail-item").forEach((button) => {
       button.addEventListener("click", () => setView(button.dataset.view));
     });
@@ -2885,9 +3056,13 @@
     $("daysInput").addEventListener("change", syncDateControls);
     $("runDailyBtn").addEventListener("click", () => runAction(runDaily, "拉取论文"));
     $("sortRelevanceBtn").addEventListener("click", () => {
-      if (!state.push?.papers) return;
+      if (!state.push?.papers?.length) {
+        showFeedbackToast("warning", "暂无可排序论文", "请先拉取或加载推荐批次。");
+        return;
+      }
       state.push.papers.sort((a, b) => Number(b.score || 0) - Number(a.score || 0));
       renderPush(state.push);
+      showFeedbackToast("success", "已按相关性排序", `当前批次 ${state.push.papers.length} 篇论文已重新排列。`);
     });
     $("paperList").addEventListener("click", (event) => {
       const button = event.target.closest("[data-action]");
@@ -2902,10 +3077,20 @@
         setPaperDisposition(number, "later");
       }
     });
-    $("selectAllSourcesBtn").addEventListener("click", () => toggleAllSources(true));
-    $("clearSourcesBtn").addEventListener("click", () => toggleAllSources(false));
+    $("selectAllSourcesBtn").addEventListener("click", () => {
+      toggleAllSources(true);
+      showFeedbackToast("success", "已全选论文来源", "下次拉取论文会使用当前已勾选的来源。");
+    });
+    $("clearSourcesBtn").addEventListener("click", () => {
+      toggleAllSources(false);
+      showFeedbackToast("warning", "已清空论文来源", "请至少选择一个来源后再拉取论文。");
+    });
     document.querySelectorAll("[data-source-toggle]").forEach((button) => {
-      button.addEventListener("click", () => toggleSourceGroup(button.dataset.sourceToggle));
+      button.addEventListener("click", () => {
+        const checkedCount = toggleSourceGroup(button.dataset.sourceToggle);
+        const label = button.closest(".source-group")?.querySelector(".source-head strong")?.textContent || "来源";
+        showFeedbackToast("success", `已切换${label}`, `当前组已选择 ${checkedCount} 项。`);
+      });
     });
     $("submitFeedbackBtn").addEventListener("click", () => runAction(() => submitFeedback(false), "提交反馈"));
     $("submitAndReadBtn").addEventListener("click", () => runAction(() => submitFeedback(true), "生成报告"));
@@ -2928,13 +3113,22 @@
     ["openReportAbsBtn", "openReportPdfBtn", "openReportDocBtn"].forEach((id) => {
       $(id).addEventListener("click", () => {
         const href = $(id).dataset.href;
-        if (href) window.open(href, "_blank", "noopener");
+        if (href) {
+          window.open(href, "_blank", "noopener");
+          showFeedbackToast("success", "已打开链接", href);
+        }
       });
     });
-    $("copyReportPathBtn").addEventListener("click", async () => {
+    $("copyReportPathBtn").addEventListener("click", () => runAction(async () => {
       const path = $("copyReportPathBtn").dataset.href || "";
-      if (navigator.clipboard && path) await navigator.clipboard.writeText(path);
-    });
+      if (!path) {
+        showFeedbackToast("warning", "暂无可复制路径", "请先打开一篇精读报告。");
+        return;
+      }
+      if (!navigator.clipboard) throw new Error("当前浏览器不支持剪贴板写入。");
+      await navigator.clipboard.writeText(path);
+      showFeedbackToast("success", "已复制报告路径", path);
+    }, "复制路径"));
     $("readArxivBtn").addEventListener("click", () => runAction(() => directRead("arxiv"), "生成报告"));
     $("readPdfBtn").addEventListener("click", () => runAction(() => directRead("pdf"), "生成报告"));
 
@@ -3070,7 +3264,12 @@
     });
     $("customSourcesList").addEventListener("click", (event) => {
       const button = event.target.closest("[data-remove-source]");
-      if (button) button.closest("div")?.remove();
+      if (button) {
+        const row = button.closest("div");
+        const label = row?.querySelector("strong")?.textContent || "自定义来源";
+        row?.remove();
+        showSettingsMessage(`已移除 ${label}，请点击保存设置写入后端配置。`);
+      }
     });
     document.querySelectorAll("[data-pref-mode]").forEach((button) => {
       button.addEventListener("click", () => {
@@ -3105,6 +3304,7 @@
     inputs.forEach((input) => {
       input.checked = shouldCheck;
     });
+    return inputs.filter((input) => input.checked).length;
   }
 
   async function init() {

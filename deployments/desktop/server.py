@@ -97,6 +97,16 @@ def _optional_positive_int(value: Any) -> Optional[int]:
     return max(1, int(value))
 
 
+def _target_date_from_body(body: Dict[str, Any]) -> str:
+    raw = str(body.get("target_date") or "").strip()
+    if not raw:
+        return datetime.now().date().isoformat()
+    try:
+        return datetime.strptime(raw, "%Y-%m-%d").date().isoformat()
+    except ValueError:
+        return datetime.now().date().isoformat()
+
+
 def _api_health(_query_params: Dict[str, Any], _body: Dict[str, Any]) -> Dict[str, Any]:
     return agents.health()
 
@@ -238,6 +248,8 @@ def _api_daily_start(_query_params: Dict[str, Any], body: Dict[str, Any]) -> Dic
         arxiv_categories=body.get("arxiv_categories"),
         conferences=body.get("conferences"),
         journals=body.get("journals"),
+        target_date=_target_date_from_body(body),
+        force_refresh=bool(body.get("force_refresh")),
     )
 
 

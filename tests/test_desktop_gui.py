@@ -617,6 +617,34 @@ def test_daily_push_semantic_scholar_fetcher_uses_api_key(monkeypatch: pytest.Mo
     assert papers[0]["arxiv_id"] == "2606.00001"
 
 
+def test_latest_push_metadata_lifts_generation_settings_from_paper_rows() -> None:
+    metadata = agents.db_ops._derive_push_metadata_from_papers(  # noqa: SLF001 - persisted GUI metadata contract
+        [
+            {
+                "metadata": {
+                    "paper_count": 17,
+                    "total_fetched": 50,
+                    "limit_per_source": 17,
+                    "fetch_days": 1,
+                    "relevance_threshold": 72,
+                    "arxiv_categories": ["cs.LG"],
+                    "conferences": [],
+                    "journals": ["Nature"],
+                    "enable_semantic_scholar": True,
+                    "enable_custom_rss": True,
+                    "custom_rss_urls": ["https://example.com/feed.xml"],
+                }
+            }
+        ]
+    )
+
+    assert metadata["paper_count"] == 17
+    assert metadata["total_fetched"] == 50
+    assert metadata["limit_per_source"] == 17
+    assert metadata["relevance_threshold"] == 72
+    assert metadata["custom_rss_urls"] == ["https://example.com/feed.xml"]
+
+
 def test_desktop_source_settings_explain_conference_auth() -> None:
     html = (PROJECT_ROOT / "deployments/desktop/static/index.html").read_text(encoding="utf-8")
     script = (PROJECT_ROOT / "deployments/desktop/static/desktop.js").read_text(encoding="utf-8")
@@ -679,6 +707,31 @@ def test_desktop_reports_view_uses_compact_reading_typography() -> None:
     assert ".reader-head h2 {\n  margin: 0 0 4px;\n  font-size: 18px;" in css
     assert ".markdown-body {\n  padding: 14px 0 4px;\n  color: #25354f;\n  line-height: 1.68;\n  font-size: 13.5px;" in css
     assert ".markdown-body h1 {\n  font-size: 19px;" in css
+
+
+def test_desktop_direct_read_generation_shows_status_feedback() -> None:
+    html = (PROJECT_ROOT / "deployments/desktop/static/index.html").read_text(encoding="utf-8")
+    script = (PROJECT_ROOT / "deployments/desktop/static/desktop.js").read_text(encoding="utf-8")
+    css = (PROJECT_ROOT / "deployments/desktop/static/desktop.css").read_text(encoding="utf-8")
+
+    assert 'id="directArxivStatus"' in html
+    assert 'id="directPdfStatus"' in html
+    assert 'class="direct-read-status"' in html
+    assert "function setDirectReadStatus" in script
+    assert "function setDirectReadBusy" in script
+    assert "正在生成${sourceLabel}精读报告" in script
+    assert "后端正在拉取论文信息、调用模型并写入本地报告库" in script
+    assert "报告已生成" in script
+    assert "报告生成失败" in script
+    assert "请先填写 arXiv ID" in script
+    assert "请先填写 PDF 路径" in script
+    assert "showFeedbackToast(warning ? \"warning\" : \"success\", \"精读报告已生成\", reportTitle)" in script
+    assert "await openReport(doc.report_id)" in script
+    assert ".direct-read-status {" in css
+    assert ".direct-read-status.success" in css
+    assert ".direct-read-status.warning" in css
+    assert ".direct-read-status.error" in css
+    assert ".primary.loading" in css
 
 
 def test_desktop_user_picker_hydrates_settings_profile_form() -> None:
@@ -850,6 +903,48 @@ def test_desktop_reading_reports_forward_saved_report_style(tmp_path, monkeypatc
     assert captured["request_metadata"]["report_style"] == "brief"
 
 
+def test_desktop_direct_arxiv_read_generates_backend_report(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    report_path = tmp_path / "direct-arxiv.md"
+    report_path.write_text("# Direct arXiv Report\n", encoding="utf-8")
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        agents.db_ops,
+        "get_paper_by_arxiv_id",
+        lambda arxiv_id: {
+            "id": 7,
+            "arxiv_id": arxiv_id,
+            "title": "Direct arXiv Paper",
+            "authors": ["Alice"],
+            "abstract": "A direct read paper.",
+            "source": "arxiv",
+        },
+    )
+    monkeypatch.setattr(agents, "_backfill_docs_to_wiki", lambda user_id, docs: 1)
+
+    def fake_create_reading_report(**kwargs):
+        captured.update(kwargs)
+        return [
+            {
+                "title": "Direct arXiv Report",
+                "report_path": str(report_path),
+                "paper": kwargs["papers"][0],
+            }
+        ]
+
+    monkeypatch.setattr(agents.reading_agent, "create_reading_report", fake_create_reading_report)
+
+    result = agents.read_arxiv("user_direct", "https://arxiv.org/abs/2606.03963", write_feishu=False)
+
+    assert result["count"] == 1
+    assert result["wiki_backfilled"] == 1
+    assert result["created_docs"][0]["title"] == "Direct arXiv Report"
+    assert result["created_docs"][0]["report_id"]
+    assert captured["user_id"] == "user_direct"
+    assert captured["request_metadata"]["report_source_type"] == "desktop_arxiv"
+    assert captured["request_metadata"]["report_source_key"] == "2606.03963"
+
+
 def test_reading_report_template_changes_with_saved_style() -> None:
     report = agents.reading_agent.generate_reading_report(
         {"title": "Styled Paper", "abstract": "A structured abstract."},
@@ -906,12 +1001,63 @@ def test_desktop_paper_card_actions_are_mutually_exclusive_before_submit() -> No
     assert "setPaperDisposition(number, \"skip\")" in script
     assert "setPaperDisposition(number, \"later\")" in script
     assert "同一篇论文只能选择精读、不感兴趣、稍后看中的一种" in script
+    assert "待提交：" in script
+    assert "card.dataset.disposition = disposition" in script
+    assert "delete card.dataset.disposition" in script
+    assert '"已不感兴趣"' in script
+    assert '"已加入稍后看"' in script
     assert "selected_numbers: selectedNumbers" in script
     assert "请先选择精读论文" in script
     assert "selected_numbers: [number]" not in script
     assert 'button.dataset.action === "select"' not in script
+    assert '.paper-card[data-disposition="skip"]' in css
+    assert '.paper-card[data-disposition="later"]' in css
     assert '.paper-actions button[data-action="read"].active' in css
+    assert '.paper-actions button[data-action="skip"].active' in css
     assert '.paper-actions button[data-action="later"].active' in css
+
+
+def test_desktop_skip_and_later_feedback_submit_to_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured_events: list[tuple[int, str, str]] = []
+
+    monkeypatch.setattr(
+        agents.db_ops,
+        "get_push_papers",
+        lambda push_id: {
+            "papers": [
+                {"id": "p1", "title": "Read Paper", "category": "agent"},
+                {"id": "p2", "title": "Skip Paper", "category": "agent"},
+                {"id": "p3", "title": "Later Paper", "category": "memory"},
+            ]
+        },
+    )
+    monkeypatch.setattr(agents.feedback_agent, "get_existing_selected_numbers", lambda user_id, push_id, papers: set())
+    monkeypatch.setattr(agents.db_ops, "get_profile", lambda user_id: {"core_directions": {}})
+    monkeypatch.setattr(agents.db_ops, "get_recent_selected_papers", lambda *args, **kwargs: [])
+    monkeypatch.setattr(agents.feedback_agent, "estimate_feedback_strength_multiplier", lambda push_id, current_timestamp: (1.0, 0.0))
+    monkeypatch.setattr(agents.feedback_agent, "update_profile_based_on_selection", lambda **kwargs: {"core_directions": {"agent": 1}})
+    monkeypatch.setattr(agents.feedback_agent, "ingest_profile_drift_to_wiki", lambda **kwargs: None)
+
+    def fake_log_feedback_event(**kwargs):
+        captured_events.append((kwargs["paper_number"], kwargs["action"], kwargs["action_type"]))
+        return len(captured_events)
+
+    monkeypatch.setattr(agents, "_log_feedback_event", fake_log_feedback_event)
+
+    result = agents.submit_gui_feedback(
+        user_id="user_test",
+        push_id="push_test",
+        selected_numbers=[1],
+        skipped_numbers=[2],
+        later_numbers=[3],
+    )
+
+    assert result["selected_numbers"] == [1]
+    assert result["skipped_numbers"] == [2]
+    assert result["later_numbers"] == [3]
+    assert (1, "selected", "gui_selected") in captured_events
+    assert (2, "skipped", "gui_skipped") in captured_events
+    assert (3, "later", "gui_later") in captured_events
 
 
 def test_desktop_wiki_frontend_derives_architecture_from_backend_graph() -> None:
@@ -971,6 +1117,34 @@ def test_desktop_feedback_submit_shows_user_confirmation() -> None:
     assert "await loadWiki()" in script
 
 
+def test_desktop_buttons_have_unified_visual_feedback() -> None:
+    script = (PROJECT_ROOT / "deployments/desktop/static/desktop.js").read_text(encoding="utf-8")
+    css = (PROJECT_ROOT / "deployments/desktop/static/desktop.css").read_text(encoding="utf-8")
+
+    assert "buttonFeedbackTimers: new WeakMap()" in script
+    assert "lastActionButton: null" in script
+    assert "function flashButtonFeedback" in script
+    assert "function setActionButtonBusy" in script
+    assert "function bindButtonFeedback" in script
+    assert "document.addEventListener(\"click\"" in script
+    assert "state.lastActionButton = button" in script
+    assert "setActionButtonBusy(actionButton, true)" in script
+    assert "flashButtonFeedback(actionButton, \"success\")" in script
+    assert "flashButtonFeedback(actionButton, \"error\")" in script
+    assert "bindButtonFeedback();" in script
+    assert "已全选论文来源" in script
+    assert "已清空论文来源" in script
+    assert "已复制报告路径" in script
+    assert "已打开链接" in script
+    assert "已移除" in script
+    assert "button.feedback-click::after" in css
+    assert "button.feedback-success::after" in css
+    assert "button.feedback-error::after" in css
+    assert "button.is-busy" in css
+    assert "@keyframes button-feedback-flash" in css
+    assert "@keyframes button-busy-spin" in css
+
+
 def test_desktop_paper_date_and_metrics_sync_with_backend() -> None:
     script = (PROJECT_ROOT / "deployments/desktop/static/desktop.js").read_text(encoding="utf-8")
     html = (PROJECT_ROOT / "deployments/desktop/static/index.html").read_text(encoding="utf-8")
@@ -978,6 +1152,9 @@ def test_desktop_paper_date_and_metrics_sync_with_backend() -> None:
 
     assert '<strong id="candidateStat">-</strong>' in html
     assert '<strong id="filteredStat">-</strong>' in html
+    assert "当前批次候选" in html
+    assert "推荐数" in html
+    assert "今日候选" not in html
     assert 'id="cacheSizeStat"' in html
     assert "2.8GB" not in html
     assert "cache_display" in script
@@ -992,6 +1169,11 @@ def test_desktop_paper_date_and_metrics_sync_with_backend() -> None:
     assert "/api/daily/status?task_id=" in script
     assert "/api/daily/status?user_id=" in script
     assert "pollDailyTask(taskId, data.push, userId, pollToken)" in script
+    assert "检查当天缓存" in script
+    assert "已加载当天缓存" in script
+    assert "本次没有重新爬取" in script
+    assert 'if (data.cached || data.task?.status === "completed")' in script
+    assert "fromCache: Boolean(data.cached || data.task.cached)" in script
     assert "while (pollToken === state.dailyPollToken)" in script
     assert "for (let attempt = 0; attempt < 80" not in script
     assert "function setDailyTaskState(" in script
@@ -1001,6 +1183,9 @@ def test_desktop_paper_date_and_metrics_sync_with_backend() -> None:
     assert "state.dailyPollToken += 1" in script
     assert "metadata.total_fetched ?? metadata.fetched_count ?? papers.length ?? 0" in script
     assert "metadata.paper_count ?? metadata.filtered_count ?? metadata.ranked_count ?? papers.length ?? 0" in script
+    assert "function pushMetaText(" in script
+    assert "最近缓存批次" in script
+    assert "单源上限" in script
     assert 'task.status === "completed"' in script
     assert "renderPush(task.push || task.preview_push" not in script
     assert "后台仍在拉取和排序论文" in script
@@ -1050,6 +1235,13 @@ def test_desktop_wiki_chat_supports_clickable_citations_streaming_and_mentions()
     assert "/api/wiki/ask/stream" in script
     assert "streamWikiAsk(payload, answerTarget, message)" in script
     assert "renderAnswerWithCitations" in script
+    assert "let doneReceived = false" in script
+    assert "doneReceived = true" in script
+    assert "if (!doneReceived)" in script
+    assert "流式连接中断，正在切换到完整回答" in script
+    assert "流式回答中断，已自动切换到完整回答" in script
+    assert "流式输出中断" in script
+    assert "已自动切换到完整回答" in script
     assert "class=\"citation-ref\"" in script
     assert "data-citation-index" in script
     assert "focusCitationSource" in script
@@ -1173,6 +1365,34 @@ def test_desktop_daily_push_task_completes(monkeypatch: pytest.MonkeyPatch) -> N
     assert task is not None
     assert task["status"] == "completed"
     assert task["push"]["push_id"] == "push_task_complete"
+
+
+def test_desktop_daily_push_task_reuses_cached_target_date(monkeypatch: pytest.MonkeyPatch) -> None:
+    cached_push = {
+        "push_id": "push_cached_today",
+        "push_time": "2026-06-14 08:00:00",
+        "papers": [{"id": 1, "title": "Cached Paper"}],
+        "metadata": {"paper_count": 1, "total_fetched": 8, "limit_per_source": 30},
+    }
+
+    monkeypatch.setattr(agents.db_ops, "get_push_for_date", lambda user_id, target_date: cached_push)
+    monkeypatch.setattr(
+        agents,
+        "run_daily_push",
+        lambda *args, **kwargs: pytest.fail("cached daily push should not recrawl"),
+    )
+
+    started = agents.start_daily_push_task(
+        "user_task_cached",
+        days=1,
+        target_date="2026-06-14",
+    )
+
+    assert started["cached"] is True
+    assert started["task"]["status"] == "completed"
+    assert started["task"]["cached"] is True
+    assert started["task"]["push"]["push_id"] == "push_cached_today"
+    assert started["task"]["push"]["metadata"]["cached_for_date"] == "2026-06-14"
 
 
 def test_desktop_daily_push_task_reuses_running_user_task(monkeypatch: pytest.MonkeyPatch) -> None:

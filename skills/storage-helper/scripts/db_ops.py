@@ -117,6 +117,17 @@ def _derive_push_metadata_from_papers(papers: List[Dict[str, Any]]) -> Dict[str,
         "fallback_kept_candidates",
         "fallback_relaxed",
         "fallback_source_scope",
+        "paper_count",
+        "total_fetched",
+        "limit_per_source",
+        "fetch_days",
+        "relevance_threshold",
+        "arxiv_categories",
+        "conferences",
+        "journals",
+        "enable_semantic_scholar",
+        "enable_custom_rss",
+        "custom_rss_urls",
     ):
         if key in metadata:
             push_metadata[key] = metadata[key]
@@ -1031,6 +1042,83 @@ def get_latest_push(user_id: str) -> Optional[Dict]:
     push_metadata = _load_json_metadata(metadata_row["metadata"]) if metadata_row else {}
     if not push_metadata:
         push_metadata = _derive_push_metadata_from_papers(papers)
+
+    conn.close()
+
+    return {
+        "push_id": push_id,
+        "push_time": push_time,
+        "papers": papers,
+        "metadata": push_metadata,
+    }
+
+
+def get_push_for_date(user_id: str, target_date: str) -> Optional[Dict]:
+    """
+    Get the latest real push for a user on a specific local date.
+
+    Args:
+        user_id: User ID
+        target_date: YYYY-MM-DD date string
+
+    Returns:
+        Push information with papers list, or None when no push exists that day
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        SELECT push_id, MAX(timestamp) as timestamp
+        FROM behavior_logs
+        WHERE user_id = ?
+          AND action IN ('pushed', 'push_empty')
+          AND date(timestamp) = ?
+        GROUP BY push_id
+        ORDER BY timestamp DESC, push_id DESC
+        LIMIT 1
+        """,
+        (user_id, target_date),
+    )
+
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        return None
+
+    push_id = row["push_id"]
+    push_time = row["timestamp"]
+
+    cursor.execute(
+        """
+        SELECT p.*, bl.id as behavior_log_id, bl.metadata as bl_metadata FROM papers p
+        JOIN behavior_logs bl ON p.id = bl.paper_id
+        WHERE bl.user_id = ? AND bl.push_id = ? AND bl.action = 'pushed'
+        ORDER BY bl.id ASC
+        """,
+        (user_id, push_id),
+    )
+
+    papers = [_build_paper_dict(row, metadata_key="bl_metadata") for row in cursor.fetchall()]
+    papers.sort(key=lambda paper: (paper.get("rank", 10**9), paper.get("behavior_log_id", 10**9)))
+
+    cursor.execute(
+        """
+        SELECT metadata
+        FROM behavior_logs
+        WHERE user_id = ?
+          AND push_id = ?
+          AND action = 'push_empty'
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (user_id, push_id),
+    )
+    metadata_row = cursor.fetchone()
+    push_metadata = _load_json_metadata(metadata_row["metadata"]) if metadata_row else {}
+    if not push_metadata:
+        push_metadata = _derive_push_metadata_from_papers(papers)
+    push_metadata["cached_for_date"] = target_date
 
     conn.close()
 
