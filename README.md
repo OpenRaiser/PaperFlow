@@ -67,15 +67,7 @@ mock: paper pulls, feedback, reading reports, Wiki graph updates, and settings
 all route through the local backend.
 
 <div align="center">
-  <a href="docs/assets/readme/paperflow-desktop-demo.mp4">
-    <img src="docs/assets/readme/paperflow-desktop-demo.gif" alt="PaperFlow offline desktop workflow demo" width="92%">
-  </a>
-  <br>
-  <sub>
-    Desktop demo: daily paper stream -> Wiki graph -> cited Q&A -> reading reports -> local settings.
-    <br>
-    <a href="docs/assets/readme/paperflow-desktop-demo.mp4">Watch / download MP4</a>
-  </sub>
+  <img src="docs/assets/readme/paperflow-desktop-demo.gif" alt="PaperFlow offline desktop workflow demo" width="92%">
 </div>
 
 <br>
