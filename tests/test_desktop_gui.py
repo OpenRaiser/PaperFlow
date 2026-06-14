@@ -2177,7 +2177,12 @@ def test_reading_report_writes_obsidian_deep_reading_and_daily_note(
         reading_agent._save_reading_report_markdown(  # noqa: SLF001 - storage contract
             user_id="cheng tan",
             paper=paper,
-            report_content="# Generative AI in K-12 Classrooms\n\n## 一句话总结\n\n测试报告。",
+            report_content=(
+                "# Generative AI in K-12 Classrooms\n\n"
+                "Q6: 总结一下论文的主要内容\n\n"
+                "这篇论文系统总结了生成式 AI 在 K-12 课堂中的使用方式、教师采用模式和早期学业信号。\n\n"
+                "## 基本信息\n\n测试报告。"
+            ),
             report_payload=payload,
         )
     )
@@ -2201,5 +2206,16 @@ def test_reading_report_writes_obsidian_deep_reading_and_daily_note(
     daily_text = daily_note.read_text(encoding="utf-8")
     assert "# AI for Education" in daily_text
     assert "[[Deep Reading - May 2026/Generative AI in K-12 Classrooms" in daily_text
+    assert "这篇论文系统总结了生成式 AI 在 K-12 课堂中的使用方式" in daily_text
+    assert "生成式人工智能在K-12教育场景中的实际应用模式与早期学业信号" not in daily_text
     assert "https://arxiv.org/pdf/2605.16277" in daily_text
     assert "[[Daily Note - May 2026]]" in toc.read_text(encoding="utf-8")
+
+
+def test_obsidian_daily_note_category_uses_word_boundaries() -> None:
+    category = reading_agent._daily_note_category(  # noqa: SLF001 - category contract
+        {"title": "Dense Supervision, Sparse Updates: On the Sparsity and Geometry of On-Policy Distillation"},
+        {},
+    )
+
+    assert category == "Machine Learning"

@@ -1838,17 +1838,21 @@ def _daily_note_category(paper: Dict[str, Any], report_payload: Dict[str, Any]) 
     for value in report_payload.get("keywords") or []:
         values.append(_clean_text(value))
     text = " ".join(value for value in values if value).lower()
-    if any(term in text for term in ("education", "classroom", "student", "teacher", "learning path", "k-12", "school")):
+
+    def has_any(terms: Tuple[str, ...]) -> bool:
+        return any(re.search(rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])", text) for term in terms)
+
+    if has_any(("education", "classroom", "k-12", "school", "curriculum", "pedagogy")):
         return "AI for Education"
-    if any(term in text for term in ("protein", "molecular", "molecule", "biology", "bio", "chemistry", "materials science", "scientific discovery", "ai for science")):
+    if has_any(("protein", "molecular", "molecule", "biology", "bio", "chemistry", "materials science", "scientific discovery", "ai for science")):
         return "AI for Science"
-    if any(term in text for term in ("agent", "multi-agent", "tool", "orchestration")):
+    if has_any(("agent", "agents", "multi-agent", "tool", "orchestration")):
         return "AI Agents"
-    if any(term in text for term in ("vision", "image", "video", "3d", "segmentation")):
+    if has_any(("vision", "image", "video", "3d", "segmentation")):
         return "Computer Vision"
-    if any(term in text for term in ("language", "llm", "nlp", "retrieval", "rag", "reasoning")):
+    if has_any(("language", "llm", "nlp", "retrieval", "rag", "reasoning")):
         return "Language Models"
-    if any(term in text for term in ("reinforcement", "diffusion", "learning", "optimization")):
+    if has_any(("reinforcement", "diffusion", "learning", "optimization", "distillation", "post-training", "on-policy")):
         return "Machine Learning"
     return "AI Research"
 
@@ -1858,6 +1862,7 @@ def _daily_note_entry(
     paper: Dict[str, Any],
     report_payload: Dict[str, Any],
     report_path: Path,
+    report_content: str,
 ) -> str:
     title = _clean_text(paper.get("title")) or report_path.stem
     marker_key = _clean_text(paper.get("arxiv_id") or paper.get("doi") or title)
@@ -1865,7 +1870,9 @@ def _daily_note_entry(
     note_link = _obsidian_note_link(report_path)
     pdf_url = _clean_text(paper.get("pdf_url")) or _get_direct_pdf_url(paper)
     summary = _clean_text(
-        report_payload.get("one_sentence_summary")
+        _extract_report_answer(report_content, "总结一下论文的主要内容")
+        or report_payload.get("paper_summary")
+        or report_payload.get("one_sentence_summary")
         or report_payload.get("clean_abstract_summary")
         or paper.get("abstract")
     )
@@ -1885,22 +1892,76 @@ def _daily_note_entry(
     return "\n".join(lines).rstrip() + "\n"
 
 
+def _extract_report_answer(report_content: str, question: str) -> str:
+    text = str(report_content or "")
+    if not text.strip():
+        return ""
+    escaped = re.escape(question)
+    pattern = re.compile(
+        rf"(?:^|\n)(?:#+\s*)?Q\d+\s*[:：]\s*{escaped}\s*\n+(.*?)(?=\n(?:#+\s*)?Q\d+\s*[:：]|\n##\s+|$)",
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    match = pattern.search(text)
+    if not match:
+        return ""
+    answer = match.group(1).strip()
+    answer = re.sub(r"\n{3,}", "\n\n", answer)
+    return answer
+
+
+def _remove_daily_note_entry(current: str, marker: str) -> Optional[str]:
+    marker_index = current.find(marker)
+    if marker_index < 0:
+        return None
+    next_marker = current.find("\n<!-- paperflow:", marker_index + len(marker))
+    next_section = current.find("\n# ", marker_index + len(marker))
+    candidates = [index for index in (next_marker, next_section) if index >= 0]
+    end_index = min(candidates) if candidates else len(current)
+    return current[:marker_index].rstrip() + "\n\n" + current[end_index:].lstrip("\n")
+
+
+def _prune_empty_daily_note_sections(text: str) -> str:
+    lines = text.splitlines()
+    output: List[str] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        if line.startswith("# "):
+            next_index = index + 1
+            while next_index < len(lines) and not lines[next_index].startswith("# "):
+                next_index += 1
+            section_body = "\n".join(lines[index + 1 : next_index]).strip()
+            if not section_body:
+                index = next_index
+                continue
+        output.append(line)
+        index += 1
+    return "\n".join(output).strip()
+
+
 def _sync_obsidian_daily_note(
     *,
     paper: Dict[str, Any],
     report_payload: Dict[str, Any],
     report_path: Path,
+    report_content: str,
 ) -> Optional[str]:
     daily_note = _obsidian_daily_note_path(report_path, paper)
     if daily_note is None:
         return None
     daily_note.parent.mkdir(parents=True, exist_ok=True)
     category = _daily_note_category(paper, report_payload)
-    entry = _daily_note_entry(paper=paper, report_payload=report_payload, report_path=report_path)
+    entry = _daily_note_entry(
+        paper=paper,
+        report_payload=report_payload,
+        report_path=report_path,
+        report_content=report_content,
+    )
     marker = entry.splitlines()[0]
     current = daily_note.read_text(encoding="utf-8") if daily_note.exists() else ""
     if marker in current:
-        return str(daily_note)
+        current = _remove_daily_note_entry(current, marker) or current
+        current = _prune_empty_daily_note_sections(current)
     section_heading = f"# {category}"
     if section_heading not in current:
         current = current.rstrip() + ("\n\n" if current.strip() else "") + section_heading + "\n"
@@ -1989,6 +2050,7 @@ def _save_reading_report_markdown(
         paper=paper,
         report_payload=report_payload,
         report_path=report_path,
+        report_content=report_content,
     )
     if daily_note_written:
         print(f"  Updated Daily Note: {daily_note_written}")
