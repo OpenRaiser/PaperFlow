@@ -140,6 +140,10 @@ def _resolve_configured_dir(
             category=category,
             project_root=PROJECT_ROOT,
         )
+    obsidian_dir = _obsidian_month_dir(base_dir, paper or {}, category)
+    if obsidian_dir is not None:
+        obsidian_dir.mkdir(parents=True, exist_ok=True)
+        return obsidian_dir.resolve()
     if _env_flag("PAPERFLOW_STORAGE_MONTHLY_SUBDIR", default=True):
         base_dir = base_dir / _month_folder_name(paper or {})
     base_dir.mkdir(parents=True, exist_ok=True)
@@ -169,6 +173,50 @@ def _month_folder_name(paper: Dict[str, Any]) -> str:
     return f"arXiv - {MONTH_LABELS.get(date.month, date.strftime('%b'))} {date.year}"
 
 
+def _daily_note_folder_name(paper: Dict[str, Any]) -> str:
+    date = _parse_publish_month(paper)
+    return f"Daily Note {date.year}"
+
+
+def _daily_note_file_name(paper: Dict[str, Any]) -> str:
+    date = _parse_publish_month(paper)
+    return f"Daily Note - {MONTH_LABELS.get(date.month, date.strftime('%b'))} {date.year}.md"
+
+
+def _deep_reading_folder_name(paper: Dict[str, Any]) -> str:
+    date = _parse_publish_month(paper)
+    return f"Deep Reading - {MONTH_LABELS.get(date.month, date.strftime('%b'))} {date.year}"
+
+
+def _looks_like_obsidian_daily_root(path: Path) -> bool:
+    name = path.name
+    if name == "Daily Note":
+        return True
+    if re.fullmatch(r"Daily Note 20\d{2}", name):
+        return True
+    return any(path.glob("Daily Note 20[0-9][0-9]")) or any(path.glob("Daily Note - * 20[0-9][0-9].md"))
+
+
+def _obsidian_year_dir(base_dir: Path, paper: Dict[str, Any]) -> Optional[Path]:
+    if not _looks_like_obsidian_daily_root(base_dir):
+        return None
+    year_dir_name = _daily_note_folder_name(paper)
+    if re.fullmatch(r"Daily Note 20\d{2}", base_dir.name):
+        return base_dir
+    return base_dir / year_dir_name
+
+
+def _obsidian_month_dir(base_dir: Path, paper: Dict[str, Any], kind: str) -> Optional[Path]:
+    year_dir = _obsidian_year_dir(base_dir, paper)
+    if year_dir is None:
+        return None
+    if kind == "pdf":
+        return year_dir / _month_folder_name(paper)
+    if kind == "reading_reports":
+        return year_dir / _deep_reading_folder_name(paper)
+    return None
+
+
 def _safe_filename(value: Any, *, max_len: int = 120) -> str:
     text = _clean_text(value)
     text = re.sub(r"[\\/:*?\"<>|]+", "-", text)
@@ -189,6 +237,13 @@ def _paper_file_stem(paper: Dict[str, Any]) -> str:
         return _safe_filename(title)
     paper_id = _clean_text(paper.get("id"))
     return _safe_filename(paper_id or "paper")
+
+
+def _paper_title_file_stem(paper: Dict[str, Any], *, max_len: int = 96) -> str:
+    title = _clean_text(paper.get("title"))
+    if title:
+        return _safe_filename(title, max_len=max_len)
+    return _paper_file_stem(paper)
 
 
 def _wiki_ingest_enabled() -> bool:
@@ -1757,6 +1812,124 @@ def _persist_pdf_file(
     return str(target_path)
 
 
+def _obsidian_daily_note_path(report_path: Path, paper: Dict[str, Any]) -> Optional[Path]:
+    deep_dir = report_path.parent
+    year_dir = deep_dir.parent
+    if not deep_dir.name.startswith("Deep Reading - ") or not re.fullmatch(r"Daily Note 20\d{2}", year_dir.name):
+        return None
+    return year_dir / _daily_note_file_name(paper)
+
+
+def _obsidian_note_link(report_path: Path) -> str:
+    year_dir = report_path.parent.parent
+    try:
+        relative = report_path.relative_to(year_dir).with_suffix("")
+    except ValueError:
+        relative = report_path.with_suffix("")
+    return str(relative).replace(os.sep, "/")
+
+
+def _daily_note_category(paper: Dict[str, Any], report_payload: Dict[str, Any]) -> str:
+    values: List[str] = []
+    for key in ("title", "abstract", "summary", "venue", "source"):
+        values.append(_clean_text(paper.get(key)))
+    for value in paper.get("subjects") or paper.get("categories") or []:
+        values.append(_clean_text(value))
+    for value in report_payload.get("keywords") or []:
+        values.append(_clean_text(value))
+    text = " ".join(value for value in values if value).lower()
+    if any(term in text for term in ("education", "classroom", "student", "teacher", "learning path", "k-12", "school")):
+        return "AI for Education"
+    if any(term in text for term in ("protein", "molecular", "molecule", "biology", "bio", "chemistry", "materials science", "scientific discovery", "ai for science")):
+        return "AI for Science"
+    if any(term in text for term in ("agent", "multi-agent", "tool", "orchestration")):
+        return "AI Agents"
+    if any(term in text for term in ("vision", "image", "video", "3d", "segmentation")):
+        return "Computer Vision"
+    if any(term in text for term in ("language", "llm", "nlp", "retrieval", "rag", "reasoning")):
+        return "Language Models"
+    if any(term in text for term in ("reinforcement", "diffusion", "learning", "optimization")):
+        return "Machine Learning"
+    return "AI Research"
+
+
+def _daily_note_entry(
+    *,
+    paper: Dict[str, Any],
+    report_payload: Dict[str, Any],
+    report_path: Path,
+) -> str:
+    title = _clean_text(paper.get("title")) or report_path.stem
+    marker_key = _clean_text(paper.get("arxiv_id") or paper.get("doi") or title)
+    marker = f"<!-- paperflow:{hashlib.sha1(marker_key.encode('utf-8')).hexdigest()[:16]} -->"
+    note_link = _obsidian_note_link(report_path)
+    pdf_url = _clean_text(paper.get("pdf_url")) or _get_direct_pdf_url(paper)
+    summary = _clean_text(
+        report_payload.get("one_sentence_summary")
+        or report_payload.get("clean_abstract_summary")
+        or paper.get("abstract")
+    )
+    if len(summary) > 900:
+        summary = summary[:900].rstrip() + "..."
+    star = "⭐" if str(report_payload.get("recommendation_label") or "").lower() in {"highly_recommended", "must_read", "high_match"} else ""
+    lines = [
+        marker,
+        f"## {star}{title}".rstrip(),
+        "",
+        f"[[{note_link}|Deep Reading]]",
+    ]
+    if pdf_url:
+        lines.extend(["", f"[{pdf_url}]({pdf_url})"])
+    if summary:
+        lines.extend(["", f"- **{summary}**"])
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _sync_obsidian_daily_note(
+    *,
+    paper: Dict[str, Any],
+    report_payload: Dict[str, Any],
+    report_path: Path,
+) -> Optional[str]:
+    daily_note = _obsidian_daily_note_path(report_path, paper)
+    if daily_note is None:
+        return None
+    daily_note.parent.mkdir(parents=True, exist_ok=True)
+    category = _daily_note_category(paper, report_payload)
+    entry = _daily_note_entry(paper=paper, report_payload=report_payload, report_path=report_path)
+    marker = entry.splitlines()[0]
+    current = daily_note.read_text(encoding="utf-8") if daily_note.exists() else ""
+    if marker in current:
+        return str(daily_note)
+    section_heading = f"# {category}"
+    if section_heading not in current:
+        current = current.rstrip() + ("\n\n" if current.strip() else "") + section_heading + "\n"
+    insert_at = current.find(section_heading) + len(section_heading)
+    next_section = current.find("\n# ", insert_at)
+    if next_section == -1:
+        updated = current.rstrip() + "\n\n" + entry
+    else:
+        updated = current[:next_section].rstrip() + "\n\n" + entry + "\n" + current[next_section:].lstrip("\n")
+    daily_note.write_text(updated.rstrip() + "\n", encoding="utf-8")
+    _sync_obsidian_toc(daily_note)
+    return str(daily_note)
+
+
+def _sync_obsidian_toc(daily_note: Path) -> None:
+    year_dir = daily_note.parent
+    match = re.fullmatch(r"Daily Note - ([A-Za-z]+) (20\d{2})\.md", daily_note.name)
+    if not match:
+        return
+    month_label, year = match.groups()
+    toc = year_dir / f"Table of Content - {year}.md"
+    link_name = daily_note.stem
+    entry = f"# {link_name}\n[[{link_name}]]"
+    current = toc.read_text(encoding="utf-8") if toc.exists() else ""
+    if f"[[{link_name}]]" in current:
+        return
+    toc.write_text(current.rstrip() + ("\n" if current.strip() else "") + entry + "\n", encoding="utf-8")
+
+
 def _save_reading_report_markdown(
     *,
     user_id: str,
@@ -1773,7 +1946,13 @@ def _save_reading_report_markdown(
         user_id=user_id,
         category="reading_reports",
     )
-    report_path = target_dir / f"{_paper_file_stem(paper)} - reading-report.md"
+    obsidian_report = target_dir.name.startswith("Deep Reading - ")
+    report_path = target_dir / (
+        f"{_paper_title_file_stem(paper)}.md"
+        if obsidian_report
+        else f"{_paper_file_stem(paper)} - reading-report.md"
+    )
+    daily_note_path = _obsidian_daily_note_path(report_path, paper) if obsidian_report else None
     metadata = {
         "user_id": user_id,
         "paper_id": paper.get("id"),
@@ -1788,6 +1967,7 @@ def _save_reading_report_markdown(
         "generation_provider": report_payload.get("generation_provider"),
         "generation_model": report_payload.get("generation_model"),
         "report_version": READING_REPORT_OUTPUT_VERSION,
+        "daily_note_path": str(daily_note_path) if daily_note_path else None,
         "saved_at": datetime.now().isoformat(timespec="seconds"),
     }
     frontmatter = ["---"]
@@ -1795,7 +1975,23 @@ def _save_reading_report_markdown(
         if value not in (None, "", [], {}):
             frontmatter.append(f"{key}: {json.dumps(value, ensure_ascii=False)}")
     frontmatter.extend(["---", ""])
-    report_path.write_text("\n".join(frontmatter) + report_content.strip() + "\n", encoding="utf-8")
+    obsidian_header = ""
+    if obsidian_report and daily_note_path:
+        daily_note_link = daily_note_path.with_suffix("").name
+        pdf_url = _clean_text(paper.get("pdf_url")) or _get_direct_pdf_url(paper)
+        pdf_line = f"- PDF：[{pdf_url}]({pdf_url})\n" if pdf_url else ""
+        obsidian_header = f"[[{daily_note_link}]]\n\n{pdf_line}\n"
+    report_path.write_text(
+        "\n".join(frontmatter) + obsidian_header + report_content.strip() + "\n",
+        encoding="utf-8",
+    )
+    daily_note_written = _sync_obsidian_daily_note(
+        paper=paper,
+        report_payload=report_payload,
+        report_path=report_path,
+    )
+    if daily_note_written:
+        print(f"  Updated Daily Note: {daily_note_written}")
     print(f"  Saved reading markdown: {report_path}")
     return str(report_path)
 
@@ -1891,6 +2087,41 @@ def enrich_paper_for_reading_report(
     )
     if pdf_url and not should_parse_pdf:
         print(f"  Skipping PDF enrichment ({skip_reason})")
+        if _env_flag("PAPERFLOW_SAVE_PDF_WITHOUT_ENRICHMENT", default=True):
+            download_candidates = _build_pdf_download_candidates(enriched, pdf_url) or [pdf_url]
+            stored_pdf_path: Optional[str] = None
+            try:
+                for download_candidate in download_candidates:
+                    try:
+                        download_referer = _pick_download_referer(enriched, download_candidate)
+                        print(f"  Downloading PDF for storage: {download_candidate[:120]}")
+                        temp_pdf_path = _download_pdf(
+                            download_candidate,
+                            enriched.get("title", "paper"),
+                            referer=download_referer,
+                        )
+                        enriched["pdf_url"] = download_candidate
+                        stored_pdf_path = _persist_pdf_file(
+                            temp_pdf_path,
+                            enriched,
+                            download_candidate,
+                            user_id=user_id,
+                        )
+                        if stored_pdf_path:
+                            enriched["pdf_path"] = stored_pdf_path
+                        break
+                    except Exception as exc:
+                        pdf_error = str(exc)
+                        print(f"  PDF storage download failed ({download_candidate[:120]}): {exc}")
+                        continue
+            finally:
+                if temp_pdf_path:
+                    try:
+                        temp_path = Path(temp_pdf_path)
+                        if not stored_pdf_path or temp_path.resolve() != Path(stored_pdf_path).resolve():
+                            temp_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
 
     if pdf_url and should_parse_pdf:
         download_candidates = _build_pdf_download_candidates(enriched, pdf_url) or [pdf_url]

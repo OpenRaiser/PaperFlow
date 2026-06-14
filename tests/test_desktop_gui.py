@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
+import importlib
 from datetime import timedelta
 from pathlib import Path
 
@@ -9,6 +10,8 @@ import pytest
 
 from deployments.desktop import server
 from deployments.desktop.shared import agents
+
+reading_agent = importlib.import_module("agents.reading-agent.main")
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -2144,3 +2147,59 @@ def test_desktop_reports_payload_warns_on_feishu_failure() -> None:
     assert payload["write_feishu_requested"] is True
     assert "飞书文档发送失败" in payload["feishu_warning"]
     assert payload["created_docs"][0]["feishu_error"] == "missing feishu config"
+
+
+def test_reading_report_writes_obsidian_deep_reading_and_daily_note(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    daily_root = tmp_path / "Daily Note"
+    monkeypatch.setenv("PAPERFLOW_READING_REPORTS_DIR", str(daily_root))
+    monkeypatch.setenv("PAPERFLOW_PDF_DIR", str(daily_root))
+
+    paper = {
+        "id": 1,
+        "title": "Generative AI in K-12 Classrooms: A Midyear Implementation Report",
+        "arxiv_id": "2605.16277",
+        "publish_date": "2026-05-20",
+        "pdf_url": "https://arxiv.org/pdf/2605.16277",
+        "subjects": ["cs.AI"],
+        "abstract": "This paper studies generative AI in classrooms with teachers and students.",
+    }
+    payload = {
+        "one_sentence_summary": "生成式人工智能在K-12教育场景中的实际应用模式与早期学业信号。",
+        "keywords": ["education", "classroom"],
+        "generation_provider": "heuristic",
+        "generation_model": "test",
+        "recommendation_label": "high_match",
+    }
+
+    report_path = Path(
+        reading_agent._save_reading_report_markdown(  # noqa: SLF001 - storage contract
+            user_id="cheng tan",
+            paper=paper,
+            report_content="# Generative AI in K-12 Classrooms\n\n## 一句话总结\n\n测试报告。",
+            report_payload=payload,
+        )
+    )
+
+    expected_dir = daily_root / "Daily Note 2026" / "Deep Reading - May 2026"
+    daily_note = daily_root / "Daily Note 2026" / "Daily Note - May 2026.md"
+    toc = daily_root / "Daily Note 2026" / "Table of Content - 2026.md"
+    pdf_dir = reading_agent._resolve_configured_dir(  # noqa: SLF001 - storage contract
+        "PAPERFLOW_PDF_DIR",
+        "data/exports",
+        paper,
+        user_id="cheng tan",
+        category="pdf",
+    )
+
+    assert report_path.parent == expected_dir
+    assert report_path.name.startswith("Generative AI in K-12 Classrooms")
+    assert report_path.suffix == ".md"
+    assert "[[Daily Note - May 2026]]" in report_path.read_text(encoding="utf-8")
+    assert pdf_dir == (daily_root / "Daily Note 2026" / "arXiv - May 2026").resolve()
+    daily_text = daily_note.read_text(encoding="utf-8")
+    assert "# AI for Education" in daily_text
+    assert "[[Deep Reading - May 2026/Generative AI in K-12 Classrooms" in daily_text
+    assert "https://arxiv.org/pdf/2605.16277" in daily_text
+    assert "[[Daily Note - May 2026]]" in toc.read_text(encoding="utf-8")
