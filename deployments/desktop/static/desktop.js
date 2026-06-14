@@ -3005,16 +3005,6 @@
     return splitListValue(items).join("; ");
   }
 
-  function profileEditableDescription(raw, userInfo) {
-    return firstText(
-      raw?.description,
-      raw?.natural_language,
-      raw?.research_description,
-      raw?.summary,
-      userInfo?.description
-    );
-  }
-
   function profileAffiliation(raw, userInfo) {
     return firstText(
       raw?.affiliation,
@@ -3088,7 +3078,6 @@
     $("homepageUrl").value = firstText(raw.homepage_url, raw.homepage_profile?.url, raw.source_inputs?.homepage_url);
     $("pdfPaths").value = firstText(raw.pdf_paths, raw.source_pdfs, raw.source_inputs?.pdf_paths);
     renderProfileInfoGrid(profile, raw, userInfo, { userId, directions, topics });
-    $("naturalLanguage").value = profileEditableDescription(raw, userInfo);
     $("resetProfile").checked = false;
 
     const updatedAt = firstText(profile.updated_at, raw.updated_at, userInfo.updated_at);
@@ -3368,7 +3357,7 @@
       method: "POST",
       body: JSON.stringify({
         user_id: userId,
-        natural_language: $("naturalLanguage").value,
+        natural_language: "",
         scholar_url: $("scholarUrl").value,
         homepage_url: $("homepageUrl").value,
         pdf_paths: pdfPaths,

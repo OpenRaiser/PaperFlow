@@ -1135,7 +1135,10 @@ def test_desktop_user_picker_hydrates_settings_profile_form() -> None:
     assert 'must_read_keywords: splitListValue($("profileKeywordsInput")?.value || "")' in script
     assert ".profile-info-item.editable" in css
     assert ".profile-info-item.editable small" in css
-    assert "$(\"naturalLanguage\").value = profileEditableDescription(raw, userInfo);" in script
+    assert 'id="naturalLanguage"' not in html
+    assert "研究方向描述" not in html
+    assert "profileEditableDescription" not in script
+    assert 'natural_language: ""' in script
     assert 'renderSettingTags("profileTagGrid"' not in script
     assert 'userInfo.has_profile ? "画像已加载" : "尚未生成画像，可在此补充"' in script
     assert "showSettingsMessage(`已加载 ${userId} 的画像信息。`);" in script

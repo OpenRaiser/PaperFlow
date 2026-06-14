@@ -2395,8 +2395,7 @@ body.chat-view .source-list.empty {
 }
 
 .profile-card .setting-card-head,
-.profile-card .profile-info-grid,
-.profile-card #naturalLanguage {
+.profile-card .profile-info-grid {
   grid-column: 1 / -1;
 }
 
@@ -2413,10 +2412,6 @@ body.chat-view .source-list.empty {
   grid-column: 4;
   justify-self: end;
   min-width: 106px;
-}
-
-.profile-card #naturalLanguage {
-  min-height: 82px;
 }
 
 .profile-info-grid {
