@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import threading
 import time
 import zipfile
@@ -62,12 +63,17 @@ EDITABLE_ENV_KEYS = [
     "ANTHROPIC_API_TIMEOUT",
     "OLLAMA_BASE_URL",
     "OLLAMA_API_TIMEOUT",
+    "PAPERFLOW_NOTES_ROOT_DIR",
     "PAPERFLOW_PDF_DIR",
     "PAPERFLOW_READING_REPORTS_DIR",
     "PAPERFLOW_MONTHLY_REPORT_DIR",
     "PAPERFLOW_TOPIC_INDEX_DIR",
     "PAPERFLOW_WIKI_DIR",
     "PAPERFLOW_WIKI_INGEST",
+    "PAPERFLOW_READING_NOTES_GIT_DIR",
+    "PAPERFLOW_READING_NOTES_GIT_REMOTE",
+    "PAPERFLOW_READING_NOTES_GIT_BRANCH",
+    "PAPERFLOW_READING_NOTES_GIT_LLM_REVIEW",
     "PAPERFLOW_WRITE_FEISHU",
     "PAPERFLOW_DEFAULT_ARXIV_CATEGORIES",
     "PAPERFLOW_DEFAULT_CONFERENCES",
@@ -351,6 +357,12 @@ def _env_int(name: str, default: int, *, min_value: int = 1, max_value: int = 10
 
 
 def _configured_path(env_name: str, default_relative: str) -> str:
+    notes_root = _configured_notes_root_dir()
+    if notes_root is not None:
+        if env_name in {"PAPERFLOW_PDF_DIR", "PAPERFLOW_READING_REPORTS_DIR"}:
+            return str(notes_root)
+        if env_name == "PAPERFLOW_WIKI_DIR":
+            return str(notes_root / "wiki")
     raw = os.environ.get(env_name, "").strip()
     if raw:
         path = Path(raw).expanduser()
@@ -358,6 +370,34 @@ def _configured_path(env_name: str, default_relative: str) -> str:
             path = PROJECT_ROOT / path
         return str(path)
     return str(PROJECT_ROOT / default_relative)
+
+
+def _configured_notes_root_dir() -> Optional[Path]:
+    if (
+        os.environ.get("PAPERFLOW_READING_REPORTS_DIR", "").strip()
+        or os.environ.get("PAPERFLOW_PDF_DIR", "").strip()
+        or os.environ.get("PAPERFLOW_WIKI_DIR", "").strip()
+    ):
+        return None
+    raw = os.environ.get("PAPERFLOW_NOTES_ROOT_DIR", "").strip()
+    if raw:
+        path = Path(raw).expanduser()
+        return (path if path.is_absolute() else PROJECT_ROOT / path).resolve()
+    file_raw = _read_env_file().get("PAPERFLOW_NOTES_ROOT_DIR", "").strip()
+    if file_raw:
+        path = Path(file_raw).expanduser()
+        return (path if path.is_absolute() else PROJECT_ROOT / path).resolve()
+    for env_name in ("PAPERFLOW_READING_REPORTS_DIR", "PAPERFLOW_PDF_DIR"):
+        legacy = _env_text(env_name, "")
+        if legacy:
+            path = Path(legacy).expanduser()
+            return (path if path.is_absolute() else PROJECT_ROOT / path).resolve()
+    return None
+
+
+def _configured_notes_root_dir_text() -> str:
+    path = _configured_notes_root_dir()
+    return str(path) if path else ""
 
 
 def _display_path(path: Path) -> str:
@@ -627,6 +667,47 @@ def _env_text(name: str, default: str = "") -> str:
     return str(file_values.get(name, os.environ.get(name, default)) or default).strip()
 
 
+def _configured_reading_notes_git_branch() -> str:
+    return _env_text("PAPERFLOW_READING_NOTES_GIT_BRANCH", "main") or "main"
+
+
+def _configured_reading_notes_git_remote() -> str:
+    return _env_text("PAPERFLOW_READING_NOTES_GIT_REMOTE", "")
+
+
+def _default_reading_notes_git_dir() -> Optional[Path]:
+    current_year = datetime.now().year
+    notes_root = _configured_notes_root_dir()
+    if notes_root is not None:
+        if notes_root.name == f"Daily Note {current_year}":
+            return notes_root.resolve()
+        return (notes_root / f"Daily Note {current_year}").resolve()
+    for root in _daily_note_roots():
+        candidates = []
+        if root.name == f"Daily Note {current_year}":
+            candidates.append(root)
+        candidates.append(root / f"Daily Note {current_year}")
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate.resolve()
+    return None
+
+
+def _configured_reading_notes_git_dir() -> Optional[Path]:
+    if _configured_notes_root_dir() is not None:
+        return _default_reading_notes_git_dir()
+    raw = _env_text("PAPERFLOW_READING_NOTES_GIT_DIR", "")
+    if raw:
+        path = Path(raw).expanduser()
+        return (path if path.is_absolute() else PROJECT_ROOT / path).resolve()
+    return _default_reading_notes_git_dir()
+
+
+def _configured_reading_notes_git_dir_text() -> str:
+    path = _configured_reading_notes_git_dir()
+    return str(path) if path else ""
+
+
 def _env_list(name: str, default: Optional[List[str]] = None) -> List[str]:
     raw = _env_text(name)
     if not raw:
@@ -678,6 +759,14 @@ def save_settings(values: Dict[str, Any]) -> Dict[str, Any]:
         return settings()
 
     _merge_env_file(updates)
+    if "PAPERFLOW_NOTES_ROOT_DIR" in updates:
+        for legacy_key in (
+            "PAPERFLOW_PDF_DIR",
+            "PAPERFLOW_READING_REPORTS_DIR",
+            "PAPERFLOW_WIKI_DIR",
+            "PAPERFLOW_READING_NOTES_GIT_DIR",
+        ):
+            os.environ.pop(legacy_key, None)
     for key, value in updates.items():
         os.environ[key] = value
     return settings()
@@ -800,9 +889,14 @@ def settings() -> Dict[str, Any]:
         "http_proxy": _env_text("HTTP_PROXY", _env_text("HTTPS_PROXY", "")),
     }
     paths = {
+        "notes_root_dir": _configured_notes_root_dir_text(),
         "pdf_dir": _configured_path("PAPERFLOW_PDF_DIR", "data/exports"),
         "reading_reports_dir": _configured_path("PAPERFLOW_READING_REPORTS_DIR", "data/exports"),
         "wiki_dir": _configured_path("PAPERFLOW_WIKI_DIR", "data/wiki"),
+        "reading_notes_git_dir": _configured_reading_notes_git_dir_text(),
+        "reading_notes_git_remote": _configured_reading_notes_git_remote(),
+        "reading_notes_git_branch": _configured_reading_notes_git_branch(),
+        "reading_notes_git_llm_review": _env_bool("PAPERFLOW_READING_NOTES_GIT_LLM_REVIEW", default=True),
         "monthly_report_dir": _configured_path("PAPERFLOW_MONTHLY_REPORT_DIR", "data/exports"),
         "topic_index_dir": _configured_path("PAPERFLOW_TOPIC_INDEX_DIR", "data/exports"),
         "role_subdir": _env_bool("PAPERFLOW_STORAGE_ROLE_SUBDIR", default=True),
@@ -1059,6 +1153,182 @@ def export_data(user_id: str, export_format: str = "markdown") -> Dict[str, Any]
         return {"format": "zip", "path": str(output), "display_path": _display_path(output), "count": count}
 
     raise ValueError("export_format must be markdown or zip")
+
+
+def _run_git(args: List[str], cwd: Path, *, check: bool = True, timeout: int = 60) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", *args],
+        cwd=str(cwd),
+        text=True,
+        capture_output=True,
+        check=check,
+        timeout=timeout,
+    )
+
+
+def _git_output(args: List[str], cwd: Path, *, timeout: int = 60) -> str:
+    result = _run_git(args, cwd, timeout=timeout)
+    return (result.stdout or "").strip()
+
+
+def _ensure_notes_gitignore(repo_dir: Path) -> None:
+    ignore_path = repo_dir / ".gitignore"
+    existing = ignore_path.read_text(encoding="utf-8").splitlines() if ignore_path.exists() else []
+    needed = ["*.pdf", ".DS_Store", "*.bak-*"]
+    next_lines = list(existing)
+    for pattern in needed:
+        if pattern not in next_lines:
+            next_lines.append(pattern)
+    if next_lines != existing:
+        ignore_path.write_text("\n".join(next_lines).rstrip() + "\n", encoding="utf-8")
+
+
+def _notes_git_remote(repo_dir: Path) -> str:
+    del repo_dir
+    return _configured_reading_notes_git_remote()
+
+
+def _ensure_notes_git_repo(repo_dir: Path, remote_url: str, branch: str) -> None:
+    if not (repo_dir / ".git").exists():
+        _run_git(["init"], repo_dir)
+    remotes = set(_git_output(["remote"], repo_dir).splitlines())
+    if remote_url:
+        if "origin" in remotes:
+            current = _git_output(["remote", "get-url", "origin"], repo_dir)
+            if current != remote_url:
+                _run_git(["remote", "set-url", "origin", remote_url], repo_dir)
+        else:
+            _run_git(["remote", "add", "origin", remote_url], repo_dir)
+    if remote_url:
+        _run_git(["fetch", "origin", branch], repo_dir, timeout=120)
+        try:
+            _git_output(["rev-parse", "--verify", "HEAD"], repo_dir)
+        except subprocess.CalledProcessError:
+            _run_git(["symbolic-ref", "HEAD", f"refs/heads/{branch}"], repo_dir)
+            _run_git(["update-ref", f"refs/heads/{branch}", f"refs/remotes/origin/{branch}"], repo_dir)
+            _run_git(["reset", "--mixed"], repo_dir)
+
+
+def _notes_llm_sync_review(repo_dir: Path, branch: str, enabled: bool) -> Dict[str, Any]:
+    if not enabled:
+        return {"enabled": False, "reviewed": False, "summary": "LLM 校对已关闭。"}
+    try:
+        provider = build_llm_provider()
+        if getattr(provider, "name", "") == "mock":
+            return {"enabled": True, "reviewed": False, "summary": "当前 LLM provider 为 mock，跳过语义校对。"}
+        status = _git_output(["status", "--short"], repo_dir)
+        staged_stat = _git_output(["diff", "--cached", "--stat"], repo_dir)
+        try:
+            remote_stat = _git_output(["diff", "--stat", f"HEAD..origin/{branch}"], repo_dir)
+        except Exception:
+            remote_stat = ""
+        staged_diff = _git_output(["diff", "--cached", "--", "*.md"], repo_dir)
+        if len(staged_diff) > 12000:
+            staged_diff = staged_diff[:12000] + "\n\n[diff truncated]"
+        prompt = "\n".join(
+            [
+                "Review this PaperFlow reading-notes Git sync before commit.",
+                "Check whether local Daily Note and Deep Reading markdown changes look like additive preservation rather than accidental deletion.",
+                "Return concise Chinese JSON with keys: risk_level, summary, suggested_action.",
+                "",
+                f"branch: {branch}",
+                "git status:",
+                status or "(clean)",
+                "",
+                "staged stat:",
+                staged_stat or "(none)",
+                "",
+                "remote stat:",
+                remote_stat or "(none)",
+                "",
+                "staged markdown diff:",
+                staged_diff or "(none)",
+            ]
+        )
+        response = provider.generate(
+            prompt,
+            system="You are a careful Git sync reviewer for an Obsidian reading-notes repository.",
+            temperature=0.0,
+            max_tokens=900,
+        )
+        return {
+            "enabled": True,
+            "reviewed": True,
+            "provider": getattr(provider, "name", "unknown"),
+            "model": getattr(provider, "model", "unknown"),
+            "summary": str(getattr(response, "text", "") or "").strip(),
+        }
+    except Exception as exc:
+        return {"enabled": True, "reviewed": False, "error": str(exc), "summary": f"LLM 校对失败：{exc}"}
+
+
+def sync_reading_notes_github(user_id: str = "") -> Dict[str, Any]:
+    del user_id
+    repo_dir = _configured_reading_notes_git_dir()
+    if repo_dir is None:
+        raise ValueError("未找到阅读笔记 Git 目录，请在设置里配置 PAPERFLOW_READING_NOTES_GIT_DIR。")
+    repo_dir.mkdir(parents=True, exist_ok=True)
+    branch = _configured_reading_notes_git_branch()
+    remote_url = _notes_git_remote(repo_dir)
+    if not remote_url:
+        raise ValueError("未配置阅读笔记 GitHub 远端，请在设置里配置 PAPERFLOW_READING_NOTES_GIT_REMOTE。")
+
+    _ensure_notes_git_repo(repo_dir, remote_url, branch)
+    _ensure_notes_gitignore(repo_dir)
+
+    initial_status = _git_output(["status", "--short"], repo_dir)
+    pulled = False
+    pull_warning = ""
+    if not initial_status:
+        try:
+            _run_git(["pull", "--ff-only", "origin", branch], repo_dir, timeout=120)
+            pulled = True
+        except subprocess.CalledProcessError as exc:
+            pull_warning = (exc.stderr or exc.stdout or str(exc)).strip()
+    else:
+        pull_warning = "本地有未提交笔记改动，已跳过自动 pull，避免覆盖 Obsidian 当前内容。"
+
+    _run_git(["add", "."], repo_dir)
+    llm_review = _notes_llm_sync_review(
+        repo_dir,
+        branch,
+        _env_bool("PAPERFLOW_READING_NOTES_GIT_LLM_REVIEW", default=True),
+    )
+    staged_status = _git_output(["status", "--short"], repo_dir)
+    committed = False
+    commit_hash = ""
+    if staged_status:
+        message = f"Sync PaperFlow reading notes {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+        _run_git(["commit", "-m", message], repo_dir, timeout=120)
+        committed = True
+        commit_hash = _git_output(["rev-parse", "--short", "HEAD"], repo_dir)
+
+    pushed = False
+    push_output = ""
+    if committed or pulled:
+        try:
+            result = _run_git(["push", "-u", "origin", branch], repo_dir, timeout=120)
+            push_output = (result.stdout or result.stderr or "").strip()
+            pushed = True
+        except subprocess.CalledProcessError as exc:
+            push_output = (exc.stderr or exc.stdout or str(exc)).strip()
+            raise RuntimeError(f"GitHub push 失败：{push_output}") from exc
+
+    final_status = _git_output(["status", "--short", "--ignored"], repo_dir)
+    return {
+        "ok": True,
+        "repo_dir": str(repo_dir),
+        "remote": remote_url,
+        "branch": branch,
+        "pulled": pulled,
+        "committed": committed,
+        "commit": commit_hash,
+        "pushed": pushed,
+        "pull_warning": pull_warning,
+        "push_output": push_output,
+        "llm_review": llm_review,
+        "status": final_status,
+    }
 
 
 def list_users() -> Dict[str, Any]:

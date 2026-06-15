@@ -35,6 +35,7 @@ def test_desktop_server_routes_are_registered() -> None:
     assert "/api/daily/start" in server.POST_ROUTES
     assert "/api/wiki/mentions" in server.GET_ROUTES
     assert "/api/wiki/ask/stream" in server.POST_ROUTES
+    assert "/api/github/sync" in server.POST_ROUTES
     assert "/api/chat/sessions" in server.GET_ROUTES
     assert "/api/chat/session" in server.GET_ROUTES
     assert "/api/chat/session" in server.POST_ROUTES
@@ -76,6 +77,8 @@ def test_desktop_settings_exposes_storage_paths() -> None:
     assert "pdf_dir" in settings["paths"]
     assert "reading_reports_dir" in settings["paths"]
     assert "wiki_dir" in settings["paths"]
+    assert "notes_root_dir" in settings["paths"]
+    assert "reading_notes_git_dir" in settings["paths"]
 
 
 def test_desktop_settings_page_renders_storage_paths_as_inputs() -> None:
@@ -88,9 +91,15 @@ def test_desktop_settings_page_renders_storage_paths_as_inputs() -> None:
     assert "editable-path-row" in script
     assert '$("refreshSettingsBtn")?.addEventListener("click", () => runAction(loadSettings, "加载设置"));' in script
     assert '$("saveStorageSettingsBtn").addEventListener("click", () => runAction(saveSettings, "保存设置"));' in script
-    assert "PAPERFLOW_PDF_DIR" in script
-    assert "PAPERFLOW_READING_REPORTS_DIR" in script
-    assert "PAPERFLOW_WIKI_DIR" in script
+    assert "PAPERFLOW_NOTES_ROOT_DIR" in script
+    assert 'data-derived-path="${escapeHtml(row.derivedRole)}"' in script
+    assert "readonly autocomplete" in script
+    assert "updateDerivedNotesPathsPreview" in script
+    assert "Daily Note ${currentYear}" in script
+    assert "PAPERFLOW_READING_NOTES_GIT_REMOTE" in script
+    assert "PAPERFLOW_READING_NOTES_GIT_BRANCH" in script
+    assert 'id="syncGithubBtn"' in html
+    assert 'id="notesGitLlmReviewSetting"' in html
 
 
 def test_desktop_wiki_graph_uses_user_nodes_and_edges(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1138,9 +1147,10 @@ def test_desktop_save_settings_updates_env_file(tmp_path, monkeypatch: pytest.Mo
             "PAPERFLOW_DAILY_LIMIT": "17",
             "PAPERFLOW_RELEVANCE_THRESHOLD": "72",
             "PAPERFLOW_MAX_CONCURRENCY": "4",
-            "PAPERFLOW_PDF_DIR": str(tmp_path / "pdf-cache"),
-            "PAPERFLOW_READING_REPORTS_DIR": str(tmp_path / "reading-reports"),
-            "PAPERFLOW_WIKI_DIR": str(tmp_path / "knowledge-base"),
+            "PAPERFLOW_NOTES_ROOT_DIR": str(tmp_path / "Daily Note"),
+            "PAPERFLOW_READING_NOTES_GIT_REMOTE": "https://github.com/example/notes.git",
+            "PAPERFLOW_READING_NOTES_GIT_BRANCH": "main",
+            "PAPERFLOW_READING_NOTES_GIT_LLM_REVIEW": "false",
             "HTTP_PROXY": "http://127.0.0.1:18080",
             "UNSUPPORTED_KEY": "ignored",
         }
@@ -1152,12 +1162,18 @@ def test_desktop_save_settings_updates_env_file(tmp_path, monkeypatch: pytest.Mo
     assert "PAPERFLOW_WRITE_FEISHU=true" in text
     assert "PAPERFLOW_ENABLE_ARXIV=false" in text
     assert "PAPERFLOW_CUSTOM_RSS_URLS=https://example.com/rss.xml" in text
-    assert f"PAPERFLOW_PDF_DIR={tmp_path / 'pdf-cache'}" in text
-    assert f"PAPERFLOW_READING_REPORTS_DIR={tmp_path / 'reading-reports'}" in text
-    assert f"PAPERFLOW_WIKI_DIR={tmp_path / 'knowledge-base'}" in text
-    assert result["paths"]["pdf_dir"] == str(tmp_path / "pdf-cache")
-    assert result["paths"]["reading_reports_dir"] == str(tmp_path / "reading-reports")
-    assert result["paths"]["wiki_dir"] == str(tmp_path / "knowledge-base")
+    assert f'PAPERFLOW_NOTES_ROOT_DIR="{tmp_path / "Daily Note"}"' in text
+    assert "PAPERFLOW_READING_NOTES_GIT_REMOTE=https://github.com/example/notes.git" in text
+    assert "PAPERFLOW_READING_NOTES_GIT_BRANCH=main" in text
+    assert "PAPERFLOW_READING_NOTES_GIT_LLM_REVIEW=false" in text
+    assert result["paths"]["notes_root_dir"] == str(tmp_path / "Daily Note")
+    assert result["paths"]["pdf_dir"] == str(tmp_path / "Daily Note")
+    assert result["paths"]["reading_reports_dir"] == str(tmp_path / "Daily Note")
+    assert result["paths"]["wiki_dir"] == str(tmp_path / "Daily Note" / "wiki")
+    assert result["paths"]["reading_notes_git_dir"] == str(tmp_path / "Daily Note" / "Daily Note 2026")
+    assert result["paths"]["reading_notes_git_remote"] == "https://github.com/example/notes.git"
+    assert result["paths"]["reading_notes_git_branch"] == "main"
+    assert result["paths"]["reading_notes_git_llm_review"] is False
     assert "PAPERFLOW_CONFERENCE_ACCESS_MODE=credential" in text
     assert r"PAPERFLOW_CONFERENCE_COOKIE_FILE=C:\paperflow\cookies\neurips.txt" in text
     assert "SEMANTIC_SCHOLAR_API_KEY=s2-test-key" in text
@@ -1175,6 +1191,58 @@ def test_desktop_save_settings_updates_env_file(tmp_path, monkeypatch: pytest.Mo
     assert result["advanced"]["http_proxy"] == "http://127.0.0.1:18080"
     assert result["source_preferences"]["conference_access_mode"] == "credential"
     assert result["source_preferences"]["auth_status"]["semantic_scholar_api_key"] is True
+
+
+def test_desktop_github_sync_commits_notes_with_llm_review(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    bare = tmp_path / "notes.git"
+    seed = tmp_path / "seed"
+    notes = tmp_path / "Daily Note 2026"
+    agents._run_git(["init", "--bare", str(bare)], tmp_path)  # noqa: SLF001 - git sync contract
+    seed.mkdir()
+    agents._run_git(["init"], seed)  # noqa: SLF001
+    agents._run_git(["checkout", "-b", "main"], seed)  # noqa: SLF001
+    agents._run_git(["config", "user.email", "paperflow@example.com"], seed)  # noqa: SLF001
+    agents._run_git(["config", "user.name", "PaperFlow Test"], seed)  # noqa: SLF001
+    (seed / "Table of Content - 2026.md").write_text("# Daily Note - Jun 2026\n[[Daily Note - Jun 2026]]\n", encoding="utf-8")
+    agents._run_git(["add", "."], seed)  # noqa: SLF001
+    agents._run_git(["commit", "-m", "Initialize reading notes"], seed)  # noqa: SLF001
+    agents._run_git(["remote", "add", "origin", str(bare)], seed)  # noqa: SLF001
+    agents._run_git(["push", "-u", "origin", "main"], seed)  # noqa: SLF001
+
+    agents._run_git(["clone", "-b", "main", str(bare), str(notes)], tmp_path)  # noqa: SLF001
+    agents._run_git(["config", "user.email", "paperflow@example.com"], notes)  # noqa: SLF001
+    agents._run_git(["config", "user.name", "PaperFlow Test"], notes)  # noqa: SLF001
+    (notes / "Daily Note - Jun 2026.md").write_text(
+        "# Reward Models & Reinforcement Learning\n\n## PaperFlow Summary\n- 论文/报告：1 篇\n",
+        encoding="utf-8",
+    )
+
+    class FakeResponse:
+        text = '{"risk_level":"low","summary":"新增 Daily Note，未发现删除风险。","suggested_action":"commit"}'
+
+    class FakeLLM:
+        name = "fake"
+        model = "test"
+
+        def generate(self, *_args, **_kwargs):
+            return FakeResponse()
+
+    monkeypatch.setattr(agents, "build_llm_provider", lambda: FakeLLM())
+    monkeypatch.setattr(agents, "_configured_reading_notes_git_dir", lambda: notes)
+    monkeypatch.setattr(agents, "_configured_reading_notes_git_remote", lambda: str(bare))
+    monkeypatch.setattr(agents, "_configured_reading_notes_git_branch", lambda: "main")
+    monkeypatch.setenv("PAPERFLOW_READING_NOTES_GIT_LLM_REVIEW", "true")
+
+    result = agents.sync_reading_notes_github("user_test")
+
+    assert result["committed"] is True
+    assert result["pushed"] is True
+    assert result["llm_review"]["reviewed"] is True
+    assert result["commit"]
+    clone_check = tmp_path / "check"
+    agents._run_git(["clone", "-b", "main", str(bare), str(clone_check)], tmp_path)  # noqa: SLF001
+    assert (clone_check / "Daily Note - Jun 2026.md").exists()
+    assert "*.bak-*" in (clone_check / ".gitignore").read_text(encoding="utf-8")
 
 
 def test_desktop_daily_push_uses_saved_settings_when_gui_omits_filters(

@@ -469,7 +469,7 @@
       setStatus("出错");
       console.error(error);
       flashButtonFeedback(actionButton, "error");
-      showFeedbackToast("error", "操作失败", error.message || String(error));
+      if (!error.paperflowToastShown) showFeedbackToast("error", "操作失败", error.message || String(error));
     } finally {
       setActionButtonBusy(actionButton, false);
     }
@@ -2375,6 +2375,44 @@
     );
   }
 
+  function githubSyncSummary(data) {
+    const parts = [];
+    if (data.pulled) parts.push("已拉取远端");
+    if (data.committed) parts.push(`已提交 ${data.commit || ""}`.trim());
+    if (data.pushed) parts.push("已推送");
+    if (!parts.length) parts.push("没有新的笔记改动");
+    return parts.join(" · ");
+  }
+
+  async function syncGithubNotes() {
+    try {
+      const data = await api("/api/github/sync", {
+        method: "POST",
+        body: JSON.stringify({ user_id: currentUser() })
+      });
+      await loadSettings();
+      await loadWiki();
+      const llm = data.llm_review || {};
+      const summary = githubSyncSummary(data);
+      const detail = [
+        `目录：${data.repo_dir || "-"}`,
+        `远端：${data.remote || "-"}`,
+        `分支：${data.branch || "main"}`,
+        data.pull_warning ? `提醒：${data.pull_warning}` : "",
+        llm.summary ? `LLM 校对：${llm.summary}` : ""
+      ].filter(Boolean).join("\n");
+      $("wikiStats").textContent = `${summary} · GitHub`;
+      setWikiEntry("GitHub 同步结果", detail, "", { renderRelations: false });
+      showFeedbackToast("success", "GitHub 同步完成", summary);
+    } catch (error) {
+      const message = error.message || String(error);
+      $("wikiStats").textContent = "GitHub 同步失败";
+      showFeedbackToast("error", "GitHub 同步失败", message);
+      error.paperflowToastShown = true;
+      throw error;
+    }
+  }
+
   async function searchWiki() {
     const rawQuery = $("wikiQuery").value.trim();
     if (!rawQuery) {
@@ -3412,9 +3450,13 @@
     const paths = data.paths || {};
     const storageStats = data.storage_stats || {};
     const rows = [
-      { label: "PDF 缓存目录", value: paths.pdf_dir, envKey: "PAPERFLOW_PDF_DIR" },
-      { label: "精读报告目录", value: paths.reading_reports_dir, envKey: "PAPERFLOW_READING_REPORTS_DIR" },
-      { label: "知识库目录", value: paths.wiki_dir, envKey: "PAPERFLOW_WIKI_DIR" },
+      { label: "笔记根目录", value: paths.notes_root_dir, envKey: "PAPERFLOW_NOTES_ROOT_DIR" },
+      { label: "PDF 缓存目录", value: paths.pdf_dir, derivedRole: "pdf" },
+      { label: "精读报告目录", value: paths.reading_reports_dir, derivedRole: "reports" },
+      { label: "知识库目录", value: paths.wiki_dir, derivedRole: "wiki" },
+      { label: "阅读笔记 Git 目录", value: paths.reading_notes_git_dir, derivedRole: "git" },
+      { label: "阅读笔记 GitHub", value: paths.reading_notes_git_remote, envKey: "PAPERFLOW_READING_NOTES_GIT_REMOTE" },
+      { label: "阅读笔记分支", value: paths.reading_notes_git_branch || "main", envKey: "PAPERFLOW_READING_NOTES_GIT_BRANCH" },
       { label: "写入飞书", value: paths.write_feishu ? "是" : "否" },
       { label: "Wiki 增量写入", value: paths.wiki_ingest ? "是" : "否" }
     ];
@@ -3424,9 +3466,14 @@
         <strong>${escapeHtml(row.label)}</strong>
         ${row.envKey
           ? `<input data-env-key="${escapeHtml(row.envKey)}" value="${escapeHtml(row.value || "")}" autocomplete="off">`
-          : `<span>${escapeHtml(row.value || "-")}</span>`}
+          : row.derivedRole
+            ? `<input data-derived-path="${escapeHtml(row.derivedRole)}" value="${escapeHtml(row.value || "")}" readonly autocomplete="off">`
+            : `<span>${escapeHtml(row.value || "-")}</span>`}
       </div>
     `).join("");
+    const notesRootInput = document.querySelector('[data-env-key="PAPERFLOW_NOTES_ROOT_DIR"]');
+    notesRootInput?.addEventListener("input", updateDerivedNotesPathsPreview);
+    updateDerivedNotesPathsPreview();
     if ($("cacheSizeStat")) $("cacheSizeStat").textContent = storageStats.cache_display || "-";
 
     const env = envMap(data);
@@ -3458,6 +3505,7 @@
     $("writeFeishuReports").checked = Boolean(reportPrefs.write_feishu);
     $("directPdfWriteFeishu").checked = Boolean(reportPrefs.write_feishu);
     $("wikiIngestSetting").checked = reportPrefs.wiki_ingest !== false;
+    if ($("notesGitLlmReviewSetting")) $("notesGitLlmReviewSetting").checked = paths.reading_notes_git_llm_review !== false;
     $("dailyLimitInput").value = advanced.daily_limit || 30;
     $("relevanceThreshold").value = advanced.relevance_threshold || 60;
     $("relevanceValue").textContent = $("relevanceThreshold").value;
@@ -3500,6 +3548,7 @@
     values.PAPERFLOW_REPORT_STYLE = document.querySelector("[data-pref-mode].active")?.dataset.prefMode || "standard";
     values.PAPERFLOW_WRITE_FEISHU = String($("writeFeishuReports").checked || $("directWriteFeishu").checked || $("directPdfWriteFeishu").checked);
     values.PAPERFLOW_WIKI_INGEST = String($("wikiIngestSetting").checked);
+    values.PAPERFLOW_READING_NOTES_GIT_LLM_REVIEW = String($("notesGitLlmReviewSetting")?.checked !== false);
     values.PAPERFLOW_DAILY_LIMIT = $("dailyLimitInput").value;
     values.PAPERFLOW_RELEVANCE_THRESHOLD = $("relevanceThreshold").value;
     values.HTTP_PROXY = $("proxyInput").value;
@@ -3521,6 +3570,30 @@
     }
     showSettingsMessage("设置已保存。每日推荐上限、相关性阈值和代理会用于下一次论文拉取；如果当天缓存参数不同，后端会自动重新拉取。");
     showFeedbackToast("success", "设置已保存", "新参数会用于下一次论文拉取，旧缓存参数不一致时会自动刷新。");
+  }
+
+  function joinPath(base, suffix) {
+    const root = String(base || "").trim().replace(/[\\/]+$/, "");
+    if (!root) return "-";
+    return `${root}/${suffix}`;
+  }
+
+  function updateDerivedNotesPathsPreview() {
+    const input = document.querySelector('[data-env-key="PAPERFLOW_NOTES_ROOT_DIR"]');
+    const root = input?.value?.trim() || state.settings?.paths?.notes_root_dir || "";
+    const currentYear = new Date().getFullYear();
+    const derived = {
+      pdf: root || "-",
+      reports: root || "-",
+      wiki: joinPath(root, "wiki"),
+      git: joinPath(root, `Daily Note ${currentYear}`)
+    };
+    Object.entries(derived).forEach(([role, value]) => {
+      const target = document.querySelector(`[data-derived-path="${role}"]`);
+      if (!target) return;
+      if ("value" in target) target.value = value;
+      else target.textContent = value;
+    });
   }
 
   async function testProvider(kind) {
@@ -3697,6 +3770,7 @@
     $("readPdfBtn").addEventListener("click", () => runAction(() => directRead("pdf"), "生成报告"));
 
     $("refreshWikiBtn").addEventListener("click", () => runAction(refreshWiki, "更新 Wiki"));
+    $("syncGithubBtn")?.addEventListener("click", () => runAction(syncGithubNotes, "同步 GitHub"));
     $("wikiSearchBtn").addEventListener("click", () => runAction(searchWiki, "搜索 Wiki"));
     $("wikiDailyScope")?.addEventListener("change", () => {
       const monthInput = $("wikiDailyMonth");

@@ -185,6 +185,10 @@ def _api_wiki_refresh(_query_params: Dict[str, Any], body: Dict[str, Any]) -> Di
     return agents.refresh_wiki(str(body.get("user_id") or "").strip())
 
 
+def _api_github_sync(_query_params: Dict[str, Any], body: Dict[str, Any]) -> Dict[str, Any]:
+    return agents.sync_reading_notes_github(str(body.get("user_id") or "").strip())
+
+
 def _api_activity(query_params: Dict[str, Any], _body: Dict[str, Any]) -> Dict[str, Any]:
     return agents.recent_activity(
         _required_user(query_params),
@@ -448,6 +452,7 @@ POST_ROUTES: Dict[str, ApiHandler] = {
     "/api/wiki/ask": _api_wiki_ask,
     "/api/wiki/ask/stream": _api_wiki_ask,
     "/api/wiki/refresh": _api_wiki_refresh,
+    "/api/github/sync": _api_github_sync,
     "/api/chat/session": _api_create_chat_session,
     "/api/chat/session/delete": _api_delete_chat_session,
     "/api/chat/sessions/clear": _api_clear_chat_sessions,
