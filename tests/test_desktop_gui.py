@@ -1380,6 +1380,18 @@ def test_desktop_source_settings_explain_conference_auth() -> None:
     assert "label:has(input:checked)" in css
 
 
+def test_desktop_paper_source_defaults_are_arxiv_only() -> None:
+    script = (PROJECT_ROOT / "deployments/desktop/static/desktop.js").read_text(encoding="utf-8")
+    collect_daily_options = script.split("function collectDailyOptions() {", 1)[1].split("function paperReportKey", 1)[0]
+
+    assert 'renderChoiceList("arxivCategories", data.arxiv_categories || [], { defaultChecked: "all" })' in script
+    assert 'renderChoiceList("conferenceSources", data.conferences || [], { defaultChecked: "none" })' in script
+    assert 'renderChoiceList("journalSources", data.journals || [], { defaultChecked: "none" })' in script
+    assert 'const conferences = openReviewEnabled ? selectedSourceValues("conferenceSources") : [];' in collect_daily_options
+    assert 'selectedSourceValues("conferenceSources").length' not in collect_daily_options
+    assert "selectedSettingConferences()" not in collect_daily_options
+
+
 def test_desktop_settings_controls_use_compact_typography() -> None:
     css = (PROJECT_ROOT / "deployments/desktop/static/desktop.css").read_text(encoding="utf-8")
 

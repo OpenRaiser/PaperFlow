@@ -835,13 +835,20 @@
     $("healthText").textContent = DEMO_MODE ? "Demo 离线预览" : data.database_exists ? "运行环境就绪" : "请先初始化";
   }
 
-  function renderChoiceList(id, items) {
+  function defaultCheckedForSource(index, mode = "none") {
+    if (mode === "all") return true;
+    if (mode === "first3") return index < 3;
+    return false;
+  }
+
+  function renderChoiceList(id, items, options = {}) {
     const target = $(id);
     target.className = "choice-list";
+    const defaultChecked = options.defaultChecked || "none";
     target.innerHTML = items.map((item, index) => {
       const value = item.id || item.name || item;
       const label = item.name || item.id || item;
-      const checked = index < 3 ? "checked" : "";
+      const checked = defaultCheckedForSource(index, defaultChecked) ? "checked" : "";
       return `<label class="source-choice"><input type="checkbox" value="${escapeHtml(value)}" ${checked}>${escapeHtml(label)}</label>`;
     }).join("");
   }
@@ -850,9 +857,9 @@
     if (state.sourceOptionsLoaded) return;
     const data = await api("/api/source-options");
     state.sourceOptions = data;
-    renderChoiceList("arxivCategories", data.arxiv_categories || []);
-    renderChoiceList("conferenceSources", data.conferences || []);
-    renderChoiceList("journalSources", data.journals || []);
+    renderChoiceList("arxivCategories", data.arxiv_categories || [], { defaultChecked: "all" });
+    renderChoiceList("conferenceSources", data.conferences || [], { defaultChecked: "none" });
+    renderChoiceList("journalSources", data.journals || [], { defaultChecked: "none" });
     state.sourceOptionsLoaded = true;
   }
 
@@ -866,16 +873,18 @@
       .filter((value) => value && value !== "未配置");
   }
 
-  function syncChoiceListFromSettings(id, values, enabled = true) {
+  function syncChoiceListFromSettings(id, values, enabled = true, options = {}) {
     const target = $(id);
     if (!target) return;
     const configured = new Set(splitListValue(values));
     const inputs = Array.from(target.querySelectorAll("input[type='checkbox']"));
+    const defaultChecked = options.defaultChecked || "none";
+    const useConfigured = options.useConfigured !== false;
     inputs.forEach((input, index) => {
-      if (configured.size) {
+      if (useConfigured && configured.size) {
         input.checked = configured.has(input.value);
-      } else if (!state.settings) {
-        input.checked = index < 3;
+      } else {
+        input.checked = defaultCheckedForSource(index, defaultChecked);
       }
       input.disabled = !enabled;
       input.closest("label")?.classList.toggle("disabled", !enabled);
@@ -885,15 +894,22 @@
   function syncDailySourceControls(sourcePrefs = {}) {
     syncChoiceListFromSettings(
       "arxivCategories",
-      sourcePrefs.arxiv_categories || [],
-      sourcePrefs.enable_arxiv !== false
+      [],
+      sourcePrefs.enable_arxiv !== false,
+      { defaultChecked: "all", useConfigured: false }
     );
     syncChoiceListFromSettings(
       "conferenceSources",
-      sourcePrefs.conferences || [],
-      sourcePrefs.enable_openreview !== false
+      [],
+      sourcePrefs.enable_openreview !== false,
+      { defaultChecked: "none", useConfigured: false }
     );
-    syncChoiceListFromSettings("journalSources", sourcePrefs.journals || [], true);
+    syncChoiceListFromSettings(
+      "journalSources",
+      [],
+      true,
+      { defaultChecked: "none", useConfigured: false }
+    );
   }
 
   function configuredDailyLimit() {
@@ -906,16 +922,8 @@
     const sourcePrefs = state.settings?.source_preferences || {};
     const arxivEnabled = $("settingEnableArxiv") ? $("settingEnableArxiv").checked : sourcePrefs.enable_arxiv !== false;
     const openReviewEnabled = $("settingEnableOpenReview") ? $("settingEnableOpenReview").checked : sourcePrefs.enable_openreview !== false;
-    const arxivCategories = arxivEnabled
-      ? selectedSourceValues("arxivCategories").length
-        ? selectedSourceValues("arxivCategories")
-        : selectedSettingTagValues("settingArxivCategories")
-      : [];
-    const conferences = openReviewEnabled
-      ? selectedSourceValues("conferenceSources").length
-        ? selectedSourceValues("conferenceSources")
-        : selectedSettingConferences()
-      : [];
+    const arxivCategories = arxivEnabled ? selectedSourceValues("arxivCategories") : [];
+    const conferences = openReviewEnabled ? selectedSourceValues("conferenceSources") : [];
     return {
       arxiv_categories: arxivCategories,
       conferences,
