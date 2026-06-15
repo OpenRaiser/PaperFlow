@@ -2076,6 +2076,60 @@ def get_report_content(report_id: str) -> Dict[str, Any]:
     raise ValueError(f"Report not found: {normalized_id}")
 
 
+def _report_doc_for_wiki_backfill(report: Dict[str, Any]) -> Dict[str, Any]:
+    metadata = dict(report.get("metadata") or {})
+    paper = {
+        "id": metadata.get("paper_id"),
+        "arxiv_id": metadata.get("arxiv_id") or report.get("arxiv_id"),
+        "doi": metadata.get("doi"),
+        "title": metadata.get("title") or report.get("title"),
+        "authors": metadata.get("authors") or [],
+        "abstract": metadata.get("abstract") or "",
+        "publish_date": metadata.get("publish_date"),
+        "pdf_path": metadata.get("pdf_path"),
+        "pdf_url": metadata.get("pdf_url") or report.get("pdf_url"),
+        "source": metadata.get("source") or "reading_report",
+    }
+    summary = str(report.get("snippet") or "").strip()
+    return {
+        "paper": paper,
+        "title": report.get("title"),
+        "url": metadata.get("doc_url") or report.get("doc_url"),
+        "doc_token": metadata.get("doc_token") or report.get("doc_token"),
+        "report_path": report.get("report_path"),
+        "pdf_path": metadata.get("pdf_path"),
+        "report_payload": {
+            "paper_summary": summary,
+            "one_sentence_summary": summary,
+            "recommendation_label": metadata.get("recommendation_label"),
+            "generation_provider": metadata.get("generation_provider"),
+            "generation_model": metadata.get("generation_model"),
+            "report_style": metadata.get("report_style"),
+        },
+    }
+
+
+def refresh_wiki(user_id: str) -> Dict[str, Any]:
+    normalized_user = str(user_id or "").strip()
+    if not normalized_user:
+        raise ValueError("user_id is required")
+
+    daily_note_paths = [str(path) for path in _all_daily_note_paths()]
+    refresh_daily_notes = getattr(reading_agent, "refresh_daily_note_files", None)
+    daily_note_result = (
+        refresh_daily_notes(user_id=normalized_user, daily_note_paths=daily_note_paths)
+        if callable(refresh_daily_notes)
+        else {"scanned": len(daily_note_paths), "refreshed": 0, "daily_notes": daily_note_paths, "errors": []}
+    )
+    return {
+        "daily_notes": daily_note_result,
+        "wiki_backfilled": 0,
+        "reports_scanned": 0,
+        "reports_indexed": 0,
+        "stats": wiki_stats(normalized_user),
+    }
+
+
 def submit_and_read(
     *,
     user_id: str,
@@ -3164,23 +3218,24 @@ def _resolve_wiki_mentions(
         seen_requests.add(request_key)
 
         node: Optional[Dict[str, Any]] = None
-        daily_node = None
-        for entry in _daily_note_reading_entries(scope="all", query=title or node_id, limit=8):
-            candidate = _daily_note_reading_node(entry)
-            if node_id and str(candidate.get("node_id") or "") == node_id:
-                daily_node = candidate
-                break
-            if title and str(candidate.get("title") or "").strip().lower() == title.lower():
-                daily_node = candidate
-                break
-            if daily_node is None:
-                daily_node = candidate
-        if daily_node is not None:
-            node = daily_node
         if node_id:
             db_node = wiki_db.get_node(user_id, node_id)
             if _wiki_node_is_visible(db_node):
-                node = node or db_node
+                node = db_node
+        if node is None:
+            daily_node = None
+            for entry in _daily_note_reading_entries(scope="all", query=title or node_id, limit=8):
+                candidate = _daily_note_reading_node(entry)
+                if node_id and str(candidate.get("node_id") or "") == node_id:
+                    daily_node = candidate
+                    break
+                if title and str(candidate.get("title") or "").strip().lower() == title.lower():
+                    daily_node = candidate
+                    break
+                if daily_node is None:
+                    daily_node = candidate
+            if daily_node is not None:
+                node = daily_node
         if node is None:
             query = title or node_id
             if query:

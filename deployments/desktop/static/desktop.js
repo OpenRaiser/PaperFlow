@@ -927,6 +927,36 @@
     return [currentUser(), pushId || "no-push", Number(number)].join("::");
   }
 
+  async function ensureLlmReadyForReading() {
+    try {
+      const data = await api("/api/provider-test", {
+        method: "POST",
+        body: JSON.stringify({ kind: "llm" })
+      });
+      const provider = String(data.provider || "").toLowerCase();
+      const model = data.model || "未识别模型";
+      if (!provider || provider === "mock") {
+        const detail = "当前 LLM 会回退到 mock-llm，说明 API Key、Provider 或模型没有配置好。请到“设置”里配置并测试 LLM 后再生成精读报告。";
+        showPaperFeedback("warning", "LLM 尚未配置好", detail);
+        showFeedbackToast("warning", "LLM 尚未配置好", detail);
+        return false;
+      }
+      if (data.ok === false) {
+        const detail = data.error || "LLM 烟测未通过，请到“设置”里检查模型、API Key 和 Base URL。";
+        showPaperFeedback("warning", "LLM 烟测失败", detail);
+        showFeedbackToast("warning", "LLM 烟测失败", detail);
+        return false;
+      }
+      console.info(`PaperFlow LLM preflight ok: ${provider}:${model}`);
+      return true;
+    } catch (error) {
+      const detail = error.message || String(error);
+      showPaperFeedback("warning", "LLM 配置不可用", `精读报告需要可用 LLM。请到“设置”里测试 LLM：${detail}`);
+      showFeedbackToast("warning", "LLM 配置不可用", detail);
+      return false;
+    }
+  }
+
   function pushMetaText(push, papers, metadata = {}, options = {}) {
     if (!push?.push_id) return "尚未加载推荐批次。";
     const parts = [];
@@ -1246,6 +1276,9 @@
     if (generateReports && !selectedNumbers.length) {
       showPaperFeedback("warning", "请先选择精读论文", "先在论文卡片上点击“精读”，再点击“提交并精读”开始生成报告。");
       showFeedbackToast("warning", "请先选择精读论文", "精读、不感兴趣、稍后看三种状态互斥，只有已选精读的论文会生成报告。");
+      return;
+    }
+    if (generateReports && !(await ensureLlmReadyForReading())) {
       return;
     }
     const endpoint = generateReports ? "/api/submit" : "/api/feedback";
@@ -2311,6 +2344,27 @@
       }
       renderWikiList();
     }
+  }
+
+  async function refreshWiki() {
+    const data = await api("/api/wiki/refresh", {
+      method: "POST",
+      body: JSON.stringify({ user_id: currentUser() })
+    });
+    await loadWiki();
+    const daily = data.daily_notes || {};
+    const noteCount = Array.isArray(daily.daily_notes) ? daily.daily_notes.length : 0;
+    const errorCount = Array.isArray(daily.errors) ? daily.errors.length : 0;
+    const detail = [
+      `扫描 Daily Note ${daily.scanned || 0} 个`,
+      `重分类 ${daily.refreshed || 0} 个`,
+      `可视化 ${noteCount} 个`
+    ].join(" · ");
+    showFeedbackToast(
+      errorCount ? "warning" : "success",
+      errorCount ? "Wiki 已更新，部分报告跳过" : "Wiki 已更新",
+      errorCount ? `${detail} · ${daily.errors[0]}` : detail
+    );
   }
 
   async function searchWiki() {
@@ -3557,7 +3611,7 @@
     $("paperDate").addEventListener("change", syncDateControls);
     $("daysInput").addEventListener("change", syncDateControls);
     $("runDailyBtn").addEventListener("click", () => runAction(runDaily, "拉取论文"));
-    $("sortRelevanceBtn").addEventListener("click", () => {
+    $("sortRelevanceBtn")?.addEventListener("click", () => {
       if (!state.push?.papers?.length) {
         showFeedbackToast("warning", "暂无可排序论文", "请先拉取或加载推荐批次。");
         return;
@@ -3634,7 +3688,7 @@
     $("readArxivBtn").addEventListener("click", () => runAction(() => directRead("arxiv"), "生成报告"));
     $("readPdfBtn").addEventListener("click", () => runAction(() => directRead("pdf"), "生成报告"));
 
-    $("refreshWikiBtn").addEventListener("click", () => runAction(loadWiki, "更新 Wiki"));
+    $("refreshWikiBtn").addEventListener("click", () => runAction(refreshWiki, "更新 Wiki"));
     $("wikiSearchBtn").addEventListener("click", () => runAction(searchWiki, "搜索 Wiki"));
     $("wikiDailyScope")?.addEventListener("change", () => {
       const monthInput = $("wikiDailyMonth");

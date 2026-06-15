@@ -22,7 +22,7 @@ import tempfile
 import inspect
 from html import unescape
 from datetime import datetime
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Dict, Iterable, List, Optional, Any, Tuple
 from pathlib import Path
 from urllib.parse import quote, urljoin, urlparse
 
@@ -249,6 +249,8 @@ def _obsidian_year_dir(base_dir: Path, paper: Dict[str, Any]) -> Optional[Path]:
 
 def _obsidian_month_dir(base_dir: Path, paper: Dict[str, Any], kind: str) -> Optional[Path]:
     year_dir = _obsidian_year_dir(base_dir, paper)
+    if year_dir is None and kind in {"pdf", "reading_reports"} and _env_flag("PAPERFLOW_DAILY_NOTE_EXPORT", True):
+        year_dir = base_dir / _daily_note_folder_name(paper)
     if year_dir is None:
         return None
     if kind == "pdf":
@@ -2020,6 +2022,148 @@ def _sync_obsidian_daily_note(
     daily_note.write_text(updated.rstrip() + "\n", encoding="utf-8")
     _sync_obsidian_toc(daily_note)
     return str(daily_note)
+
+
+def _markdown_section_excerpt(content: str, *headings: str, max_chars: int = 900) -> str:
+    text = str(content or "")
+    for heading in headings:
+        pattern = re.compile(
+            rf"(?ms)^##\s+{re.escape(heading)}\s*$\n+(.*?)(?=^##\s+|\Z)"
+        )
+        match = pattern.search(text)
+        if not match:
+            continue
+        excerpt = match.group(1).strip()
+        excerpt = re.sub(r"(?m)^>\s*", "", excerpt)
+        excerpt = re.sub(r"(?m)^[-*]\s+", "", excerpt)
+        excerpt = re.sub(r"\n{3,}", "\n\n", excerpt).strip()
+        if excerpt:
+            return excerpt[:max_chars].rstrip()
+    return ""
+
+
+def _report_paper_from_metadata(metadata: Dict[str, Any], report: Dict[str, Any]) -> Dict[str, Any]:
+    title = _clean_text(metadata.get("title") or report.get("title"))
+    return {
+        "id": metadata.get("paper_id"),
+        "arxiv_id": metadata.get("arxiv_id"),
+        "doi": metadata.get("doi"),
+        "title": title or "Untitled Paper",
+        "authors": metadata.get("authors") or [],
+        "abstract": metadata.get("abstract") or "",
+        "publish_date": metadata.get("publish_date"),
+        "pdf_path": metadata.get("pdf_path"),
+        "pdf_url": metadata.get("pdf_url") or report.get("pdf_url"),
+        "source": metadata.get("source") or "reading_report",
+    }
+
+
+def _report_payload_from_metadata(
+    metadata: Dict[str, Any],
+    report_content: str,
+    report: Dict[str, Any],
+) -> Dict[str, Any]:
+    summary = (
+        _markdown_section_excerpt(report_content, "一句话总结", "摘要")
+        or _clean_text(report.get("snippet"))
+    )
+    return {
+        "paper_summary": summary,
+        "one_sentence_summary": summary,
+        "recommendation_label": metadata.get("recommendation_label"),
+        "generation_provider": metadata.get("generation_provider"),
+        "generation_model": metadata.get("generation_model"),
+        "report_style": metadata.get("report_style"),
+    }
+
+
+def sync_daily_notes_from_reports(
+    *,
+    user_id: str,
+    reports: Iterable[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Create or refresh Daily Notes from existing reading-report records."""
+    scanned = 0
+    synced = 0
+    daily_notes: List[str] = []
+    report_paths: List[str] = []
+    errors: List[str] = []
+
+    for report in reports or []:
+        scanned += 1
+        metadata = dict(report.get("metadata") or {})
+        report_user = _clean_text(metadata.get("user_id") or report.get("user_id"))
+        if user_id and report_user and report_user != user_id:
+            continue
+        report_content = str(report.get("markdown") or "")
+        if not report_content.strip():
+            continue
+        paper = _report_paper_from_metadata(metadata, report)
+        payload = _report_payload_from_metadata(metadata, report_content, report)
+        try:
+            saved_path = _save_reading_report_markdown(
+                user_id=user_id or report_user,
+                paper=paper,
+                report_content=report_content,
+                report_payload=payload,
+                doc_url=metadata.get("doc_url") or report.get("doc_url"),
+                doc_token=metadata.get("doc_token") or report.get("doc_token"),
+            )
+            synced += 1
+            report_paths.append(saved_path)
+            daily_note = _obsidian_daily_note_path(Path(saved_path), paper)
+            if daily_note is not None:
+                daily_notes.append(str(daily_note))
+        except Exception as exc:
+            errors.append(f"{paper.get('title') or report.get('report_path')}: {exc}")
+
+    return {
+        "scanned": scanned,
+        "synced": synced,
+        "daily_notes": sorted(set(daily_notes)),
+        "report_paths": sorted(set(report_paths)),
+        "errors": errors[:8],
+    }
+
+
+def refresh_daily_note_files(
+    *,
+    user_id: str,
+    daily_note_paths: Iterable[str],
+) -> Dict[str, Any]:
+    """Reclassify and refresh summaries in existing Daily Note files."""
+    user_profile = _daily_note_user_profile(user_id)
+    scanned = 0
+    refreshed = 0
+    paths: List[str] = []
+    errors: List[str] = []
+
+    for raw_path in daily_note_paths or []:
+        path = Path(str(raw_path or "")).expanduser()
+        if not path.is_absolute():
+            path = PROJECT_ROOT / path
+        if not path.exists() or not path.is_file():
+            continue
+        scanned += 1
+        try:
+            current = path.read_text(encoding="utf-8")
+            updated = _refresh_daily_note_topic_summaries(current, user_profile=user_profile)
+            updated = _llm_review_daily_note_categories(updated, user_profile=user_profile)
+            updated = _refresh_daily_note_topic_summaries(updated, user_profile=user_profile)
+            if updated.rstrip() + "\n" != current:
+                path.write_text(updated.rstrip() + "\n", encoding="utf-8")
+                _sync_obsidian_toc(path)
+            refreshed += 1
+            paths.append(str(path))
+        except Exception as exc:
+            errors.append(f"{path}: {exc}")
+
+    return {
+        "scanned": scanned,
+        "refreshed": refreshed,
+        "daily_notes": sorted(set(paths)),
+        "errors": errors[:8],
+    }
 
 
 def _daily_note_user_profile(user_id: str) -> Dict[str, Any]:

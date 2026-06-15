@@ -284,7 +284,7 @@ textarea {
   align-items: center;
   justify-content: space-between;
   gap: 18px;
-  max-width: 1280px;
+  max-width: 1520px;
   margin: 0 auto 18px;
 }
 
@@ -413,7 +413,7 @@ textarea {
 
 .view {
   display: none;
-  max-width: 1280px;
+  max-width: 1520px;
   margin: 0 auto;
 }
 
@@ -446,7 +446,7 @@ body.chat-view #chat {
 
 .recommend-layout {
   display: grid;
-  grid-template-columns: minmax(760px, 1fr) 328px;
+  grid-template-columns: minmax(0, 1fr);
   gap: 16px;
   align-items: start;
 }
@@ -656,9 +656,9 @@ body.chat-view #chat {
 
 .paper-card {
   display: grid;
-  grid-template-columns: 86px minmax(0, 1fr) 116px;
+  grid-template-columns: 86px minmax(0, 1fr) 128px;
   gap: 14px;
-  align-items: center;
+  align-items: start;
   min-height: 120px;
   border: 1px solid #e0e9f6;
   border-radius: 8px;
@@ -730,7 +730,7 @@ body.chat-view #chat {
 }
 
 .paper-abstract {
-  -webkit-line-clamp: 3;
+  -webkit-line-clamp: 6;
 }
 
 .paper-tags,
