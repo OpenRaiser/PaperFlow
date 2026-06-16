@@ -285,6 +285,7 @@ def test_synthesize_reading_report_with_llm_uses_local_provider(monkeypatch):
             "research_background": "论文关注科研助手在高噪声候选集上的筛选效率问题。",
             "core_method": "方法采用两阶段排序与证据过滤。",
             "key_results": "结果显示排序质量和阅读效率都有提升。",
+            "experimental_observations": "实验现象显示证据过滤质量比排序深度更影响最终阅读效率。",
             "main_contributions": ["提出两阶段流程", "给出更贴近使用场景的评测"],
             "limitations": ["跨领域泛化仍需进一步验证"],
             "relevance_points": ["和用户关注的智能体方向高度相关"],
@@ -309,10 +310,16 @@ def test_synthesize_reading_report_with_llm_uses_local_provider(monkeypatch):
 
     assert result["recommendation_label"] == "推荐阅读"
     assert result["main_contributions"][0] == "提出两阶段流程"
+    assert result["experimental_observations"].startswith("实验现象显示")
     assert result["generation_provider"] == "local"
     assert result["institution"] == "OpenAI"
     assert "Scientific Planner" in captured["user_text"]
     assert "institution" in captured["system_prompt"]
+    assert "experimental_observations" in captured["system_prompt"]
+    assert "发现了什么实验现象" in captured["system_prompt"]
+    assert "maximalist 风格" in captured["system_prompt"]
+    assert "800-1800 个中文字" in captured["system_prompt"]
+    assert "1200-3000 个中文字" in captured["system_prompt"]
     assert "科研论文精读助手" in captured["system_prompt"]
 
 

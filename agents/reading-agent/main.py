@@ -4100,6 +4100,7 @@ def _merge_report_payload(base: Dict[str, Any], llm_payload: Optional[Dict[str, 
         "related_work",
         "solution_approach",
         "experiments",
+        "experimental_observations",
         "future_directions",
         "paper_summary",
         "research_background",
@@ -4200,8 +4201,6 @@ def generate_reading_report(
         "analysis_pdf": "PDF full text" if is_en else "PDF 全文",
         "analysis_source_page": "source page + metadata" if is_en else "源站正文 + 元数据",
         "analysis_metadata": "abstract + metadata" if is_en else "摘要 + 元数据",
-        "about_minutes": "about" if is_en else "约",
-        "minutes": "min" if is_en else "分钟",
         "model": "model" if is_en else "模型",
         "keywords": "Keywords" if is_en else "关键词",
         "one_sentence": "One-Sentence Summary" if is_en else "一句话总结",
@@ -4226,7 +4225,6 @@ def generate_reading_report(
         "subjects": "Subjects/Categories" if is_en else "主题/分类",
         "date": "Date" if is_en else "日期",
         "recommendation_level": "Recommendation" if is_en else "推荐级别",
-        "estimated_reading_time": "Estimated reading time" if is_en else "预计阅读时间",
         "analysis_source": "Analysis source" if is_en else "解析来源",
         "generation_model": "Generation model" if is_en else "生成模型",
         "not_provided": "Not provided" if is_en else "未提供",
@@ -4288,7 +4286,6 @@ def generate_reading_report(
 
     lines.append(
         f"> {recommendation_stars} {recommendation_display_label} · "
-        f"{labels['about_minutes']} {int(payload.get('estimated_reading_minutes') or 8)} {labels['minutes']} · "
         f"{labels['model']} {generation_provider}/{generation_model}"
     )
     lines.append("")
@@ -4339,6 +4336,7 @@ def generate_reading_report(
     if not experiments:
         result_text = _clean_text(payload.get("key_results"))
         experiments = result_text or labels["experiments_empty"]
+    experimental_observations = payload.get("experimental_observations") or payload.get("key_results") or labels["experiments_empty"]
     future_directions = payload.get("future_directions")
     if not future_directions:
         future_items = []
@@ -4370,8 +4368,9 @@ def generate_reading_report(
             ("Q2", "What related work does it build on or compare against?"),
             ("Q3", "How does the paper solve the problem?"),
             ("Q4", "What experiments does the paper run?"),
-            ("Q5", "What directions are worth exploring next?"),
-            ("Q6", "Summarize the main content of the paper."),
+            ("Q5", "What empirical phenomena do the experiments reveal?"),
+            ("Q6", "What directions are worth exploring next?"),
+            ("Q7", "Summarize the main content of the paper."),
         ]
         if is_en
         else [
@@ -4379,13 +4378,14 @@ def generate_reading_report(
             ("Q2", "有哪些相关研究？"),
             ("Q3", "论文如何解决这个问题？"),
             ("Q4", "论文做了哪些实验？"),
-            ("Q5", "有什么可以进一步探索的点？"),
-            ("Q6", "总结一下论文的主要内容"),
+            ("Q5", "发现了什么实验现象？"),
+            ("Q6", "有什么可以进一步探索的点？"),
+            ("Q7", "总结一下论文的主要内容"),
         ]
     )
     for (qid, question_text), content in zip(
         qa_questions,
-        [problem_analysis, related_work, solution_approach, experiments, future_directions, paper_summary],
+        [problem_analysis, related_work, solution_approach, experiments, experimental_observations, future_directions, paper_summary],
     ):
         _append_template_qa_block(lines, qid, question_text, content, response_language=language)
 
@@ -4411,7 +4411,6 @@ def generate_reading_report(
     lines.append(f"- {labels['subjects']}{field_sep}{subjects}")
     lines.append(f"- {labels['date']}{field_sep}{_clean_text(paper.get('publish_date')) or labels['unknown']}")
     lines.append(f"- {labels['recommendation_level']}{field_sep}**{recommendation_display_label}**")
-    lines.append(f"- {labels['estimated_reading_time']}{field_sep}{labels['about_minutes']} {int(payload.get('estimated_reading_minutes') or 8)} {labels['minutes']}")
     lines.append(f"- {labels['analysis_source']}{field_sep}{analysis_source_label}")
     lines.append(f"- {labels['generation_model']}{field_sep}{generation_provider} / {generation_model}")
     if arxiv_id:

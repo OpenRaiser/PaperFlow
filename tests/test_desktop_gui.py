@@ -1713,6 +1713,33 @@ def test_report_record_derives_abs_url_and_patches_missing_institution(tmp_path:
     assert "- 机构：Shandong University; Zhongguancun Academy; Fudan University" in report["markdown"]
 
 
+def test_report_snippet_skips_legacy_recommendation_time_quote(tmp_path: Path) -> None:
+    report_path = tmp_path / "legacy.md"
+    report_path.write_text(
+        "\n".join(
+            [
+                "---",
+                'title: "Legacy"',
+                'report_version: "v1"',
+                "---",
+                "# Legacy",
+                "",
+                "> ★★☆☆☆ 按需阅读 · 约 20 分钟 · 模型 provider/model",
+                "",
+                "## 一句话总结",
+                "",
+                "这篇论文的正文摘要应该显示在侧边栏。",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    report = agents._report_record(report_path)  # noqa: SLF001 - report reader fallback contract
+
+    assert "约 20 分钟" not in report["snippet"]
+    assert report["snippet"] == "这篇论文的正文摘要应该显示在侧边栏。"
+
+
 def test_desktop_direct_read_generation_shows_status_feedback() -> None:
     html = (PROJECT_ROOT / "deployments/desktop/static/index.html").read_text(encoding="utf-8")
     script = (PROJECT_ROOT / "deployments/desktop/static/desktop.js").read_text(encoding="utf-8")
@@ -2055,6 +2082,10 @@ def test_reading_report_template_supports_english_response_language() -> None:
     assert "## Paper Details" in report
     assert "- Authors: Alice" in report
     assert "- Recommendation: **Recommended**" in report
+    assert "about 7 min" not in report
+    assert "Estimated reading time" not in report
+    assert "Q5: What empirical phenomena do the experiments reveal?" in report
+    assert "Q7: Summarize the main content of the paper." in report
     assert "## 基本信息" not in report
     assert "预计阅读时间" not in report
 
@@ -2076,6 +2107,7 @@ def test_reading_report_template_omits_resource_and_evidence_locator_blocks() ->
             "institution": "OpenAI",
             "recommendation_label": "强烈推荐",
             "analysis_source": "pdf",
+            "experimental_observations": "实验现象包括性能随证据质量提升而改善。",
             "analysis_note": "参考了 PDF 检索证据。",
             "report_evidence_anchors": {"method": ["p.1 method evidence"]},
             "field_evidence_map": {"core_method": ["p.2 method anchor"], "key_results": ["p.3 result anchor"]},
@@ -2089,6 +2121,11 @@ def test_reading_report_template_omits_resource_and_evidence_locator_blocks() ->
     assert "方法证据锚点" not in report
     assert "结果证据锚点" not in report
     assert "代码与资源" not in report
+    assert "预计阅读时间" not in report
+    assert "约 8 分钟" not in report
+    assert "Q5: 发现了什么实验现象？" in report
+    assert "Q7: 总结一下论文的主要内容" in report
+    assert "实验现象包括性能随证据质量提升而改善" in report
     assert "- 机构：OpenAI" in report
     assert "★★★★★（5/5）" in report
 

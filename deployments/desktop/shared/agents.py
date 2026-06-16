@@ -618,6 +618,8 @@ def _report_snippet(body: str) -> str:
         line = re.sub(r"^>+\s*", "", line)
         line = re.sub(r"^[-*]\s+", "", line)
         line = re.sub(r"`([^`]*)`", r"\1", line)
+        if re.match(r"^[★☆]{2,}.*(?:约\s*\d+\s*分钟|about\s+\d+\s+min)", line, flags=re.IGNORECASE):
+            continue
         if not line:
             continue
         return line[:240]
