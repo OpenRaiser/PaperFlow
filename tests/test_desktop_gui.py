@@ -54,6 +54,60 @@ def test_desktop_wiki_stream_helpers_emit_sse_frames() -> None:
     assert "_api_wiki_ask({}, body)" not in source
 
 
+def test_desktop_language_selector_and_response_language_contract() -> None:
+    html = (PROJECT_ROOT / "deployments/desktop/static/index.html").read_text(encoding="utf-8")
+    script = (PROJECT_ROOT / "deployments/desktop/static/desktop.js").read_text(encoding="utf-8")
+    css = (PROJECT_ROOT / "deployments/desktop/static/desktop.css").read_text(encoding="utf-8")
+
+    assert 'class="language-picker"' in html
+    assert 'id="languageSelect"' in html
+    assert 'value="zh"' in html
+    assert 'value="en"' in html
+    assert ".language-picker select" in css
+    assert "toggleLocale" not in script
+    assert "function setLocale(locale)" in script
+    assert "function responseLanguage()" in script
+    assert "response_language: responseLanguage()" in script
+    assert 'response_language: responseLanguage() })' in script
+    assert '$("languageSelect")?.addEventListener("change", (event) => setLocale(event.target.value))' in script
+
+
+def test_desktop_locale_covers_settings_and_wiki_dynamic_text() -> None:
+    script = (PROJECT_ROOT / "deployments/desktop/static/desktop.js").read_text(encoding="utf-8")
+
+    assert 'setText("#syncGithubBtn", text.wiki.githubSync.button);' in script
+    assert 'setLabelTexts(".source-auth-fields label", text.settings.sourceFieldLabels);' in script
+    assert 'sourceFieldLabels: ["Semantic Scholar API Key", "OpenReview username", "OpenReview token", "Conference cookie file"]' in script
+    assert "text.settings.notesGitReview" in script
+
+    assert '["当前用户画像", "Current User Profile"]' in script
+    assert '["多模态推理", "Multimodal Reasoning"]' in script
+    assert '["结构化记忆", "Structured Memory"]' in script
+    assert "function localizeWikiText(value)" in script
+    assert "return localizeWikiText(rawGraphTitle(node));" in script
+    assert "return localizeWikiText(rawGraphBody(node));" in script
+    assert "return [rawGraphTitle(node), rawGraphBody(node), node?.keywords, node?.node_type, graphId(node)]" in script
+    assert 'data-node-title="${escapeHtml(rawGraphTitle(node))}"' in script
+    assert '$("wikiEntryTitle").dataset.rawTitle = rawTitle;' in script
+    assert 'title: $("wikiEntryTitle").dataset.rawTitle || $("wikiEntryTitle").textContent,' in script
+
+
+def test_desktop_server_forwards_response_language_to_agents(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(agents, "wiki_ask", lambda **kwargs: captured.setdefault("wiki", kwargs) or {"text": ""})
+    monkeypatch.setattr(agents, "create_reading_reports", lambda **kwargs: captured.setdefault("read", kwargs) or {"created_docs": []})
+    monkeypatch.setattr(agents, "sync_reading_notes_github", lambda user_id, response_language="zh": captured.setdefault("github", {"user_id": user_id, "response_language": response_language}) or {"ok": True})
+
+    server.POST_ROUTES["/api/wiki/ask"]({}, {"user_id": "user_test", "question": "What is RAG?", "response_language": "en"})
+    server.POST_ROUTES["/api/read"]({}, {"user_id": "user_test", "push_id": "push_test", "selected_numbers": [1], "response_language": "en"})
+    server.POST_ROUTES["/api/github/sync"]({}, {"user_id": "user_test", "response_language": "en"})
+
+    assert captured["wiki"]["response_language"] == "en"
+    assert captured["read"]["response_language"] == "en"
+    assert captured["github"]["response_language"] == "en"
+
+
 def test_desktop_daily_target_date_controls_backend_fetch_window() -> None:
     today = server.datetime.now().date()
     server_source = (PROJECT_ROOT / "deployments/desktop/server.py").read_text(encoding="utf-8")
@@ -789,6 +843,25 @@ def test_desktop_wiki_ask_pins_filtered_daily_note_readings_for_rag_summary(monk
     assert "Retrieval augmented generation" in captured["pinned_nodes"][0]["body"]
 
 
+def test_desktop_wiki_ask_forwards_response_language(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured = {}
+
+    monkeypatch.setattr(agents, "_visible_wiki_node_ids", lambda _user_id: [])
+
+    def fake_answer_question(user_id, question, *, limit=8, pinned_nodes=None, response_language="zh", **_kwargs):
+        captured["response_language"] = response_language
+        captured["question"] = question
+        return {"text": "English answer [1]", "citations": []}
+
+    monkeypatch.setattr(agents.wiki_answer, "answer_question", fake_answer_question)
+
+    payload = agents.wiki_ask("user_test", "Summarize my research profile", scope="profile", response_language="en")
+
+    assert captured["response_language"] == "en"
+    assert "Prioritize profile" in captured["question"]
+    assert payload["response_language"] == "en"
+
+
 def test_desktop_wiki_ask_requires_mentions_for_ambiguous_two_paper_comparison(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(agents.wiki_answer, "answer_question", lambda *_args, **_kwargs: pytest.fail("ambiguous comparisons should not call LLM"))
 
@@ -1431,6 +1504,12 @@ def test_desktop_source_settings_explain_conference_auth() -> None:
     assert "renderConferenceSettings(sourcePrefs)" in script
     assert "selectedSettingConferences().join(\",\")" in script
     assert "conferenceAccessInfo(item)" in script
+    assert "function formatConferenceTimeline(value)" in script
+    assert "englishMonthNames" in script
+    assert "formatConferenceTimeline(item.acceptance_timeline)" in script
+    assert "formatConferenceTimeline(item.conference_date)" in script
+    assert "renderConferenceSettings(sourcePrefs);" in script
+    assert "updateSourceAuthStatus(sourcePrefs, envMap(state.settings));" in script
     assert "syncConferenceAccessUi(input.value)" in script
     assert "settingEnableCustomRss" in script
     assert 'input.disabled = normalized !== "credential"' in script
@@ -1495,13 +1574,20 @@ def test_desktop_direct_read_generation_shows_status_feedback() -> None:
     assert 'class="direct-read-status"' in html
     assert "function setDirectReadStatus" in script
     assert "function setDirectReadBusy" in script
-    assert "正在生成${sourceLabel}精读报告" in script
+    assert "generatingTitle: (source) => `正在生成${source}精读报告`" in script
+    assert "generatingTitle: (source) => `Generating ${source} reading report`" in script
     assert "后端正在拉取论文信息、调用模型并写入本地报告库" in script
+    assert "The backend is fetching paper metadata, calling the model, and writing the local report." in script
     assert "报告已生成" in script
+    assert "Report generated" in script
     assert "报告生成失败" in script
+    assert "Report generation failed" in script
     assert "请先填写 arXiv ID" in script
+    assert "Enter an arXiv ID" in script
     assert "请先填写 PDF 路径" in script
-    assert "showFeedbackToast(warning ? \"warning\" : \"success\", \"精读报告已生成\", reportTitle)" in script
+    assert "Enter a PDF path" in script
+    assert "showFeedbackToast(warning ? \"warning\" : \"success\", ui().reports.generatedToast, reportTitle)" in script
+    assert "payload.response_language = responseLanguage();" in script
     assert "await openReport(doc.report_id)" in script
     assert ".direct-read-status {" in css
     assert ".direct-read-status.success" in css
@@ -1530,12 +1616,15 @@ def test_desktop_user_picker_hydrates_settings_profile_form() -> None:
     assert "renderProfileForm(data);" in script
     assert "await loadCurrentProfile();" in script
     assert "$(\"profileUserId\").value = userId;" in script
-    assert 'profileInfoItem("个人机构", profileAffiliation(raw, userInfo), "wide")' in script
-    assert 'profileEditItem("关注方向", "profileDirectionsInput"' in script
-    assert 'profileEditItem("关注关键词", "profileKeywordsInput"' in script
-    assert 'profileEditItem("关注作者", "profileAuthorsInput"' in script
-    assert 'profileEditItem("关注机构", "profileInstitutionsInput"' in script
-    assert 'profileEditItem("关注主题", "profileTopicsInput"' in script
+    assert "profileFields" in script
+    assert 'affiliation: "个人机构"' in script
+    assert 'affiliation: "Affiliation"' in script
+    assert 'profileInfoItem(labels.affiliation, profileAffiliation(raw, userInfo), "wide")' in script
+    assert 'profileEditItem(labels.directions, "profileDirectionsInput"' in script
+    assert 'profileEditItem(labels.keywords, "profileKeywordsInput"' in script
+    assert 'profileEditItem(labels.authors, "profileAuthorsInput"' in script
+    assert 'profileEditItem(labels.institutions, "profileInstitutionsInput"' in script
+    assert 'profileEditItem(labels.topics, "profileTopicsInput"' in script
     assert 'profileAffiliationInput' not in script
     assert "用分号或换行分隔；可写 方向:0.8" in script
     assert "用分号或换行分隔；可写 主题:0.8" in script
@@ -1550,8 +1639,10 @@ def test_desktop_user_picker_hydrates_settings_profile_form() -> None:
     assert "profileEditableDescription" not in script
     assert 'natural_language: ""' in script
     assert 'renderSettingTags("profileTagGrid"' not in script
-    assert 'userInfo.has_profile ? "画像已加载" : "尚未生成画像，可在此补充"' in script
-    assert "showSettingsMessage(`已加载 ${userId} 的画像信息。`);" in script
+    assert "userInfo.has_profile ? labels.loaded : labels.missing" in script
+    assert "profileLoaded: (userId) => `已加载 ${userId} 的画像信息。`" in script
+    assert "profileLoaded: (userId) => `Loaded profile information for ${userId}.`" in script
+    assert "showSettingsMessage(ui().settings.profileLoaded(userId));" in script
 
 
 def test_desktop_save_profile_applies_manual_editable_fields(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1727,9 +1818,11 @@ def test_desktop_reading_reports_forward_saved_report_style(tmp_path, monkeypatc
         push_id="push_style",
         paper_numbers=[1],
         write_feishu=False,
+        response_language="en",
     )
 
     assert captured["request_metadata"]["report_style"] == "brief"
+    assert captured["request_metadata"]["response_language"] == "en"
 
 
 def test_desktop_direct_arxiv_read_generates_backend_report(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1787,6 +1880,113 @@ def test_reading_report_template_changes_with_saved_style() -> None:
     )
 
     assert "Deep-Dive Checklist" in report
+
+
+def test_reading_report_template_supports_english_response_language() -> None:
+    report = agents.reading_agent.generate_reading_report(
+        {
+            "title": "English Paper",
+            "abstract": "A structured abstract.",
+            "authors": ["Alice"],
+            "source": "arxiv",
+            "system_label": "high_relevant",
+            "system_score": 0.7,
+        },
+        {"core_directions": {}},
+        report_payload={
+            "response_language": "en",
+            "one_sentence_summary": "A concise English summary.",
+            "abstract": "A structured abstract.",
+            "recommendation_label": "推荐阅读",
+            "estimated_reading_minutes": 7,
+        },
+    )
+
+    assert "## One-Sentence Summary" in report
+    assert "## Paper Details" in report
+    assert "- Authors: Alice" in report
+    assert "- Recommendation: **Recommended**" in report
+    assert "## 基本信息" not in report
+    assert "预计阅读时间" not in report
+
+
+def test_reading_report_english_heuristic_fallbacks_do_not_emit_chinese(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(agents.reading_agent, "_retrieve_report_evidence", lambda *_args, **_kwargs: {})
+
+    paper = {
+        "title": "Sparse English Paper",
+        "authors": ["Alice"],
+        "source": "arxiv",
+        "score": 0.72,
+        "abstract": "",
+    }
+    profile = {
+        "core_directions": {"multimodal-reasoning": 0.8},
+        "methodology_preferences": {
+            "preference_data_driven_over_theory": True,
+            "preference_systematic_work_over_incremental": True,
+        },
+    }
+
+    payload = agents.reading_agent.build_heuristic_report_payload(
+        paper,
+        profile,
+        pdf_error="PDF timed out",
+        response_language="en",
+    )
+    report = agents.reading_agent.generate_reading_report(
+        paper,
+        profile,
+        report_payload=payload,
+        response_language="en",
+    )
+
+    assert payload["response_language"] == "en"
+    assert payload["research_background"].startswith("Start with the original abstract")
+    assert "PDF fetching timed out" in payload["analysis_note"]
+    assert "Relationship to the user profile" in report
+    assert "## Paper Details" in report
+    assert not any("\u4e00" <= char <= "\u9fff" for char in report)
+
+
+def test_reading_report_creation_passes_response_language_to_heuristics(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+    paper = {"id": 1, "title": "English Creation Paper", "abstract": "", "authors": ["Alice"]}
+
+    monkeypatch.setattr(agents.reading_agent, "get_profile", lambda _user_id: {"core_directions": {}})
+    monkeypatch.setattr(agents.reading_agent, "ensure_profile_schema", lambda profile: profile)
+    monkeypatch.setattr(agents.reading_agent, "get_existing_reading_reports_for_papers", lambda _user_id, _paper_ids: {})
+    monkeypatch.setattr(agents.reading_agent, "_enrich_paper_for_reading_report_compat", lambda item, user_id=None: (item, None, None))
+    monkeypatch.setattr(agents.reading_agent, "_synthesize_report_with_llm", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(agents.reading_agent, "_save_reading_report_markdown", lambda **_kwargs: str(tmp_path / "report.md"))
+    monkeypatch.setattr(agents.reading_agent, "ingest_reading_report_to_wiki", lambda **_kwargs: {})
+    monkeypatch.setattr(agents.reading_agent, "log_behavior", lambda **_kwargs: None)
+    monkeypatch.setattr(agents.reading_agent, "_annotate_tracking_links", lambda _docs, _user_id: None)
+
+    def fake_build_payload(*_args, **kwargs):
+        captured["response_language"] = kwargs.get("response_language")
+        return {
+            "response_language": kwargs.get("response_language"),
+            "abstract": "Abstract.",
+            "one_sentence_summary": "Summary.",
+            "recommendation_label": "推荐阅读",
+            "analysis_source": "abstract",
+            "estimated_reading_minutes": 5,
+        }
+
+    monkeypatch.setattr(agents.reading_agent, "build_heuristic_report_payload", fake_build_payload)
+
+    docs = agents.reading_agent.create_reading_report(
+        user_id="user_en",
+        paper_ids=[1],
+        papers=[paper],
+        send_to_feishu=False,
+        request_metadata={"response_language": "en"},
+    )
+
+    assert captured["response_language"] == "en"
+    assert docs[0]["title"].startswith("[Reading]")
+    assert docs[0]["report_payload"]["response_language"] == "en"
 
 
 def test_desktop_backfills_reused_reading_report_to_wiki(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2000,7 +2200,8 @@ def test_desktop_paper_date_and_metrics_sync_with_backend() -> None:
     assert "selectedDateFetchDays()" in script
     assert "runButton.disabled = false" in script
     assert 'target_date: $("paperDate").value' in script
-    assert "每日上限 ${metadata.daily_limit}" in script
+    assert "dailyLimit: (limit) => `每日上限 ${limit}`" in script
+    assert "dailyLimit: (limit) => `Daily limit ${limit}`" in script
     assert "旧缓存参数不一致时会自动刷新" in script
     assert 'id="saveAdvancedSettingsBtn" class="primary" type="button">保存设置</button>' in html
     assert 'runAction(saveSettings, "保存设置")' in script

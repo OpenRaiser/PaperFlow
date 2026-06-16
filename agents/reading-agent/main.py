@@ -99,6 +99,11 @@ HTTP_RETRY_TOTAL = int(os.environ.get("PAPERFLOW_HTTP_RETRIES", "2"))
 HTTP_RETRY_BACKOFF = float(os.environ.get("PAPERFLOW_HTTP_BACKOFF", "0.8"))
 
 
+def _normalize_response_language(value: Any = None) -> str:
+    raw = str(value or "").strip().lower().replace("_", "-")
+    return "en" if raw.startswith("en") or raw == "english" else "zh"
+
+
 MONTH_LABELS = {
     1: "Jan",
     2: "Feb",
@@ -760,20 +765,36 @@ def _preferred_evidence_top_k(user_profile: Dict[str, Any]) -> int:
     return max(3, min(5, preferred))
 
 
-def _describe_pdf_fallback(pdf_error: Optional[str], *, fallback_mode: str = "abstract") -> str:
+def _describe_pdf_fallback(
+    pdf_error: Optional[str],
+    *,
+    fallback_mode: str = "abstract",
+    response_language: str = "zh",
+) -> str:
+    is_en = _normalize_response_language(response_language) == "en"
     lowered = _clean_text(pdf_error).lower()
     if not lowered:
-        reason = "未能拿到 PDF 全文"
+        reason = "The PDF full text was unavailable" if is_en else "未能拿到 PDF 全文"
     elif "403" in lowered or "forbidden" in lowered:
-        reason = "源站拒绝了 PDF 访问"
+        reason = "The source blocked PDF access" if is_en else "源站拒绝了 PDF 访问"
     elif "timed out" in lowered or "timeout" in lowered:
-        reason = "PDF 抓取超时"
+        reason = "PDF fetching timed out" if is_en else "PDF 抓取超时"
     elif "ssl" in lowered or "eof" in lowered or "connection" in lowered:
-        reason = "PDF 抓取时网络连接不稳定"
+        reason = "The network connection was unstable while fetching the PDF" if is_en else "PDF 抓取时网络连接不稳定"
     elif "content-type" in lowered or "did not return a pdf" in lowered:
-        reason = "源站没有直接返回 PDF 文件"
+        reason = "The source did not return a PDF file directly" if is_en else "源站没有直接返回 PDF 文件"
     else:
-        reason = "PDF 抓取或解析失败"
+        reason = "PDF fetching or parsing failed" if is_en else "PDF 抓取或解析失败"
+    if is_en:
+        if fallback_mode == "source_page":
+            return (
+                f"{reason}; this report fell back to the source page text and metadata. "
+                "Verify method and experiment details in the original paper."
+            )
+        return (
+            f"{reason}; this report fell back to the template, abstract, and metadata. "
+            "Verify method and experiment details in the original paper."
+        )
     if fallback_mode == "source_page":
         return f"{reason}，本次报告已回退为基于源站正文和元数据生成；方法与实验细节仍建议回原文核对。"
     return f"{reason}，本次报告改为按模板基于摘要和元数据生成；方法与实验细节建议回原文核对。"
@@ -788,6 +809,18 @@ def _recommendation_score(label: str) -> int:
         "按需阅读": 2,
     }
     return mapping.get(normalized, 3)
+
+
+def _recommendation_display_label(label: str, response_language: str = "zh") -> str:
+    normalized = _clean_text(label)
+    if _normalize_response_language(response_language) != "en":
+        return normalized
+    return {
+        "强烈推荐": "Strongly recommended",
+        "推荐阅读": "Recommended",
+        "值得快速浏览": "Worth a quick scan",
+        "按需阅读": "Read if needed",
+    }.get(normalized, normalized or "Recommended")
 
 
 def _label_rank(label: str) -> int:
@@ -907,7 +940,15 @@ def _get_direct_pdf_url(paper: Dict[str, Any]) -> str:
     return ""
 
 
-def _build_resource_items(paper: Dict[str, Any]) -> List[Tuple[str, str]]:
+def _build_resource_items(paper: Dict[str, Any], response_language: str = "zh") -> List[Tuple[str, str]]:
+    language = _normalize_response_language(response_language)
+    missing = "No public link found yet" if language == "en" else "暂未发现公开链接"
+    labels = {
+        "code": "Code" if language == "en" else "代码",
+        "data": "Data" if language == "en" else "数据",
+        "project": "Project page" if language == "en" else "项目主页",
+        "pdf": "Paper PDF" if language == "en" else "原文 PDF",
+    }
     code_url = _get_first_url(paper, "code_url", "github_url", "repo_url", "repository_url")
     dataset_url = _get_first_url(paper, "dataset_url", "data_url")
     project_url = _get_first_url(
@@ -924,10 +965,10 @@ def _build_resource_items(paper: Dict[str, Any]) -> List[Tuple[str, str]]:
     pdf_url = _get_direct_pdf_url(paper)
 
     items: List[Tuple[str, str]] = []
-    items.append(("代码", _format_plain_url(code_url) if code_url else "暂未发现公开链接"))
-    items.append(("数据", _format_plain_url(dataset_url) if dataset_url else "暂未发现公开链接"))
-    items.append(("项目主页", _format_plain_url(project_url) if project_url else "暂未发现公开链接"))
-    items.append(("原文 PDF", _format_plain_url(pdf_url) if pdf_url else "暂未发现公开链接"))
+    items.append((labels["code"], _format_plain_url(code_url) if code_url else missing))
+    items.append((labels["data"], _format_plain_url(dataset_url) if dataset_url else missing))
+    items.append((labels["project"], _format_plain_url(project_url) if project_url else missing))
+    items.append((labels["pdf"], _format_plain_url(pdf_url) if pdf_url else missing))
 
     arxiv_id = _clean_text(paper.get("arxiv_id"))
     if arxiv_id:
@@ -956,7 +997,13 @@ def _format_subjects(paper: Dict[str, Any]) -> str:
     return "未知"
 
 
-def _collect_report_action_pairs(paper: Dict[str, Any]) -> List[Tuple[str, str]]:
+def _collect_report_action_pairs(paper: Dict[str, Any], response_language: str = "zh") -> List[Tuple[str, str]]:
+    language = _normalize_response_language(response_language)
+    labels = {
+        "paper": "Paper" if language == "en" else "原文",
+        "code": "Code" if language == "en" else "代码",
+        "project": "Project" if language == "en" else "项目",
+    }
     candidates: List[Tuple[str, str]] = []
     pdf_url = _get_direct_pdf_url(paper)
     if pdf_url:
@@ -976,15 +1023,15 @@ def _collect_report_action_pairs(paper: Dict[str, Any]) -> List[Tuple[str, str]]
     if not paper_url and arxiv_id:
         paper_url = f"https://arxiv.org/abs/{arxiv_id}"
     if paper_url:
-        candidates.append(("原文", paper_url))
+        candidates.append((labels["paper"], paper_url))
 
     code_url = _get_first_url(paper, "code_url", "github_url", "repo_url", "repository_url")
     if code_url:
-        candidates.append(("代码", code_url))
+        candidates.append((labels["code"], code_url))
 
     project_url = _get_first_url(paper, "project_url")
     if project_url:
-        candidates.append(("项目", project_url))
+        candidates.append((labels["project"], project_url))
 
     seen: set[str] = set()
     pairs: List[Tuple[str, str]] = []
@@ -997,9 +1044,9 @@ def _collect_report_action_pairs(paper: Dict[str, Any]) -> List[Tuple[str, str]]
     return pairs
 
 
-def _build_report_action_links(paper: Dict[str, Any]) -> str:
+def _build_report_action_links(paper: Dict[str, Any], response_language: str = "zh") -> str:
     """Bullet list of action URLs (Feishu-safe, one URL per line)."""
-    return "\n".join(f"- {label}: {url}" for label, url in _collect_report_action_pairs(paper))
+    return "\n".join(f"- {label}: {url}" for label, url in _collect_report_action_pairs(paper, response_language))
 
 
 def _append_qa_block(lines: List[str], label: str, question: str, body: Any) -> None:
@@ -1021,7 +1068,8 @@ def _append_qa_block(lines: List[str], label: str, question: str, body: Any) -> 
     lines.append("")
 
 
-def _build_recommendation_reason(payload: Dict[str, Any]) -> str:
+def _build_recommendation_reason(payload: Dict[str, Any], response_language: str = "zh") -> str:
+    language = _normalize_response_language(response_language)
     reasons: List[str] = []
     relevance_points = payload.get("relevance_points") or []
     reading_focus = payload.get("reading_focus") or []
@@ -1030,14 +1078,26 @@ def _build_recommendation_reason(payload: Dict[str, Any]) -> str:
     if relevance_points:
         reasons.append(_clean_text(relevance_points[0]))
     if analysis_source == "pdf":
-        reasons.append("这次已拿到 PDF 全文结构，方法和结果信息相对更完整。")
+        reasons.append(
+            "This run used the full PDF structure, so method and result details are relatively more complete."
+            if language == "en"
+            else "这次已拿到 PDF 全文结构，方法和结果信息相对更完整。"
+        )
     elif _clean_text(payload.get("analysis_note")):
         reasons.append(_clean_text(payload.get("analysis_note")))
     if reading_focus:
-        reasons.append(f"建议优先看：{_clean_text(reading_focus[0])}")
+        reasons.append(
+            f"Recommended first focus: {_clean_text(reading_focus[0])}"
+            if language == "en"
+            else f"建议优先看：{_clean_text(reading_focus[0])}"
+        )
 
     if not reasons:
-        reasons.append("当前推荐主要基于题目、摘要、元数据和你的画像匹配结果。")
+        reasons.append(
+            "This recommendation is mainly based on title, abstract, metadata, and profile matching."
+            if language == "en"
+            else "当前推荐主要基于题目、摘要、元数据和你的画像匹配结果。"
+        )
     return reasons[0]
 
 
@@ -1048,16 +1108,21 @@ def _looks_like_placeholder_title(title: str) -> bool:
     return bool(re.fullmatch(r"(paper|test paper)\s*\d*", normalized))
 
 
-def _format_direction_label(direction: str) -> str:
+def _format_direction_label(direction: str, response_language: str = "zh") -> str:
+    language = _normalize_response_language(response_language)
     normalized = str(direction or "").strip()
     if not normalized:
-        return "当前方向"
+        return "Current direction" if language == "en" else "当前方向"
     formatter = getattr(direction_lexicon, "format_direction_label", None)
     if callable(formatter):
-        label = str(formatter(normalized, prefer_chinese=True) or "").strip()
+        label = str(formatter(normalized, prefer_chinese=(language != "en")) or "").strip()
         if label:
             return label
     lowered = normalized.lower()
+    if language == "en":
+        return (
+            normalized.replace("-", " ").replace("_", " ").title().replace("Gui", "GUI").replace("Ai", "AI")
+        )
     if lowered in DIRECTION_LABELS:
         return DIRECTION_LABELS[lowered]
     if any("\u4e00" <= ch <= "\u9fff" for ch in normalized):
@@ -1272,6 +1337,19 @@ def _is_report_record_current(report_record: Optional[Dict[str, Any]]) -> bool:
     return _clean_text(metadata.get("report_version")) == READING_REPORT_OUTPUT_VERSION
 
 
+def _report_record_matches_language(report_record: Optional[Dict[str, Any]], response_language: str) -> bool:
+    if not isinstance(report_record, dict):
+        return False
+    language = _normalize_response_language(response_language)
+    metadata = report_record.get("metadata") or {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+    recorded = _clean_text(metadata.get("response_language") or metadata.get("language"))
+    if not recorded:
+        return language == "zh"
+    return _normalize_response_language(recorded) == language
+
+
 def _lookup_existing_pdf_report(
     user_id: str,
     request_metadata: Dict[str, Any],
@@ -1287,6 +1365,8 @@ def _lookup_existing_pdf_report(
     if not report_record:
         return None
     if not _is_report_record_current(report_record):
+        return None
+    if not _report_record_matches_language(report_record, request_metadata.get("response_language")):
         return None
 
     return _build_reused_doc_entry(fallback_paper, report_record)
@@ -2074,6 +2154,7 @@ def _report_payload_from_metadata(
         "generation_provider": metadata.get("generation_provider"),
         "generation_model": metadata.get("generation_model"),
         "report_style": metadata.get("report_style"),
+        "response_language": metadata.get("response_language"),
     }
 
 
@@ -2516,6 +2597,7 @@ def _save_reading_report_markdown(
         "doc_token": doc_token,
         "generation_provider": report_payload.get("generation_provider"),
         "generation_model": report_payload.get("generation_model"),
+        "response_language": report_payload.get("response_language"),
         "report_version": READING_REPORT_OUTPUT_VERSION,
         "daily_note_path": str(daily_note_path) if daily_note_path else None,
         "saved_at": datetime.now().isoformat(timespec="seconds"),
@@ -3238,7 +3320,9 @@ def _build_relevance_points(
     user_profile: Dict[str, Any],
     combined_text: str,
     parsed_pdf: Optional[Dict[str, Any]],
+    response_language: str = "zh",
 ) -> List[str]:
+    is_en = _normalize_response_language(response_language) == "en"
     text_lower = combined_text.lower()
     points: List[str] = []
 
@@ -3249,30 +3333,67 @@ def _build_relevance_points(
     for direction, weight in sorted_directions[:3]:
         tokens = str(direction).lower().replace("-", " ").replace("_", " ").split()
         if str(direction).lower() in text_lower or any(token in text_lower for token in tokens if len(token) >= 4):
-            matched.append(f"{_format_direction_label(direction)}（权重 {float(weight):.2f}）")
+            if is_en:
+                matched.append(f"{_format_direction_label(direction, response_language)} (weight {float(weight):.2f})")
+            else:
+                matched.append(f"{_format_direction_label(direction)}（权重 {float(weight):.2f}）")
 
     if matched:
-        points.append(f"这篇论文和你当前画像里的方向有直接重合：{', '.join(matched)}。")
+        points.append(
+            f"This paper directly overlaps with the current profile directions: {', '.join(matched)}."
+            if is_en
+            else f"这篇论文和你当前画像里的方向有直接重合：{', '.join(matched)}。"
+        )
     elif sorted_directions:
-        points.append(f"它不一定和你当前最核心的 {_format_direction_label(sorted_directions[0][0])} 完全同题，但方法设计和评测组织值得借鉴。")
+        direction_label = _format_direction_label(sorted_directions[0][0], response_language)
+        points.append(
+            f"It may not exactly match the current core direction, {direction_label}, but its method design and evaluation structure are worth inspecting."
+            if is_en
+            else f"它不一定和你当前最核心的 {direction_label} 完全同题，但方法设计和评测组织值得借鉴。"
+        )
     else:
-        points.append("你当前画像还在持续学习阶段，这篇论文适合作为新的兴趣锚点来判断后续是否继续追踪。")
+        points.append(
+            "The current profile is still learning; this paper can act as a new interest anchor for deciding whether to keep tracking the topic."
+            if is_en
+            else "你当前画像还在持续学习阶段，这篇论文适合作为新的兴趣锚点来判断后续是否继续追踪。"
+        )
 
     preferences = user_profile.get("methodology_preferences", {}) or {}
     if preferences.get("preference_data_driven_over_theory"):
-        points.append("从方法论上看，它偏向数据驱动或实验验证路径，和你当前偏好比较一致。")
+        points.append(
+            "Methodologically, it leans toward a data-driven or empirically validated path, which matches the current profile preference."
+            if is_en
+            else "从方法论上看，它偏向数据驱动或实验验证路径，和你当前偏好比较一致。"
+        )
     if preferences.get("preference_systematic_work_over_incremental"):
-        points.append("如果你更看重系统性工作，可以重点看它如何组织任务设定、实验协议和整体框架。")
+        points.append(
+            "If the profile favors systematic work, focus on how the paper organizes the task setup, experiment protocol, and overall framework."
+            if is_en
+            else "如果你更看重系统性工作，可以重点看它如何组织任务设定、实验协议和整体框架。"
+        )
     if preferences.get("preference_bio_science_application"):
-        points.append("若你当前关注生物或科学应用，建议额外留意论文中的任务场景、数据来源和落地边界。")
+        points.append(
+            "For bio or science-application interests, pay extra attention to the task setting, data source, and deployment boundary."
+            if is_en
+            else "若你当前关注生物或科学应用，建议额外留意论文中的任务场景、数据来源和落地边界。"
+        )
     if parsed_pdf and parsed_pdf.get("sections", {}).get("results"):
-        points.append("建议把精力放在 Results/Experiments 部分，判断提升是否真正来自核心方法而不是实验技巧。")
+        points.append(
+            "Spend time on Results / Experiments to judge whether the gains come from the core method rather than experimental tricks."
+            if is_en
+            else "建议把精力放在 Results/Experiments 部分，判断提升是否真正来自核心方法而不是实验技巧。"
+        )
 
     score = float(paper.get("score") or 0.0)
     if score > 0:
-        points.append(f"当前推荐分约为 {score:.2f}，系统判断它与画像存在一定相关性。")
+        points.append(
+            f"The current recommendation score is about {score:.2f}; the system sees some relevance to the profile."
+            if is_en
+            else f"当前推荐分约为 {score:.2f}，系统判断它与画像存在一定相关性。"
+        )
 
     return _unique_preserve_order(points)[:4]
+
 def _legacy_generate_reading_report(paper: Dict, user_profile: Dict) -> str:
     """
     生成精读报告
@@ -3549,7 +3670,10 @@ def build_heuristic_report_payload(
     user_profile: Dict[str, Any],
     parsed_pdf: Optional[Dict[str, Any]] = None,
     pdf_error: Optional[str] = None,
+    response_language: str = "zh",
 ) -> Dict[str, Any]:
+    language = _normalize_response_language(response_language)
+    is_en = language == "en"
     sections = dict((parsed_pdf or {}).get("sections") or {})
     parsed_source_kind = _clean_text((parsed_pdf or {}).get("source_kind")).lower() or ("pdf" if parsed_pdf else "abstract")
     if _prefer_candidate_abstract(paper.get("abstract"), (parsed_pdf or {}).get("abstract")):
@@ -3569,7 +3693,11 @@ def build_heuristic_report_payload(
     bg_from_abstract = _infer_section_from_abstract(abstract, "background")
     research_background = _first_non_empty(bg_from_evidence, bg_from_pdf, bg_from_abstract)
     if not research_background:
-        research_background = "建议先查看原文摘要和引言部分以了解研究背景。"
+        research_background = (
+            "Start with the original abstract and introduction to understand the research background."
+            if is_en
+            else "建议先查看原文摘要和引言部分以了解研究背景。"
+        )
 
     method_from_evidence = " ".join(
         _collect_evidence_sentences(
@@ -3583,7 +3711,11 @@ def build_heuristic_report_payload(
     method_from_abstract = _infer_section_from_abstract(abstract, "method")
     core_method = _first_non_empty(method_from_evidence, method_from_pdf, method_from_abstract)
     if not core_method:
-        core_method = "方法细节建议重点查看原文的 Method / Approach 部分。"
+        core_method = (
+            "Method details were not extracted reliably; focus on the Method / Approach section in the original paper."
+            if is_en
+            else "方法细节建议重点查看原文的 Method / Approach 部分。"
+        )
 
     results_from_evidence = " ".join(
         _collect_evidence_sentences(
@@ -3597,7 +3729,11 @@ def build_heuristic_report_payload(
     results_from_abstract = _infer_section_from_abstract(abstract, "results")
     key_results = _first_non_empty(results_from_evidence, results_from_pdf, results_from_abstract)
     if not key_results:
-        key_results = "实验结果建议重点核对原文表格、图示和主要指标。"
+        key_results = (
+            "Experimental results were not extracted reliably; check the tables, figures, and main metrics in the original paper."
+            if is_en
+            else "实验结果建议重点核对原文表格、图示和主要指标。"
+        )
 
     summary_candidates = _pick_sentences(abstract, limit=1, cues=CONTRIBUTION_CUES + RESULT_CUES)
     if not summary_candidates:
@@ -3609,7 +3745,11 @@ def build_heuristic_report_payload(
         )
     if not summary_candidates:
         summary_candidates = _pick_sentences(introduction or abstract, limit=1)
-    one_sentence_summary = summary_candidates[0] if summary_candidates else "本文的核心信息仍建议结合原文进一步核对。"
+    one_sentence_summary = summary_candidates[0] if summary_candidates else (
+        "The core claim still needs to be verified against the original paper."
+        if is_en
+        else "本文的核心信息仍建议结合原文进一步核对。"
+    )
 
     main_contributions = _unique_preserve_order(
         _collect_evidence_sentences(retrieved_evidence, "method", limit=2, cues=CONTRIBUTION_CUES)
@@ -3619,11 +3759,19 @@ def build_heuristic_report_payload(
         + _pick_sentences(results, limit=1, cues=RESULT_CUES)
     )[:3]
     if not main_contributions:
-        main_contributions = [
-            "论文给出了明确的问题定义和任务设定，适合作为领域入口文献来读。",
-            "文中提供了可直接关注的方法主线，建议结合原文图表理解其模块关系。",
-            "实验部分值得重点核对，以确认结论是否和方法创新真正对应。",
-        ]
+        main_contributions = (
+            [
+                "The paper gives a clear problem definition and task setup, making it useful as an entry point into the area.",
+                "The method thread is worth following directly; use the original figures to understand how the modules connect.",
+                "The experiments should be checked carefully to verify whether the conclusion really follows from the method contribution.",
+            ]
+            if is_en
+            else [
+                "论文给出了明确的问题定义和任务设定，适合作为领域入口文献来读。",
+                "文中提供了可直接关注的方法主线，建议结合原文图表理解其模块关系。",
+                "实验部分值得重点核对，以确认结论是否和方法创新真正对应。",
+            ]
+        )
 
     limitations = _unique_preserve_order(
         _collect_evidence_sentences(retrieved_evidence, "limitations", limit=2, cues=LIMITATION_CUES)
@@ -3631,56 +3779,117 @@ def build_heuristic_report_payload(
         + _pick_sentences(discussion, limit=2, cues=LIMITATION_CUES)
     )
     if not limitations:
-        limitations = ["文中未明显展开局限性，阅读时建议重点核对数据覆盖范围、评测设置和泛化边界。"]
+        limitations = [
+            (
+                "The limitations are not clearly expanded in the extracted text; check data coverage, evaluation setup, and generalization boundaries."
+                if is_en
+                else "文中未明显展开局限性，阅读时建议重点核对数据覆盖范围、评测设置和泛化边界。"
+            )
+        ]
         if pdf_error:
-            limitations.append("本次未成功抓取 PDF，方法与实验细节部分仍应以原文为准。")
+            limitations.append(
+                "The PDF was not fetched successfully, so method and experiment details should still be verified in the original paper."
+                if is_en
+                else "本次未成功抓取 PDF，方法与实验细节部分仍应以原文为准。"
+            )
 
     reading_focus = []
     evidence_sections = _collect_evidence_sections(retrieved_evidence, "relevance")
     if evidence_sections:
-        reading_focus.append(f"优先核对语义命中的全文片段：{' / '.join(evidence_sections)}。")
+        reading_focus.append(
+            f"First verify the full-text sections hit by semantic retrieval: {' / '.join(evidence_sections)}."
+            if is_en
+            else f"优先核对语义命中的全文片段：{' / '.join(evidence_sections)}。"
+        )
     if introduction:
-        reading_focus.append("先看 Introduction，确认论文到底在补哪一块空白。")
+        reading_focus.append(
+            "Start with the Introduction to identify the exact gap the paper claims to fill."
+            if is_en
+            else "先看 Introduction，确认论文到底在补哪一块空白。"
+        )
     if method:
-        reading_focus.append("再看 Method / Approach，把核心模块、训练目标和输入输出关系理清。")
+        reading_focus.append(
+            "Then read Method / Approach to clarify the core modules, training objective, and input-output relationships."
+            if is_en
+            else "再看 Method / Approach，把核心模块、训练目标和输入输出关系理清。"
+        )
     if results:
-        reading_focus.append("重点看 Experiments / Results，确认提升来自哪里，以及 baseline 是否公平。")
+        reading_focus.append(
+            "Focus on Experiments / Results to verify where the improvement comes from and whether the baselines are fair."
+            if is_en
+            else "重点看 Experiments / Results，确认提升来自哪里，以及 baseline 是否公平。"
+        )
     if conclusion or discussion:
-        reading_focus.append("最后看 Conclusion / Discussion，判断作者自己如何定义边界与下一步。")
+        reading_focus.append(
+            "Finally read Conclusion / Discussion to see how the authors define boundaries and next steps."
+            if is_en
+            else "最后看 Conclusion / Discussion，判断作者自己如何定义边界与下一步。"
+        )
     if not reading_focus:
-        reading_focus.append("当前建议先读摘要，再回到原文按图表和章节标题定位方法与实验细节。")
+        reading_focus.append(
+            "Start with the abstract, then use figures and section titles in the original paper to locate method and experiment details."
+            if is_en
+            else "当前建议先读摘要，再回到原文按图表和章节标题定位方法与实验细节。"
+        )
 
     combined_text = "\n".join(
         item for item in [paper.get("title"), abstract, introduction, method, results, conclusion, discussion] if item
     )
 
     analysis_note = (
-        "本报告已结合 PDF 全文结构做自动提炼。"
+        ("This report used the PDF full-text structure for automatic extraction." if is_en else "本报告已结合 PDF 全文结构做自动提炼。")
         if parsed_source_kind == "pdf"
         else (
-            "本报告已结合源站正文结构做自动提炼。"
+            ("This report used source-page text structure for automatic extraction." if is_en else "本报告已结合源站正文结构做自动提炼。")
             if parsed_source_kind == "source_page"
-            else "本报告当前基于摘要和元数据自动生成，方法与实验细节建议回到原文核对。"
+            else (
+                "This report was generated from the abstract and metadata; verify method and experiment details in the original paper."
+                if is_en
+                else "本报告当前基于摘要和元数据自动生成，方法与实验细节建议回到原文核对。"
+            )
         )
     )
     if retrieved_evidence:
-        analysis_note = _append_analysis_note(analysis_note, "已结合全文切块语义检索证据生成。")
+        analysis_note = _append_analysis_note(
+            analysis_note,
+            (
+                "Full-text chunk retrieval evidence was used during generation."
+                if is_en
+                else "已结合全文切块语义检索证据生成。"
+            ),
+        )
         if _clean_text(_summarize_profile_for_embedding(user_profile)):
             analysis_note = _append_analysis_note(
                 analysis_note,
-                "当前精读正文已将用户兴趣 embedding 检索链路作为主要证据排序信号之一。",
+                (
+                    "The user-interest embedding retrieval path was used as one of the main evidence-ranking signals."
+                    if is_en
+                    else "当前精读正文已将用户兴趣 embedding 检索链路作为主要证据排序信号之一。"
+                ),
             )
     if pdf_error:
         fallback_mode = "source_page" if parsed_source_kind == "source_page" else "abstract"
         analysis_note = _append_analysis_note(
             analysis_note,
-            _describe_pdf_fallback(pdf_error, fallback_mode=fallback_mode),
+            _describe_pdf_fallback(pdf_error, fallback_mode=fallback_mode, response_language=language),
         )
 
-    relevance_points = _build_relevance_points(paper, user_profile, combined_text, parsed_pdf)
+    relevance_points = _build_relevance_points(
+        paper,
+        user_profile,
+        combined_text,
+        parsed_pdf,
+        response_language=language,
+    )
     if evidence_sections:
         relevance_points = _unique_preserve_order(
-            [f"从全文语义检索命中的片段看，相关信息主要落在 {' / '.join(evidence_sections)} 部分。"]
+            [
+                (
+                    f"Semantic retrieval suggests the most relevant evidence is concentrated in: {' / '.join(evidence_sections)}."
+                    if is_en
+                    else f"从全文语义检索命中的片段看，相关信息主要落在 {' / '.join(evidence_sections)} 部分。"
+                )
+            ]
             + list(relevance_points)
         )[:4]
     field_evidence_map = _build_field_evidence_map(retrieved_evidence)
@@ -3711,6 +3920,7 @@ def build_heuristic_report_payload(
         "retrieved_evidence": retrieved_evidence,
         "field_evidence_map": field_evidence_map,
         "report_evidence_anchors": report_evidence_anchors,
+        "response_language": language,
     }
 
 
@@ -3750,7 +3960,18 @@ def _looks_like_extraction_noise(text: str) -> bool:
     return marker_hits >= 2 or short_line_count >= 6 or digit_ratio > 0.12
 
 
-def _append_template_qa_block(lines: List[str], qid: str, question: str, content: Any) -> None:
+def _append_template_qa_block(
+    lines: List[str],
+    qid: str,
+    question: str,
+    content: Any,
+    response_language: str = "zh",
+) -> None:
+    fallback = (
+        "Current information is insufficient; check the corresponding section in the original paper."
+        if _normalize_response_language(response_language) == "en"
+        else "当前信息不足，建议回到原文对应章节核对。"
+    )
     lines.append(f"{qid}: {question}")
     lines.append("")
     if isinstance(content, list):
@@ -3759,7 +3980,7 @@ def _append_template_qa_block(lines: List[str], qid: str, question: str, content
             for item in values:
                 lines.append(f"- {item}")
         else:
-            lines.append("当前信息不足，建议回到原文对应章节核对。")
+            lines.append(fallback)
     else:
         text = _clean_text(content)
         if text:
@@ -3771,7 +3992,7 @@ def _append_template_qa_block(lines: List[str], qid: str, question: str, content
             if lines and lines[-1] == "":
                 lines.pop()
         else:
-            lines.append("当前信息不足，建议回到原文对应章节核对。")
+            lines.append(fallback)
     lines.append("")
 
 
@@ -3780,8 +4001,14 @@ def _synthesize_report_with_llm(
     user_profile: Dict[str, Any],
     parsed_pdf: Optional[Dict[str, Any]],
     heuristic_payload: Dict[str, Any],
+    response_language: str = "zh",
 ) -> Optional[Dict[str, Any]]:
-    fallback_note = "生成式精读补充本次未返回，当前内容仍按精读模板基于已拿到的摘要、元数据和可用 PDF 片段生成。"
+    language = _normalize_response_language(response_language)
+    fallback_note = (
+        "The generative reading supplement did not return this time; the report is still generated from the reading template, metadata, abstract, and available PDF snippets."
+        if language == "en"
+        else "生成式精读补充本次未返回，当前内容仍按精读模板基于已拿到的摘要、元数据和可用 PDF 片段生成。"
+    )
 
     try:
         llm_parser = _load_llm_parser()
@@ -3799,6 +4026,7 @@ def _synthesize_report_with_llm(
             user_profile=user_profile,
             parsed_pdf=parsed_pdf,
             heuristic_payload=heuristic_payload,
+            response_language=language,
         )
         if isinstance(result, dict) and result:
             return result
@@ -3917,10 +4145,66 @@ def generate_reading_report(
     paper: Dict[str, Any],
     user_profile: Dict[str, Any],
     report_payload: Optional[Dict[str, Any]] = None,
+    response_language: str = "zh",
 ) -> str:
-    payload = report_payload or build_heuristic_report_payload(paper, user_profile)
+    payload = report_payload or build_heuristic_report_payload(
+        paper,
+        user_profile,
+        response_language=response_language,
+    )
+    language = _normalize_response_language(payload.get("response_language") or response_language)
+    is_en = language == "en"
+    labels = {
+        "untitled": "Untitled Paper" if is_en else "Untitled Paper",
+        "source_no_abstract_link": "The source did not return a usable abstract. View the original paper here:" if is_en else "源站暂未返回可用摘要。请直接查看原文链接：",
+        "source_no_abstract": "The source did not return a usable abstract. Check the original PDF or paper page directly." if is_en else "源站暂未返回可用摘要，建议直接查看原文 PDF 或论文主页。",
+        "analysis_pdf": "PDF full text + metadata" if is_en else "PDF 全文 + 元数据",
+        "analysis_source_page": "source page + metadata" if is_en else "源站正文 + 元数据",
+        "analysis_metadata": "abstract + metadata" if is_en else "摘要 + 元数据",
+        "about_minutes": "about" if is_en else "约",
+        "minutes": "min" if is_en else "分钟",
+        "model": "model" if is_en else "模型",
+        "evidence": "evidence" if is_en else "证据",
+        "keywords": "Keywords" if is_en else "关键词",
+        "one_sentence": "One-Sentence Summary" if is_en else "一句话总结",
+        "one_sentence_empty": "There is not enough information to generate a one-sentence summary yet." if is_en else "当前没有足够信息生成一句话总结。",
+        "abstract": "Abstract" if is_en else "摘要",
+        "problem_empty": "Start from the abstract and introduction to verify the research problem." if is_en else "建议先回到原文摘要和引言确认研究问题。",
+        "related_empty": "The automatic parser did not extract a stable Related Work thread. Check the introduction, related-work section, and citations to identify the main compared methods." if is_en else "当前自动解析没有稳定提取出 Related Work 的完整脉络。可先从论文引言、相关工作章节和引用线索核对它主要对比了哪些方法。",
+        "related_prefix": "Based on current evidence, the paper is positioned around: " if is_en else "从当前证据可见，论文的定位至少包括：",
+        "solution_empty": "Method details were not extracted reliably; focus on the Method / Approach section." if is_en else "当前未成功提炼方法细节，请重点阅读 Method / Approach 部分。",
+        "experiments_empty": "No clear experimental setup was extracted; check Experiments / Results, tables, figures, and key metrics." if is_en else "当前没有提炼出明确实验设置，请重点核对 Experiments / Results、表格、图示和主要指标。",
+        "future_empty": "Current information is insufficient; revisit limitations, failure cases, ablation gaps, and cross-domain generalization in the paper." if is_en else "当前信息不足，建议从局限性、失败案例、消融缺口和跨领域泛化四个角度回原文继续挖掘。",
+        "contributions_prefix": "Main contributions include: " if is_en else "主要贡献包括：",
+        "limitations_prefix": "Important boundaries include: " if is_en else "需要注意的边界包括：",
+        "relevance_prefix": "Relationship to the user profile: " if is_en else "与用户画像的关系：",
+        "summary_empty": "Current information is insufficient; connect the abstract, introduction, method, and conclusion in the original paper." if is_en else "当前信息不足，建议回到原文摘要、引言、方法和结论串联主线。",
+        "evidence_pdf": "PDF Evidence Locator" if is_en else "PDF 证据定位",
+        "evidence_full": "Full-Text Evidence Locator" if is_en else "全文证据定位",
+        "recommendation": "Recommendation" if is_en else "推荐指数",
+        "reason": "Reason" if is_en else "推荐理由",
+        "details": "Paper Details" if is_en else "基本信息",
+        "authors": "Authors" if is_en else "作者",
+        "affiliation": "Affiliation" if is_en else "机构",
+        "source": "Source" if is_en else "来源",
+        "subjects": "Subjects/Categories" if is_en else "主题/分类",
+        "date": "Date" if is_en else "日期",
+        "recommendation_level": "Recommendation" if is_en else "推荐级别",
+        "estimated_reading_time": "Estimated reading time" if is_en else "预计阅读时间",
+        "analysis_source": "Analysis source" if is_en else "解析来源",
+        "generation_model": "Generation model" if is_en else "生成模型",
+        "not_provided": "Not provided" if is_en else "未提供",
+        "unknown": "Unknown" if is_en else "未知",
+        "resources": "Code & Resources" if is_en else "代码与资源",
+        "analysis_note": "Analysis note" if is_en else "解析说明",
+        "method_anchor": "Method evidence anchor" if is_en else "方法证据锚点",
+        "result_anchor": "Result evidence anchor" if is_en else "结果证据锚点",
+    }
+    field_sep = ": " if is_en else "："
+    list_joiner = "; " if is_en else "；"
+    sentence_end = "." if is_en else "。"
     report_style = _normalize_report_style(payload.get("report_style"))
-    title = _clean_text(paper.get("title")) or "Untitled Paper"
+    title = _clean_text(paper.get("title")) or labels["untitled"]
     abstract = _clean_abstract_text(payload.get("abstract") or paper.get("abstract"))
     clean_abstract_summary = _clean_text(payload.get("clean_abstract_summary"))
     if clean_abstract_summary and (not _clean_text(abstract) or _looks_like_extraction_noise(abstract)):
@@ -3937,9 +4221,9 @@ def generate_reading_report(
             "url",
         )
         if fallback_source:
-            abstract = f"源站暂未返回可用摘要。请直接查看原文链接：{fallback_source}"
+            abstract = f"{labels['source_no_abstract_link']} {fallback_source}" if is_en else f"{labels['source_no_abstract_link']}{fallback_source}"
         else:
-            abstract = "源站暂未返回可用摘要，建议直接查看原文 PDF 或论文主页。"
+            abstract = labels["source_no_abstract"]
     arxiv_id = _clean_text(paper.get("arxiv_id"))
     doi = _clean_text(paper.get("doi"))
     recommendation_label = payload.get("recommendation_label") or _recommendation_label(paper)
@@ -3949,20 +4233,23 @@ def generate_reading_report(
         payload.get("analysis_source"),
     )
     recommendation_score = _recommendation_score(recommendation_label)
+    recommendation_display_label = _recommendation_display_label(recommendation_label, response_language=language)
     recommendation_stars = "★" * recommendation_score + "☆" * (5 - recommendation_score)
     analysis_source = _clean_text(payload.get("analysis_source"))
     analysis_source_label = (
-        "PDF 全文 + 元数据"
+        labels["analysis_pdf"]
         if analysis_source == "pdf"
-        else ("源站正文 + 元数据" if analysis_source == "source_page" else "摘要 + 元数据")
+        else (labels["analysis_source_page"] if analysis_source == "source_page" else labels["analysis_metadata"])
     )
     analysis_note = _clean_text(payload.get("analysis_note"))
-    resource_items = _build_resource_items(paper)
-    action_links = _build_report_action_links(paper)
+    resource_items = _build_resource_items(paper, response_language=language)
+    action_links = _build_report_action_links(paper, response_language=language)
     subjects = _format_subjects(paper)
+    if subjects == "未知" and is_en:
+        subjects = labels["unknown"]
     generation_provider = _clean_text(payload.get("generation_provider")) or "heuristic"
     generation_model = _clean_text(payload.get("generation_model")) or "PaperFlow template"
-    recommendation_reason = _build_recommendation_reason(payload)
+    recommendation_reason = _build_recommendation_reason(payload, response_language=language)
     report_evidence_anchors = payload.get("report_evidence_anchors") or {}
     field_evidence_map = payload.get("field_evidence_map") or {}
 
@@ -3973,7 +4260,12 @@ def generate_reading_report(
         lines.append(action_links)
         lines.append("")
 
-    lines.append(f"> {recommendation_stars} {recommendation_label} · 约 {int(payload.get('estimated_reading_minutes') or 8)} 分钟 · 模型 {generation_provider}/{generation_model} · 证据 {analysis_source_label}")
+    lines.append(
+        f"> {recommendation_stars} {recommendation_display_label} · "
+        f"{labels['about_minutes']} {int(payload.get('estimated_reading_minutes') or 8)} {labels['minutes']} · "
+        f"{labels['model']} {generation_provider}/{generation_model} · "
+        f"{labels['evidence']} {analysis_source_label}"
+    )
     lines.append("")
 
     if report_style == "brief":
@@ -3995,41 +4287,39 @@ def generate_reading_report(
     else:
         clean_keywords = []
     if clean_keywords:
-        lines.append(f"🏷 关键词：{' · '.join(clean_keywords[:8])}")
+        lines.append(f"🏷 {labels['keywords']}{field_sep}{' · '.join(clean_keywords[:8])}")
         lines.append("")
 
-    lines.append("## 一句话总结")
+    lines.append(f"## {labels['one_sentence']}")
     lines.append("")
-    lines.append(payload.get("one_sentence_summary") or "当前没有足够信息生成一句话总结。")
+    lines.append(payload.get("one_sentence_summary") or labels["one_sentence_empty"])
     lines.append("")
 
-    lines.append("## 摘要")
+    lines.append(f"## {labels['abstract']}")
     lines.append("")
     for paragraph in _clean_text(abstract).split("\n"):
         if paragraph.strip():
             lines.append(f"> {paragraph.strip()}")
     lines.append("")
 
-    problem_analysis = payload.get("problem_analysis") or payload.get("research_background") or "建议先回到原文摘要和引言确认研究问题。"
+    problem_analysis = payload.get("problem_analysis") or payload.get("research_background") or labels["problem_empty"]
     related_work = payload.get("related_work")
     if not related_work:
         related_work_items = payload.get("main_contributions") or []
-        related_work = (
-            "当前自动解析没有稳定提取出 Related Work 的完整脉络。可先从论文引言、相关工作章节和引用线索核对它主要对比了哪些方法。"
-        )
+        related_work = labels["related_empty"]
         if related_work_items:
-            related_work += "\n\n从当前证据可见，论文的定位至少包括：" + "；".join(str(item) for item in related_work_items[:3]) + "。"
-    solution_approach = payload.get("solution_approach") or payload.get("core_method") or "当前未成功提炼方法细节，请重点阅读 Method / Approach 部分。"
+            related_work += "\n\n" + labels["related_prefix"] + list_joiner.join(str(item) for item in related_work_items[:3]) + sentence_end
+    solution_approach = payload.get("solution_approach") or payload.get("core_method") or labels["solution_empty"]
     experiments = payload.get("experiments")
     if not experiments:
         result_text = _clean_text(payload.get("key_results"))
-        experiments = result_text or "当前没有提炼出明确实验设置，请重点核对 Experiments / Results、表格、图示和主要指标。"
+        experiments = result_text or labels["experiments_empty"]
     future_directions = payload.get("future_directions")
     if not future_directions:
         future_items = []
         future_items.extend(payload.get("limitations") or [])
         future_items.extend(payload.get("reading_focus") or [])
-        future_directions = future_items or ["当前信息不足，建议从局限性、失败案例、消融缺口和跨领域泛化四个角度回原文继续挖掘。"]
+        future_directions = future_items or [labels["future_empty"]]
     paper_summary = payload.get("paper_summary")
     if not paper_summary:
         summary_parts = [
@@ -4042,75 +4332,100 @@ def generate_reading_report(
         limitations = payload.get("limitations") or []
         relevance = payload.get("relevance_points") or []
         if contributions:
-            summary_parts.append("主要贡献包括：" + "；".join(str(item) for item in contributions[:4]) + "。")
+            summary_parts.append(labels["contributions_prefix"] + list_joiner.join(str(item) for item in contributions[:4]) + sentence_end)
         if limitations:
-            summary_parts.append("需要注意的边界包括：" + "；".join(str(item) for item in limitations[:3]) + "。")
+            summary_parts.append(labels["limitations_prefix"] + list_joiner.join(str(item) for item in limitations[:3]) + sentence_end)
         if relevance:
-            summary_parts.append("与用户画像的关系：" + "；".join(str(item) for item in relevance[:3]) + "。")
-        paper_summary = "\n\n".join(part for part in summary_parts if part) or "当前信息不足，建议回到原文摘要、引言、方法和结论串联主线。"
+            summary_parts.append(labels["relevance_prefix"] + list_joiner.join(str(item) for item in relevance[:3]) + sentence_end)
+        paper_summary = "\n\n".join(part for part in summary_parts if part) or labels["summary_empty"]
 
-    _append_template_qa_block(lines, "Q1", "这篇论文试图解决什么问题？", problem_analysis)
-    _append_template_qa_block(lines, "Q2", "有哪些相关研究？", related_work)
-    _append_template_qa_block(lines, "Q3", "论文如何解决这个问题？", solution_approach)
-    _append_template_qa_block(lines, "Q4", "论文做了哪些实验？", experiments)
-    _append_template_qa_block(lines, "Q5", "有什么可以进一步探索的点？", future_directions)
-    _append_template_qa_block(lines, "Q6", "总结一下论文的主要内容", paper_summary)
+    qa_questions = (
+        [
+            ("Q1", "What problem does this paper try to solve?"),
+            ("Q2", "What related work does it build on or compare against?"),
+            ("Q3", "How does the paper solve the problem?"),
+            ("Q4", "What experiments does the paper run?"),
+            ("Q5", "What directions are worth exploring next?"),
+            ("Q6", "Summarize the main content of the paper."),
+        ]
+        if is_en
+        else [
+            ("Q1", "这篇论文试图解决什么问题？"),
+            ("Q2", "有哪些相关研究？"),
+            ("Q3", "论文如何解决这个问题？"),
+            ("Q4", "论文做了哪些实验？"),
+            ("Q5", "有什么可以进一步探索的点？"),
+            ("Q6", "总结一下论文的主要内容"),
+        ]
+    )
+    for (qid, question_text), content in zip(
+        qa_questions,
+        [problem_analysis, related_work, solution_approach, experiments, future_directions, paper_summary],
+    ):
+        _append_template_qa_block(lines, qid, question_text, content, response_language=language)
 
     if report_evidence_anchors:
         bucket_labels = {
-            "background": "研究背景",
-            "method": "核心方法",
-            "results": "主要结果",
-            "limitations": "局限性",
-            "relevance": "相关性",
+            "background": "Background" if is_en else "研究背景",
+            "method": "Method" if is_en else "核心方法",
+            "results": "Results" if is_en else "主要结果",
+            "limitations": "Limitations" if is_en else "局限性",
+            "relevance": "Relevance" if is_en else "相关性",
         }
-        evidence_heading = "## PDF 证据定位" if analysis_source == "pdf" else "## 全文证据定位"
+        evidence_heading = f"## {labels['evidence_pdf']}" if analysis_source == "pdf" else f"## {labels['evidence_full']}"
         lines.append(evidence_heading)
         lines.append("")
         for bucket in ("background", "method", "results", "limitations", "relevance"):
             items = report_evidence_anchors.get(bucket) or []
             if not items:
                 continue
-            lines.append(f"- {bucket_labels.get(bucket, bucket)}：")
+            lines.append(f"- {bucket_labels.get(bucket, bucket)}{field_sep}")
             for item in items:
                 lines.append(f"  {item}")
         lines.append("")
 
-    lines.append("## 推荐指数")
+    lines.append(f"## {labels['recommendation']}")
     lines.append("")
-    lines.append(f"{recommendation_stars}（{recommendation_score}/5）")
-    lines.append(f"- 推荐理由：{recommendation_reason}")
+    lines.append(
+        f"{recommendation_stars} ({recommendation_score}/5)"
+        if is_en
+        else f"{recommendation_stars}（{recommendation_score}/5）"
+    )
+    lines.append(f"- {labels['reason']}{field_sep}{recommendation_reason}")
     lines.append("")
 
-    lines.append("## 基本信息")
+    lines.append(f"## {labels['details']}")
     lines.append("")
-    lines.append(f"- 作者：{_format_authors(paper.get('authors'))}")
-    lines.append(f"- 机构：{_clean_text(paper.get('institution')) or '未提供'}")
-    lines.append(f"- 来源：{_clean_text(paper.get('venue') or paper.get('journal') or paper.get('source')) or '未知'}")
-    lines.append(f"- 主题/分类：{subjects}")
-    lines.append(f"- 日期：{_clean_text(paper.get('publish_date')) or '未知'}")
-    lines.append(f"- 推荐级别：**{recommendation_label}**")
-    lines.append(f"- 预计阅读时间：约 {int(payload.get('estimated_reading_minutes') or 8)} 分钟")
-    lines.append(f"- 解析来源：{analysis_source_label}")
-    lines.append(f"- 生成模型：{generation_provider} / {generation_model}")
+    authors_text = _format_authors(paper.get("authors"))
+    if authors_text == "未知" and is_en:
+        authors_text = labels["unknown"]
+    lines.append(f"- {labels['authors']}{field_sep}{authors_text}")
+    lines.append(f"- {labels['affiliation']}{field_sep}{_clean_text(paper.get('institution')) or labels['not_provided']}")
+    lines.append(f"- {labels['source']}{field_sep}{_clean_text(paper.get('venue') or paper.get('journal') or paper.get('source')) or labels['unknown']}")
+    lines.append(f"- {labels['subjects']}{field_sep}{subjects}")
+    lines.append(f"- {labels['date']}{field_sep}{_clean_text(paper.get('publish_date')) or labels['unknown']}")
+    lines.append(f"- {labels['recommendation_level']}{field_sep}**{recommendation_display_label}**")
+    lines.append(f"- {labels['estimated_reading_time']}{field_sep}{labels['about_minutes']} {int(payload.get('estimated_reading_minutes') or 8)} {labels['minutes']}")
+    lines.append(f"- {labels['analysis_source']}{field_sep}{analysis_source_label}")
+    lines.append(f"- {labels['generation_model']}{field_sep}{generation_provider} / {generation_model}")
     if arxiv_id:
-        lines.append(f"- arXiv ID：`{arxiv_id}`")
+        lines.append(f"- arXiv ID{field_sep}`{arxiv_id}`")
     if doi:
-        lines.append(f"- DOI：`{doi}`")
+        lines.append(f"- DOI{field_sep}`{doi}`")
     lines.append("")
 
-    lines.append("## 代码与资源")
+    lines.append(f"## {labels['resources']}")
     lines.append("")
     for label, value in resource_items:
-        lines.append(f"- {label}：{value}")
+        lines.append(f"- {label}{field_sep}{value}")
     if analysis_note:
-        lines.append(f"- 解析说明：{analysis_note}")
+        lines.append(f"- {labels['analysis_note']}{field_sep}{analysis_note}")
     method_evidence = field_evidence_map.get("core_method") or []
     result_evidence = field_evidence_map.get("key_results") or []
     if method_evidence:
-        lines.append(f"- 方法证据锚点：{method_evidence[0]}")
+        lines.append(f"- {labels['method_anchor']}{field_sep}{method_evidence[0]}")
     if result_evidence:
-        lines.append(f"- 结果证据锚点：{result_evidence[0]}")
+        lines.append(f"- {labels['result_anchor']}{field_sep}{result_evidence[0]}")
     lines.append("")
 
     return "\n".join(lines).rstrip() + "\n"
@@ -4308,6 +4623,8 @@ def create_reading_report(
     use_chat_id = chat_id is not None
     request_metadata = dict(request_metadata or {})
     report_style = _normalize_report_style(request_metadata.get("report_style"))
+    response_language = _normalize_response_language(request_metadata.get("response_language"))
+    request_metadata["response_language"] = response_language
 
     profile = get_profile(user_id)
     if not profile:
@@ -4384,6 +4701,9 @@ def create_reading_report(
                 "Existing reading report found but it was generated by an older template version; "
                 "regenerating."
             )
+        if should_reuse_report and not _report_record_matches_language(report_record, response_language):
+            should_reuse_report = False
+            print("Existing reading report found but language does not match; regenerating.")
         if should_reuse_report and not _paper_has_sufficient_metadata_for_report(normalized_raw_paper):
             should_reuse_report = False
             print(
@@ -4416,12 +4736,14 @@ def create_reading_report(
                 profile,
                 parsed_pdf=parsed_pdf,
                 pdf_error=pdf_error,
+                response_language=response_language,
             )
             llm_payload = _synthesize_report_with_llm(
                 enriched_paper,
                 profile,
                 parsed_pdf=parsed_pdf,
                 heuristic_payload=heuristic_payload,
+                response_language=response_language,
             )
             report_payload = _merge_report_payload(heuristic_payload, llm_payload)
             proposed_label = report_payload.get("recommendation_label")
@@ -4437,13 +4759,16 @@ def create_reading_report(
                 report_payload.get("analysis_source"),
             )
             report_payload["report_style"] = report_style
+            report_payload["response_language"] = response_language
             report_content = generate_reading_report(
                 enriched_paper,
                 profile,
                 report_payload=report_payload,
+                response_language=response_language,
             )
 
-            doc_title = f"[精读] {enriched_paper.get('title', 'Unknown')[:80]}"
+            doc_prefix = "[Reading]" if response_language == "en" else "[精读]"
+            doc_title = f"{doc_prefix} {enriched_paper.get('title', 'Unknown')[:80]}"
             doc_info: Dict[str, Any] = {"title": doc_title, "local_only": True}
             doc_url = None
             doc_token = None
@@ -4506,6 +4831,7 @@ def create_reading_report(
                 "analysis_source": report_payload.get("analysis_source"),
                 "report_version": READING_REPORT_OUTPUT_VERSION,
                 "report_style": report_style,
+                "response_language": response_language,
             }
             if feishu_error:
                 behavior_metadata["feishu_error"] = feishu_error

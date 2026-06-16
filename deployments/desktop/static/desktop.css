@@ -330,6 +330,25 @@ textarea {
   padding: 0;
 }
 
+.language-picker {
+  display: grid;
+  grid-template-columns: auto 108px;
+  align-items: center;
+  gap: 7px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.language-picker select {
+  height: 36px;
+  padding: 6px 30px 6px 10px;
+  border-color: #cfe0ff;
+  color: #23456f;
+  background-color: rgba(255, 255, 255, 0.94);
+  font-size: 12.5px;
+  font-weight: 750;
+}
+
 .primary {
   border-color: var(--blue);
   background: var(--blue);

@@ -13,7 +13,7 @@ from paperflow.providers import build_llm_provider
 wiki_db = importlib.import_module("skills.wiki-store.scripts.wiki_db")
 
 
-SYSTEM_PROMPT = """You are PaperFlow's private research wiki assistant.
+SYSTEM_PROMPT_ZH = """You are PaperFlow's private research wiki assistant.
 
 Answer only from the provided wiki snippets. Cite every concrete claim with
 [N], where N is the snippet number shown in the context. Keep citation markers
@@ -22,6 +22,27 @@ the snippets do not contain enough evidence, say that the local wiki does not
 have enough material yet. Do not expose internal section labels such as Q1/Q2
 unless the user explicitly asks for report-section structure. Use concise
 Chinese by default unless the user asks otherwise."""
+
+SYSTEM_PROMPT_EN = """You are PaperFlow's private research wiki assistant.
+
+Answer only from the provided wiki snippets. Cite every concrete claim with
+[N], where N is the snippet number shown in the context. Keep citation markers
+inline immediately after the supported claim, and do not invent references. If
+the snippets do not contain enough evidence, say that the local wiki does not
+have enough material yet. Do not expose internal section labels such as Q1/Q2
+unless the user explicitly asks for report-section structure. Answer in clear,
+concise English."""
+
+SYSTEM_PROMPT = SYSTEM_PROMPT_ZH
+
+
+def _normalize_response_language(value: Any = None) -> str:
+    raw = str(value or "").strip().lower().replace("_", "-")
+    return "en" if raw.startswith("en") or raw == "english" else "zh"
+
+
+def _system_prompt(response_language: str) -> str:
+    return SYSTEM_PROMPT_EN if _normalize_response_language(response_language) == "en" else SYSTEM_PROMPT_ZH
 
 
 def _answer_max_tokens() -> int:
@@ -75,12 +96,19 @@ def _build_prompt(question: str, hits: List[Dict[str, Any]]) -> str:
     return f"Question: {question}\n\nWiki snippets:\n\n" + "\n\n".join(blocks)
 
 
-def _extractive_fallback(hits: List[Dict[str, Any]], error: str) -> str:
-    lines = [
-        "当前 LLM 不可用，PaperFlow 先返回本地 Wiki 证据片段（local wiki snippets）。",
-        f"Provider error: {error}",
-        "",
-    ]
+def _extractive_fallback(hits: List[Dict[str, Any]], error: str, response_language: str = "zh") -> str:
+    if _normalize_response_language(response_language) == "en":
+        lines = [
+            "The current LLM is unavailable, so PaperFlow is returning local Wiki evidence snippets first.",
+            f"Provider error: {error}",
+            "",
+        ]
+    else:
+        lines = [
+            "当前 LLM 不可用，PaperFlow 先返回本地 Wiki 证据片段（local wiki snippets）。",
+            f"Provider error: {error}",
+            "",
+        ]
     for index, hit in enumerate(hits[:5], start=1):
         lines.append(f"[{index}] {hit.get('title')} ({hit.get('node_type')})")
         lines.append(_snippet(hit, max_chars=280))
@@ -161,14 +189,19 @@ def _build_citations(user_id: str, hits: List[Dict[str, Any]]) -> List[Dict[str,
     return citations
 
 
-def _empty_answer(started: float) -> Dict[str, Any]:
+def _empty_answer(started: float, response_language: str = "zh") -> Dict[str, Any]:
+    language = _normalize_response_language(response_language)
+    text = (
+        "The local Wiki does not have enough relevant material yet. Generate reading reports "
+        "for related papers first, or run `paperflow wiki backfill` to import existing history."
+        if language == "en"
+        else "本地 Wiki 还没有足够相关的材料。可以先对相关论文生成精读报告，或运行 `paperflow wiki backfill` 导入已有运行历史。"
+    )
     return {
-        "text": (
-            "本地 Wiki 还没有足够相关的材料。可以先对相关论文生成精读报告，"
-            "或运行 `paperflow wiki backfill` 导入已有运行历史。"
-        ),
+        "text": text,
         "citations": [],
         "elapsed_ms": int((time.time() - started) * 1000),
+        "response_language": language,
         "token_usage": {},
     }
 
@@ -191,28 +224,31 @@ def answer_question(
     limit: int = 8,
     pinned_nodes: Optional[List[Dict[str, Any]]] = None,
     allowed_node_ids: Optional[Iterable[str]] = None,
+    response_language: str = "zh",
 ) -> Dict[str, Any]:
     """Return an LLM answer with local wiki citations."""
+    language = _normalize_response_language(response_language)
     started = time.time()
     hits, embedding_error = _prepare_hits(user_id, question, limit, pinned_nodes, allowed_node_ids=allowed_node_ids)
     if not hits:
-        return _empty_answer(started)
+        return _empty_answer(started, response_language=language)
 
     prompt = _build_prompt(question, hits)
     llm = build_llm_provider()
     llm_error = None
     response = None
     try:
-        response = llm.generate(prompt, system=SYSTEM_PROMPT, temperature=0.0, max_tokens=_answer_max_tokens())
+        response = llm.generate(prompt, system=_system_prompt(language), temperature=0.0, max_tokens=_answer_max_tokens())
         answer_text = response.text
     except Exception as exc:
         llm_error = str(exc)
-        answer_text = _extractive_fallback(hits, llm_error)
+        answer_text = _extractive_fallback(hits, llm_error, response_language=language)
     citations = _build_citations(user_id, hits)
     return {
         "text": answer_text,
         "citations": citations,
         "elapsed_ms": int((time.time() - started) * 1000),
+        "response_language": language,
         "token_usage": _token_usage(llm, response, embedding_error, llm_error),
     }
 
@@ -224,12 +260,14 @@ def answer_question_stream(
     limit: int = 8,
     pinned_nodes: Optional[List[Dict[str, Any]]] = None,
     allowed_node_ids: Optional[Iterable[str]] = None,
+    response_language: str = "zh",
 ) -> Iterator[Dict[str, Any]]:
     """Yield answer events with local citations and provider-native chunks."""
+    language = _normalize_response_language(response_language)
     started = time.time()
     hits, embedding_error = _prepare_hits(user_id, question, limit, pinned_nodes, allowed_node_ids=allowed_node_ids)
     if not hits:
-        result = _empty_answer(started)
+        result = _empty_answer(started, response_language=language)
         yield {"event": "meta", "data": {key: value for key, value in result.items() if key != "text"}}
         yield {"event": "chunk", "data": {"text": result["text"]}}
         yield {"event": "done", "data": result}
@@ -243,19 +281,20 @@ def answer_question_stream(
     meta = {
         "citations": citations,
         "elapsed_ms": 0,
+        "response_language": language,
         "token_usage": _token_usage(llm, None, embedding_error, None),
         "streaming": {"provider": True, "transport": "sse"},
     }
     yield {"event": "meta", "data": meta}
     try:
-        for chunk in llm.stream_generate(prompt, system=SYSTEM_PROMPT, temperature=0.0, max_tokens=_answer_max_tokens()):
+        for chunk in llm.stream_generate(prompt, system=_system_prompt(language), temperature=0.0, max_tokens=_answer_max_tokens()):
             if not chunk:
                 continue
             text_parts.append(chunk)
             yield {"event": "chunk", "data": {"text": chunk}}
     except Exception as exc:
         llm_error = str(exc)
-        fallback = _extractive_fallback(hits, llm_error)
+        fallback = _extractive_fallback(hits, llm_error, response_language=language)
         text_parts = [fallback]
         yield {"event": "chunk", "data": {"text": fallback}}
 
@@ -263,7 +302,7 @@ def answer_question_stream(
     response = None
     if llm_error is None and _looks_incomplete_answer(answer_text):
         try:
-            response = llm.generate(prompt, system=SYSTEM_PROMPT, temperature=0.0, max_tokens=_answer_max_tokens())
+            response = llm.generate(prompt, system=_system_prompt(language), temperature=0.0, max_tokens=_answer_max_tokens())
             if response.text and len(response.text.strip()) > len(answer_text.strip()):
                 answer_text = response.text
         except Exception as exc:
@@ -273,6 +312,7 @@ def answer_question_stream(
         "text": answer_text,
         "citations": citations,
         "elapsed_ms": int((time.time() - started) * 1000),
+        "response_language": language,
         "token_usage": _token_usage(llm, response, embedding_error, llm_error),
     }
     yield {"event": "done", "data": result}

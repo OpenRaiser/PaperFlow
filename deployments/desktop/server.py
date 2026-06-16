@@ -76,6 +76,11 @@ def _required_user(params: Dict[str, Any]) -> str:
     return user_id
 
 
+def _response_language(payload: Dict[str, Any]) -> str:
+    raw = str(payload.get("response_language") or payload.get("language") or "").strip().lower()
+    return "en" if raw.startswith("en") else "zh"
+
+
 def _daily_days_from_body(body: Dict[str, Any]) -> int:
     raw_days = int(body.get("days") or 1)
     target_date = str(body.get("target_date") or "").strip()
@@ -186,7 +191,10 @@ def _api_wiki_refresh(_query_params: Dict[str, Any], body: Dict[str, Any]) -> Di
 
 
 def _api_github_sync(_query_params: Dict[str, Any], body: Dict[str, Any]) -> Dict[str, Any]:
-    return agents.sync_reading_notes_github(str(body.get("user_id") or "").strip())
+    return agents.sync_reading_notes_github(
+        str(body.get("user_id") or "").strip(),
+        response_language=_response_language(body),
+    )
 
 
 def _api_activity(query_params: Dict[str, Any], _body: Dict[str, Any]) -> Dict[str, Any]:
@@ -302,6 +310,7 @@ def _api_read(_query_params: Dict[str, Any], body: Dict[str, Any]) -> Dict[str, 
         push_id=push_id,
         paper_numbers=body.get("paper_numbers") or body.get("selected_numbers") or [],
         write_feishu=body.get("write_feishu"),
+        response_language=_response_language(body),
     )
 
 
@@ -313,6 +322,7 @@ def _api_read_arxiv(_query_params: Dict[str, Any], body: Dict[str, Any]) -> Dict
         user_id=user_id,
         arxiv_id=str(body.get("arxiv_id") or "").strip(),
         write_feishu=body.get("write_feishu"),
+        response_language=_response_language(body),
     )
 
 
@@ -325,6 +335,7 @@ def _api_read_pdf(_query_params: Dict[str, Any], body: Dict[str, Any]) -> Dict[s
         pdf_path=str(body.get("pdf_path") or "").strip(),
         title=str(body.get("title") or "").strip(),
         write_feishu=body.get("write_feishu"),
+        response_language=_response_language(body),
     )
 
 
@@ -341,6 +352,7 @@ def _api_submit(_query_params: Dict[str, Any], body: Dict[str, Any]) -> Dict[str
         later_numbers=body.get("later_numbers") or [],
         generate_reports=bool(body.get("generate_reports", True)),
         write_feishu=body.get("write_feishu"),
+        response_language=_response_language(body),
     )
 
 
@@ -353,6 +365,7 @@ def _api_wiki_ask(_query_params: Dict[str, Any], body: Dict[str, Any]) -> Dict[s
         mentions=body.get("mentions") or [],
         session_id=str(body.get("session_id") or "").strip(),
         persist_chat=True,
+        response_language=_response_language(body),
     )
 
 
@@ -512,7 +525,13 @@ class PaperFlowGuiHandler(BaseHTTPRequestHandler):
         self.send_header("Connection", "close")
         self.end_headers()
         try:
-            self._send_sse_event("status", {"text": "正在检索本地 Wiki 与引用来源"})
+            response_language = _response_language(body)
+            status_text = (
+                "Searching local Wiki and citation sources"
+                if response_language == "en"
+                else "正在检索本地 Wiki 与引用来源"
+            )
+            self._send_sse_event("status", {"text": status_text})
             for event in agents.wiki_ask_stream(
                 user_id=str(body.get("user_id") or "").strip(),
                 question=str(body.get("question") or "").strip(),
@@ -521,6 +540,7 @@ class PaperFlowGuiHandler(BaseHTTPRequestHandler):
                 mentions=body.get("mentions") or [],
                 session_id=str(body.get("session_id") or "").strip(),
                 persist_chat=True,
+                response_language=response_language,
             ):
                 self._send_sse_event(str(event.get("event") or "message"), {"ok": True, **(event.get("data") or {})})
         except Exception as exc:

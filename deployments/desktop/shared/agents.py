@@ -49,6 +49,13 @@ _DAILY_TASKS: Dict[str, Dict[str, Any]] = {}
 _DAILY_TASK_BY_USER: Dict[str, str] = {}
 
 ENV_PATH = PROJECT_ROOT / ".env"
+
+
+def _normalize_response_language(value: Any = None) -> str:
+    raw = str(value or "").strip().lower().replace("_", "-")
+    return "en" if raw.startswith("en") or raw in {"english"} else "zh"
+
+
 EDITABLE_ENV_KEYS = [
     "PAPERFLOW_LLM_PROVIDER",
     "PAPERFLOW_LLM_MODEL",
@@ -657,7 +664,7 @@ def _serialize_env_value(value: Any) -> str:
     if not text:
         return ""
     if any(char.isspace() for char in text) or "#" in text:
-        escaped = text.replace("\\", "\\\\").replace('"', '\\"')
+        escaped = text.replace('"', '\\"')
         return f'"{escaped}"'
     return text
 
@@ -1209,13 +1216,31 @@ def _ensure_notes_git_repo(repo_dir: Path, remote_url: str, branch: str) -> None
             _run_git(["reset", "--mixed"], repo_dir)
 
 
-def _notes_llm_sync_review(repo_dir: Path, branch: str, enabled: bool) -> Dict[str, Any]:
+def _notes_llm_sync_review(
+    repo_dir: Path,
+    branch: str,
+    enabled: bool,
+    response_language: str = "zh",
+) -> Dict[str, Any]:
+    language = _normalize_response_language(response_language)
     if not enabled:
-        return {"enabled": False, "reviewed": False, "summary": "LLM 校对已关闭。"}
+        return {
+            "enabled": False,
+            "reviewed": False,
+            "summary": "LLM review is disabled." if language == "en" else "LLM 校对已关闭。",
+        }
     try:
         provider = build_llm_provider()
         if getattr(provider, "name", "") == "mock":
-            return {"enabled": True, "reviewed": False, "summary": "当前 LLM provider 为 mock，跳过语义校对。"}
+            return {
+                "enabled": True,
+                "reviewed": False,
+                "summary": (
+                    "The current LLM provider is mock; semantic review was skipped."
+                    if language == "en"
+                    else "当前 LLM provider 为 mock，跳过语义校对。"
+                ),
+            }
         status = _git_output(["status", "--short"], repo_dir)
         staged_stat = _git_output(["diff", "--cached", "--stat"], repo_dir)
         try:
@@ -1225,11 +1250,16 @@ def _notes_llm_sync_review(repo_dir: Path, branch: str, enabled: bool) -> Dict[s
         staged_diff = _git_output(["diff", "--cached", "--", "*.md"], repo_dir)
         if len(staged_diff) > 12000:
             staged_diff = staged_diff[:12000] + "\n\n[diff truncated]"
+        output_rule = (
+            "Return concise English JSON with keys: risk_level, summary, suggested_action."
+            if language == "en"
+            else "Return concise Chinese JSON with keys: risk_level, summary, suggested_action."
+        )
         prompt = "\n".join(
             [
                 "Review this PaperFlow reading-notes Git sync before commit.",
                 "Check whether local Daily Note and Deep Reading markdown changes look like additive preservation rather than accidental deletion.",
-                "Return concise Chinese JSON with keys: risk_level, summary, suggested_action.",
+                output_rule,
                 "",
                 f"branch: {branch}",
                 "git status:",
@@ -1259,19 +1289,33 @@ def _notes_llm_sync_review(repo_dir: Path, branch: str, enabled: bool) -> Dict[s
             "summary": str(getattr(response, "text", "") or "").strip(),
         }
     except Exception as exc:
-        return {"enabled": True, "reviewed": False, "error": str(exc), "summary": f"LLM 校对失败：{exc}"}
+        return {
+            "enabled": True,
+            "reviewed": False,
+            "error": str(exc),
+            "summary": f"LLM review failed: {exc}" if language == "en" else f"LLM 校对失败：{exc}",
+        }
 
 
-def sync_reading_notes_github(user_id: str = "") -> Dict[str, Any]:
+def sync_reading_notes_github(user_id: str = "", response_language: str = "zh") -> Dict[str, Any]:
     del user_id
+    language = _normalize_response_language(response_language)
     repo_dir = _configured_reading_notes_git_dir()
     if repo_dir is None:
-        raise ValueError("未找到阅读笔记 Git 目录，请在设置里配置 PAPERFLOW_READING_NOTES_GIT_DIR。")
+        raise ValueError(
+            "Reading notes Git directory was not found. Configure PAPERFLOW_READING_NOTES_GIT_DIR in Settings."
+            if language == "en"
+            else "未找到阅读笔记 Git 目录，请在设置里配置 PAPERFLOW_READING_NOTES_GIT_DIR。"
+        )
     repo_dir.mkdir(parents=True, exist_ok=True)
     branch = _configured_reading_notes_git_branch()
     remote_url = _notes_git_remote(repo_dir)
     if not remote_url:
-        raise ValueError("未配置阅读笔记 GitHub 远端，请在设置里配置 PAPERFLOW_READING_NOTES_GIT_REMOTE。")
+        raise ValueError(
+            "Reading notes GitHub remote is not configured. Configure PAPERFLOW_READING_NOTES_GIT_REMOTE in Settings."
+            if language == "en"
+            else "未配置阅读笔记 GitHub 远端，请在设置里配置 PAPERFLOW_READING_NOTES_GIT_REMOTE。"
+        )
 
     _ensure_notes_git_repo(repo_dir, remote_url, branch)
     _ensure_notes_gitignore(repo_dir)
@@ -1286,13 +1330,18 @@ def sync_reading_notes_github(user_id: str = "") -> Dict[str, Any]:
         except subprocess.CalledProcessError as exc:
             pull_warning = (exc.stderr or exc.stdout or str(exc)).strip()
     else:
-        pull_warning = "本地有未提交笔记改动，已跳过自动 pull，避免覆盖 Obsidian 当前内容。"
+        pull_warning = (
+            "Local note changes are uncommitted, so automatic pull was skipped to avoid overwriting current Obsidian content."
+            if language == "en"
+            else "本地有未提交笔记改动，已跳过自动 pull，避免覆盖 Obsidian 当前内容。"
+        )
 
     _run_git(["add", "."], repo_dir)
     llm_review = _notes_llm_sync_review(
         repo_dir,
         branch,
         _env_bool("PAPERFLOW_READING_NOTES_GIT_LLM_REVIEW", default=True),
+        response_language=language,
     )
     staged_status = _git_output(["status", "--short"], repo_dir)
     committed = False
@@ -1312,7 +1361,9 @@ def sync_reading_notes_github(user_id: str = "") -> Dict[str, Any]:
             pushed = True
         except subprocess.CalledProcessError as exc:
             push_output = (exc.stderr or exc.stdout or str(exc)).strip()
-            raise RuntimeError(f"GitHub push 失败：{push_output}") from exc
+            raise RuntimeError(
+                f"GitHub push failed: {push_output}" if language == "en" else f"GitHub push 失败：{push_output}"
+            ) from exc
 
     final_status = _git_output(["status", "--short", "--ignored"], repo_dir)
     return {
@@ -2091,6 +2142,7 @@ def create_reading_reports(
     push_id: str,
     paper_numbers: Iterable[Any],
     write_feishu: Optional[bool] = None,
+    response_language: str = "zh",
 ) -> Dict[str, Any]:
     push = db_ops.get_push_papers(push_id)
     if not push or not push.get("papers"):
@@ -2098,6 +2150,7 @@ def create_reading_reports(
     papers = list(push["papers"])
     selected = _unique_ints(paper_numbers, maximum=len(papers))
     should_write_feishu = _env_bool("PAPERFLOW_WRITE_FEISHU", default=False) if write_feishu is None else bool(write_feishu)
+    language = _normalize_response_language(response_language)
     if not selected:
         return _reports_payload([], write_feishu_requested=should_write_feishu)
 
@@ -2111,6 +2164,7 @@ def create_reading_reports(
                 "selection_push_id": push_id,
                 "report_source_type": "desktop_gui",
                 "report_style": _configured_report_style(),
+                "response_language": language,
             },
         )
 
@@ -2130,7 +2184,12 @@ def _normalize_arxiv_id(value: str) -> str:
     return raw.strip()
 
 
-def read_arxiv(user_id: str, arxiv_id: str, write_feishu: Optional[bool] = None) -> Dict[str, Any]:
+def read_arxiv(
+    user_id: str,
+    arxiv_id: str,
+    write_feishu: Optional[bool] = None,
+    response_language: str = "zh",
+) -> Dict[str, Any]:
     normalized_arxiv_id = _normalize_arxiv_id(arxiv_id)
     paper = db_ops.get_paper_by_arxiv_id(normalized_arxiv_id)
     if not paper:
@@ -2150,6 +2209,7 @@ def read_arxiv(user_id: str, arxiv_id: str, write_feishu: Optional[bool] = None)
         paper = {**detail, "id": paper_id, "source": "arxiv"}
 
     should_write_feishu = _env_bool("PAPERFLOW_WRITE_FEISHU", default=False) if write_feishu is None else bool(write_feishu)
+    language = _normalize_response_language(response_language)
     with _local_only_feishu_doc_patch(not should_write_feishu):
         docs = reading_agent.create_reading_report(
             user_id=user_id,
@@ -2161,6 +2221,7 @@ def read_arxiv(user_id: str, arxiv_id: str, write_feishu: Optional[bool] = None)
                 "report_source_key": normalized_arxiv_id,
                 "report_source_name": normalized_arxiv_id,
                 "report_style": _configured_report_style(),
+                "response_language": language,
             },
         )
     wiki_backfilled = _backfill_docs_to_wiki(user_id, docs)
@@ -2174,6 +2235,7 @@ def read_local_pdf(
     pdf_path: str,
     title: str = "",
     write_feishu: Optional[bool] = None,
+    response_language: str = "zh",
 ) -> Dict[str, Any]:
     path = Path(str(pdf_path or "")).expanduser()
     if not path.is_absolute():
@@ -2190,6 +2252,7 @@ def read_local_pdf(
         "url": str(path),
     }
     should_write_feishu = _env_bool("PAPERFLOW_WRITE_FEISHU", default=False) if write_feishu is None else bool(write_feishu)
+    language = _normalize_response_language(response_language)
     with _local_only_feishu_doc_patch(not should_write_feishu):
         docs = reading_agent.create_reading_report(
             user_id=user_id,
@@ -2201,6 +2264,7 @@ def read_local_pdf(
                 "report_source_key": str(path),
                 "report_source_name": path.name,
                 "report_style": _configured_report_style(),
+                "response_language": language,
             },
         )
     wiki_backfilled = _backfill_docs_to_wiki(user_id, docs)
@@ -2409,6 +2473,7 @@ def submit_and_read(
     later_numbers: Iterable[Any] = (),
     generate_reports: bool = True,
     write_feishu: Optional[bool] = None,
+    response_language: str = "zh",
 ) -> Dict[str, Any]:
     feedback = submit_gui_feedback(
         user_id=user_id,
@@ -2424,6 +2489,7 @@ def submit_and_read(
             push_id=push_id,
             paper_numbers=feedback["selected_numbers"],
             write_feishu=write_feishu,
+            response_language=response_language,
         )
     return {"feedback": feedback, "reports": reports}
 
@@ -3423,12 +3489,25 @@ _DIRECT_STARTERS = (
     "explain ",
 )
 
-DIRECT_ANSWER_PROMPT = """You are PaperFlow's desktop research assistant.
+DIRECT_ANSWER_PROMPT_ZH = """You are PaperFlow's desktop research assistant.
 
 The user asked a general question that does not require local Wiki retrieval.
 Answer directly and concisely in Chinese by default. Do not add fake citations
 or [N] markers. If the question asks for local papers, reports, user profile,
 or Wiki evidence, say that local Wiki retrieval is required instead."""
+
+DIRECT_ANSWER_PROMPT_EN = """You are PaperFlow's desktop research assistant.
+
+The user asked a general question that does not require local Wiki retrieval.
+Answer directly and concisely in English. Do not add fake citations or [N]
+markers. If the question asks for local papers, reports, user profile, or Wiki
+evidence, say that local Wiki retrieval is required instead."""
+
+DIRECT_ANSWER_PROMPT = DIRECT_ANSWER_PROMPT_ZH
+
+
+def _direct_answer_prompt(response_language: str) -> str:
+    return DIRECT_ANSWER_PROMPT_EN if _normalize_response_language(response_language) == "en" else DIRECT_ANSWER_PROMPT_ZH
 
 
 def _direct_answer_max_tokens() -> int:
@@ -3769,30 +3848,43 @@ def _citation_source_payload(citation: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _direct_answer(question: str) -> Dict[str, Any]:
+def _direct_answer(question: str, response_language: str = "zh") -> Dict[str, Any]:
     started = time.time()
+    language = _normalize_response_language(response_language)
     llm = build_llm_provider()
     llm_error = None
     response = None
     if getattr(llm, "name", "") == "mock":
-        text = "这个问题不需要调用本地 Wiki。当前未配置可用 LLM，因此离线版无法生成通用回答；如需基于本地论文回答，请用 @ 选择论文或切换到 Wiki 范围。"
+        text = (
+            "This question does not require the local Wiki. No usable LLM is configured, "
+            "so the offline desktop app cannot generate a general answer right now. "
+            "Use @ to select papers or switch to a Wiki scope for local-paper answers."
+            if language == "en"
+            else "这个问题不需要调用本地 Wiki。当前未配置可用 LLM，因此离线版无法生成通用回答；如需基于本地论文回答，请用 @ 选择论文或切换到 Wiki 范围。"
+        )
     else:
         try:
             response = llm.generate(
                 question,
-                system=DIRECT_ANSWER_PROMPT,
+                system=_direct_answer_prompt(language),
                 temperature=0.0,
                 max_tokens=_direct_answer_max_tokens(),
             )
             text = response.text
         except Exception as exc:
             llm_error = str(exc)
-            text = f"这个问题被判定为通用问题，不需要引用本地 Wiki；但当前 LLM 调用失败：{llm_error}"
+            text = (
+                f"This was routed as a general question and does not need local Wiki citations, "
+                f"but the current LLM call failed: {llm_error}"
+                if language == "en"
+                else f"这个问题被判定为通用问题，不需要引用本地 Wiki；但当前 LLM 调用失败：{llm_error}"
+            )
     return {
         "text": text,
         "citations": [],
         "sources": [],
         "elapsed_ms": int((time.time() - started) * 1000),
+        "response_language": language,
         "token_usage": {
             "provider": getattr(llm, "name", "unknown"),
             "model": getattr(llm, "model", "unknown"),
@@ -3809,19 +3901,20 @@ def _text_chunks(text: str, size: int = 24) -> Iterator[str]:
         yield content[index : index + size]
 
 
-def _selection_required_answer(message: str) -> Dict[str, Any]:
+def _selection_required_answer(message: str, response_language: str = "zh") -> Dict[str, Any]:
     return {
         "text": message,
         "citations": [],
         "sources": [],
         "elapsed_ms": 0,
+        "response_language": _normalize_response_language(response_language),
         "token_usage": {},
         "streaming": {"provider": False, "transport": "json"},
     }
 
 
-def _selection_required_answer_stream(message: str) -> Iterator[Dict[str, Any]]:
-    result = _selection_required_answer(message)
+def _selection_required_answer_stream(message: str, response_language: str = "zh") -> Iterator[Dict[str, Any]]:
+    result = _selection_required_answer(message, response_language=response_language)
     yield {"event": "meta", "data": {key: value for key, value in result.items() if key != "text"}}
     for chunk in _text_chunks(message):
         yield {"event": "chunk", "data": {"text": chunk}}
@@ -3837,6 +3930,7 @@ def _apply_chat_metadata(
     mentions: List[Dict[str, Any]],
     unresolved_mentions: List[Dict[str, str]],
     scope: str,
+    response_language: str = "zh",
 ) -> Dict[str, Any]:
     citations = result.get("citations") or []
     result["sources"] = [_citation_source_payload(citation) for citation in citations]
@@ -3848,6 +3942,7 @@ def _apply_chat_metadata(
             "mentions": mentions,
             "unresolved_mentions": unresolved_mentions,
             "scope": scope if scope in {"all", "recent", "profile"} else "all",
+            "response_language": _normalize_response_language(response_language),
         }
     )
     return result
@@ -3866,6 +3961,7 @@ def _chat_turn_metadata(result: Dict[str, Any]) -> Dict[str, Any]:
         "elapsed_ms",
         "token_usage",
         "streaming",
+        "response_language",
     ]
     return {key: deepcopy(result.get(key)) for key in metadata_keys if key in result}
 
@@ -3915,8 +4011,9 @@ def _attach_chat_session(
     return result
 
 
-def _direct_answer_stream(question: str) -> Iterator[Dict[str, Any]]:
+def _direct_answer_stream(question: str, response_language: str = "zh") -> Iterator[Dict[str, Any]]:
     started = time.time()
+    language = _normalize_response_language(response_language)
     llm = build_llm_provider()
     llm_error = None
     text_parts: List[str] = []
@@ -3924,6 +4021,7 @@ def _direct_answer_stream(question: str) -> Iterator[Dict[str, Any]]:
         "citations": [],
         "sources": [],
         "elapsed_ms": 0,
+        "response_language": language,
         "token_usage": {
             "provider": getattr(llm, "name", "unknown"),
             "model": getattr(llm, "model", "unknown"),
@@ -3935,7 +4033,13 @@ def _direct_answer_stream(question: str) -> Iterator[Dict[str, Any]]:
     }
     yield {"event": "meta", "data": meta}
     if getattr(llm, "name", "") == "mock":
-        text = "这个问题不需要调用本地 Wiki。当前未配置可用 LLM，因此离线版无法生成通用回答；如需基于本地论文回答，请用 @ 选择论文或切换到 Wiki 范围。"
+        text = (
+            "This question does not require the local Wiki. No usable LLM is configured, "
+            "so the offline desktop app cannot generate a general answer right now. "
+            "Use @ to select papers or switch to a Wiki scope for local-paper answers."
+            if language == "en"
+            else "这个问题不需要调用本地 Wiki。当前未配置可用 LLM，因此离线版无法生成通用回答；如需基于本地论文回答，请用 @ 选择论文或切换到 Wiki 范围。"
+        )
         for chunk in _text_chunks(text):
             text_parts.append(chunk)
             yield {"event": "chunk", "data": {"text": chunk}}
@@ -3943,7 +4047,7 @@ def _direct_answer_stream(question: str) -> Iterator[Dict[str, Any]]:
         try:
             for chunk in llm.stream_generate(
                 question,
-                system=DIRECT_ANSWER_PROMPT,
+                system=_direct_answer_prompt(language),
                 temperature=0.0,
                 max_tokens=_direct_answer_max_tokens(),
             ):
@@ -3953,7 +4057,12 @@ def _direct_answer_stream(question: str) -> Iterator[Dict[str, Any]]:
                 yield {"event": "chunk", "data": {"text": chunk}}
         except Exception as exc:
             llm_error = str(exc)
-            text = f"这个问题被判定为通用问题，不需要引用本地 Wiki；但当前 LLM 流式调用失败：{llm_error}"
+            text = (
+                f"This was routed as a general question and does not need local Wiki citations, "
+                f"but the current LLM streaming call failed: {llm_error}"
+                if language == "en"
+                else f"这个问题被判定为通用问题，不需要引用本地 Wiki；但当前 LLM 流式调用失败：{llm_error}"
+            )
             text_parts = [text]
             yield {"event": "chunk", "data": {"text": text}}
 
@@ -3962,6 +4071,7 @@ def _direct_answer_stream(question: str) -> Iterator[Dict[str, Any]]:
         "citations": [],
         "sources": [],
         "elapsed_ms": int((time.time() - started) * 1000),
+        "response_language": language,
         "token_usage": {
             "provider": getattr(llm, "name", "unknown"),
             "model": getattr(llm, "model", "unknown"),
@@ -3974,6 +4084,29 @@ def _direct_answer_stream(question: str) -> Iterator[Dict[str, Any]]:
     yield {"event": "done", "data": result}
 
 
+def _wiki_scope_hint(scope: str, response_language: str) -> str:
+    language = _normalize_response_language(response_language)
+    if language == "en":
+        return {
+            "recent": " Prioritize recently updated wiki nodes and recent reading reports.",
+            "profile": " Prioritize profile, trajectory, preference, and research-direction wiki nodes.",
+        }.get(scope, "")
+    return {
+        "recent": " 请优先参考最近更新的 Wiki 节点和近期精读报告。",
+        "profile": " 请优先参考用户画像、研究轨迹、偏好和研究方向相关 Wiki 节点。",
+    }.get(scope, "")
+
+
+def _comparison_selection_required_message(response_language: str) -> str:
+    if _normalize_response_language(response_language) == "en":
+        return (
+            "Please use @ in the input box to select two specific papers first, "
+            "or open a reference from the right panel before comparing them. "
+            "Otherwise the local Wiki cannot know which two papers you mean."
+        )
+    return "请先在输入框用 @ 选择两篇具体论文，或从右侧参考文献点“查看来源”后再对比。否则本地 Wiki 无法判断你说的“这两篇”是哪两篇。"
+
+
 def wiki_ask(
     user_id: str,
     question: str,
@@ -3982,18 +4115,17 @@ def wiki_ask(
     mentions: Any = None,
     session_id: str = "",
     persist_chat: bool = False,
+    response_language: str = "zh",
 ) -> Dict[str, Any]:
     if not user_id:
         raise ValueError("user_id is required")
     cleaned_question = str(question or "").strip()
     if not cleaned_question:
         raise ValueError("question is required")
+    language = _normalize_response_language(response_language)
     safe_limit = max(1, min(12, int(limit or 8)))
     normalized_scope = str(scope or "all").strip().lower()
-    scope_hint = {
-        "recent": " Prioritize recently updated wiki nodes and recent reading reports.",
-        "profile": " Prioritize profile, trajectory, preference, and research-direction wiki nodes.",
-    }.get(normalized_scope, "")
+    scope_hint = _wiki_scope_hint(normalized_scope, language)
     resolved_nodes, resolved_mentions, unresolved_mentions = _resolve_wiki_mentions(
         user_id,
         cleaned_question,
@@ -4003,7 +4135,8 @@ def wiki_ask(
     mode, routing_reason = _question_route(cleaned_question, normalized_scope, resolved_mentions)
     if _comparison_needs_mentions(cleaned_question, resolved_nodes):
         result = _selection_required_answer(
-            "请先在输入框用 @ 选择两篇具体论文，或从右侧参考文献点“查看来源”后再对比。否则本地 Wiki 无法判断你说的“这两篇”是哪两篇。"
+            _comparison_selection_required_message(language),
+            response_language=language,
         )
         _apply_chat_metadata(
             result,
@@ -4013,6 +4146,7 @@ def wiki_ask(
             mentions=resolved_mentions,
             unresolved_mentions=unresolved_mentions,
             scope=normalized_scope,
+            response_language=language,
         )
         _attach_chat_session(
             result,
@@ -4023,7 +4157,7 @@ def wiki_ask(
         )
         return result
     if mode == "direct":
-        result = _direct_answer(cleaned_question)
+        result = _direct_answer(cleaned_question, response_language=language)
         result["streaming"] = {"provider": False, "transport": "json"}
         _apply_chat_metadata(
             result,
@@ -4033,6 +4167,7 @@ def wiki_ask(
             mentions=[],
             unresolved_mentions=unresolved_mentions,
             scope=normalized_scope,
+            response_language=language,
         )
     else:
         pinned_nodes = _chat_pinned_nodes(
@@ -4048,6 +4183,7 @@ def wiki_ask(
             limit=safe_limit,
             pinned_nodes=pinned_nodes,
             allowed_node_ids=_visible_wiki_node_ids(user_id),
+            response_language=language,
         )
         result["streaming"] = {"provider": False, "transport": "json"}
         _apply_chat_metadata(
@@ -4058,6 +4194,7 @@ def wiki_ask(
             mentions=resolved_mentions,
             unresolved_mentions=unresolved_mentions,
             scope=normalized_scope,
+            response_language=language,
         )
     _attach_chat_session(
         result,
@@ -4077,18 +4214,17 @@ def wiki_ask_stream(
     mentions: Any = None,
     session_id: str = "",
     persist_chat: bool = False,
+    response_language: str = "zh",
 ) -> Iterator[Dict[str, Any]]:
     if not user_id:
         raise ValueError("user_id is required")
     cleaned_question = str(question or "").strip()
     if not cleaned_question:
         raise ValueError("question is required")
+    language = _normalize_response_language(response_language)
     safe_limit = max(1, min(12, int(limit or 8)))
     normalized_scope = str(scope or "all").strip().lower()
-    scope_hint = {
-        "recent": " Prioritize recently updated wiki nodes and recent reading reports.",
-        "profile": " Prioritize profile, trajectory, preference, and research-direction wiki nodes.",
-    }.get(normalized_scope, "")
+    scope_hint = _wiki_scope_hint(normalized_scope, language)
     resolved_nodes, resolved_mentions, unresolved_mentions = _resolve_wiki_mentions(
         user_id,
         cleaned_question,
@@ -4098,7 +4234,8 @@ def wiki_ask_stream(
     mode, routing_reason = _question_route(cleaned_question, normalized_scope, resolved_mentions)
     if _comparison_needs_mentions(cleaned_question, resolved_nodes):
         for event in _selection_required_answer_stream(
-            "请先在输入框用 @ 选择两篇具体论文，或从右侧参考文献点“查看来源”后再对比。否则本地 Wiki 无法判断你说的“这两篇”是哪两篇。"
+            _comparison_selection_required_message(language),
+            response_language=language,
         ):
             if event["event"] in {"meta", "done"}:
                 _apply_chat_metadata(
@@ -4109,6 +4246,7 @@ def wiki_ask_stream(
                     mentions=resolved_mentions,
                     unresolved_mentions=unresolved_mentions,
                     scope=normalized_scope,
+                    response_language=language,
                 )
             if event["event"] == "meta" and session_id:
                 event["data"]["session_id"] = session_id
@@ -4123,7 +4261,7 @@ def wiki_ask_stream(
             yield event
         return
     if mode == "direct":
-        for event in _direct_answer_stream(cleaned_question):
+        for event in _direct_answer_stream(cleaned_question, response_language=language):
             if event["event"] in {"meta", "done"}:
                 _apply_chat_metadata(
                     event["data"],
@@ -4133,6 +4271,7 @@ def wiki_ask_stream(
                     mentions=[],
                     unresolved_mentions=unresolved_mentions,
                     scope=normalized_scope,
+                    response_language=language,
                 )
             if event["event"] == "meta" and session_id:
                 event["data"]["session_id"] = session_id
@@ -4160,6 +4299,7 @@ def wiki_ask_stream(
         limit=safe_limit,
         pinned_nodes=pinned_nodes,
         allowed_node_ids=_visible_wiki_node_ids(user_id),
+        response_language=language,
     ):
         if event["event"] in {"meta", "done"}:
             _apply_chat_metadata(
@@ -4170,6 +4310,7 @@ def wiki_ask_stream(
                 mentions=resolved_mentions,
                 unresolved_mentions=unresolved_mentions,
                 scope=normalized_scope,
+                response_language=language,
             )
         if event["event"] == "meta" and session_id:
             event["data"]["session_id"] = session_id

@@ -9,9 +9,9 @@ build a profile, rank today's papers, read the useful ones, collect feedback,
 and adapt tomorrow's recommendations.
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB.svg)](https://www.python.org/downloads/)
-[![Package](https://img.shields.io/badge/package-paperflow-2E7D32.svg)](pyproject.toml)
+[![Package](https://img.shields.io/badge/package-paperflow-2E7D32.svg)](https://github.com/OpenRaiser/PaperFlow/blob/main/pyproject.toml)
 [![HF Dataset](https://img.shields.io/badge/HF%20Dataset-OpenRaiser%2FPaperFlow-FFD21E.svg)](https://huggingface.co/datasets/OpenRaiser/PaperFlow)
-[![License: MIT](https://img.shields.io/badge/License-MIT-111111.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-111111.svg)](https://github.com/OpenRaiser/PaperFlow/blob/main/LICENSE)
 
 ![Personalized Recommendation](https://img.shields.io/badge/personalized-recommendation-2E7D32.svg)
 ![Scientific Reading](https://img.shields.io/badge/scientific-reading-1565C0.svg)
@@ -20,12 +20,21 @@ and adapt tomorrow's recommendations.
 ![Interest Drift](https://img.shields.io/badge/interest-drift-00897B.svg)
 ![Feishu/Lark](https://img.shields.io/badge/Feishu%2FLark-bot-00A1E9.svg)
 
+**Language**:
+[English](https://github.com/OpenRaiser/PaperFlow#readme) ·
+[简体中文](https://github.com/OpenRaiser/PaperFlow/blob/main/assets/README/README_CN.md) ·
+[日本語](https://github.com/OpenRaiser/PaperFlow/blob/main/assets/README/README_JA.md) ·
+[Español](https://github.com/OpenRaiser/PaperFlow/blob/main/assets/README/README_ES.md) ·
+[Français](https://github.com/OpenRaiser/PaperFlow/blob/main/assets/README/README_FR.md) ·
+[Português](https://github.com/OpenRaiser/PaperFlow/blob/main/assets/README/README_PT.md) ·
+[한국어](https://github.com/OpenRaiser/PaperFlow/blob/main/assets/README/README_KO.md)
+
 [Quick Start](#quick-start) | [Desktop Preview](#desktop-preview) | [Local GUI](#local-gui) |
 [GUI Preview](https://openraiser.github.io/PaperFlow/deployments/desktop/static/index.html?demo=1) |
 [CLI Usage](#cli-usage) |
-[Feedback Loop](docs/feedback-loop.md) |
+[Feedback Loop](https://github.com/OpenRaiser/PaperFlow/blob/main/docs/feedback-loop.md) |
 [Feishu/Lark Bot](#feishu--lark-bot) |
-[PaperFlow-Bench](#paperflow-bench) | [Reproduce](experiments/REPRODUCE.md)
+[PaperFlow-Bench](#paperflow-bench) | [Reproduce](https://github.com/OpenRaiser/PaperFlow/blob/main/experiments/REPRODUCE.md)
 
 <img src="https://github.com/user-attachments/assets/fd31a62b-00a4-4210-82cb-1ffd080de254" alt="PaperFlow personalized scientific reading banner" width="100%">
 
@@ -337,7 +346,7 @@ paperflow gui --host 0.0.0.0 --no-browser
 ```
 
 Detailed GUI notes are in
-[deployments/desktop/README.md](deployments/desktop/README.md).
+[deployments/desktop/README.md](https://github.com/OpenRaiser/PaperFlow/blob/main/deployments/desktop/README.md).
 
 ## CLI Usage
 
@@ -427,7 +436,7 @@ Without `--month`, PaperFlow exports the current calendar month. Use
 month.
 
 Feishu/Lark document export is optional and separate from the GUI and CLI core.
-Configuration is in [docs/feishu-doc-export.md](docs/feishu-doc-export.md).
+Configuration is in [docs/feishu-doc-export.md](https://github.com/OpenRaiser/PaperFlow/blob/main/docs/feishu-doc-export.md).
 After configuring Feishu, CLI usage is:
 
 ```bash
@@ -448,7 +457,7 @@ paperflow feedback \
 
 Feedback from CLI, GUI, and Feishu/Lark bot replies is stored in the same
 SQLite database and updates the same profile for that `user_id`. See
-[docs/feedback-loop.md](docs/feedback-loop.md) for the full learning path.
+[docs/feedback-loop.md](https://github.com/OpenRaiser/PaperFlow/blob/main/docs/feedback-loop.md) for the full learning path.
 
 ## Feishu / Lark Bot
 
@@ -456,7 +465,7 @@ The Feishu/Lark integration is optional. Use it when you want PaperFlow to run
 as a chat bot with scheduled pushes and weekly reports.
 
 If you only want reading reports exported as Feishu/Lark docs, use
-[docs/feishu-doc-export.md](docs/feishu-doc-export.md) instead; that path does
+[docs/feishu-doc-export.md](https://github.com/OpenRaiser/PaperFlow/blob/main/docs/feishu-doc-export.md) instead; that path does
 not require ngrok or webhook callbacks.
 
 Add the Feishu/Lark and ngrok values to `.env`:
@@ -504,7 +513,7 @@ read 1
 ```
 
 Detailed setup:
-[docs/feishu-webhook-setup.md](docs/feishu-webhook-setup.md).
+[docs/feishu-webhook-setup.md](https://github.com/OpenRaiser/PaperFlow/blob/main/docs/feishu-webhook-setup.md).
 
 ## PaperFlow-Bench
 
@@ -537,8 +546,8 @@ paperflow eval \
 
 More benchmark details:
 
-- [docs/benchmark.md](docs/benchmark.md)
-- [experiments/REPRODUCE.md](experiments/REPRODUCE.md)
+- [docs/benchmark.md](https://github.com/OpenRaiser/PaperFlow/blob/main/docs/benchmark.md)
+- [experiments/REPRODUCE.md](https://github.com/OpenRaiser/PaperFlow/blob/main/experiments/REPRODUCE.md)
 
 ## Workflow
 
@@ -586,16 +595,16 @@ in `experiments/tests/` for benchmark and reproduction validation.
 
 ## Documentation
 
-For a complete guide map, see [docs/README.md](docs/README.md). The most common
+For a complete guide map, see [docs/README.md](https://github.com/OpenRaiser/PaperFlow/blob/main/docs/README.md). The most common
 follow-ups are:
 
-- [docs/quickstart.md](docs/quickstart.md) for the first local run
-- [docs/configuration.md](docs/configuration.md) for environment variables and paths
-- [docs/feedback-loop.md](docs/feedback-loop.md) for CLI / GUI / Feishu profile learning
-- [deployments/desktop/README.md](deployments/desktop/README.md) for local GUI behavior
+- [docs/quickstart.md](https://github.com/OpenRaiser/PaperFlow/blob/main/docs/quickstart.md) for the first local run
+- [docs/configuration.md](https://github.com/OpenRaiser/PaperFlow/blob/main/docs/configuration.md) for environment variables and paths
+- [docs/feedback-loop.md](https://github.com/OpenRaiser/PaperFlow/blob/main/docs/feedback-loop.md) for CLI / GUI / Feishu profile learning
+- [deployments/desktop/README.md](https://github.com/OpenRaiser/PaperFlow/blob/main/deployments/desktop/README.md) for local GUI behavior
 - [PaperFlow GUI Preview](https://openraiser.github.io/PaperFlow/deployments/desktop/static/index.html?demo=1) for a no-install UI preview
-- [docs/feishu-doc-export.md](docs/feishu-doc-export.md) for Feishu document export
-- [docs/feishu-webhook-setup.md](docs/feishu-webhook-setup.md) for webhook + ngrok bot deployment
+- [docs/feishu-doc-export.md](https://github.com/OpenRaiser/PaperFlow/blob/main/docs/feishu-doc-export.md) for Feishu document export
+- [docs/feishu-webhook-setup.md](https://github.com/OpenRaiser/PaperFlow/blob/main/docs/feishu-webhook-setup.md) for webhook + ngrok bot deployment
 
 ## Citation
 
@@ -614,4 +623,4 @@ The formal citation will be updated after the paper is published.
 
 ## License
 
-PaperFlow is released under the MIT License. See [LICENSE](LICENSE).
+PaperFlow is released under the MIT License. See [LICENSE](https://github.com/OpenRaiser/PaperFlow/blob/main/LICENSE).
