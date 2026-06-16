@@ -1158,6 +1158,71 @@ body.chat-view #chat {
   font-size: 13.5px;
 }
 
+.annotation-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 10px 0 2px;
+}
+
+.annotation-swatch {
+  width: 26px;
+  height: 26px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.annotation-swatch.bg-red {
+  background: #fee2e2;
+}
+
+.annotation-swatch.bg-yellow {
+  background: #fef3c7;
+}
+
+.annotation-swatch.bg-green {
+  background: #dcfce7;
+}
+
+.annotation-swatch.text-red {
+  background: #fff;
+  color: #b91c1c;
+}
+
+.annotation-swatch.text-yellow {
+  background: #fff;
+  color: #a16207;
+}
+
+.annotation-swatch.text-green {
+  background: #fff;
+  color: #15803d;
+}
+
+.annotation-swatch.text-red::before,
+.annotation-swatch.text-yellow::before,
+.annotation-swatch.text-green::before {
+  content: "A";
+  font-weight: 700;
+}
+
+.annotation-divider {
+  width: 1px;
+  height: 20px;
+  background: var(--line);
+}
+
+.annotation-clear {
+  min-height: 26px;
+  padding: 0 9px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 12px;
+}
+
 .markdown-body h1,
 .markdown-body h2,
 .markdown-body h3 {
@@ -1181,9 +1246,43 @@ body.chat-view #chat {
   margin: 0 0 10px;
 }
 
-.markdown-body ul {
+.markdown-body ul,
+.markdown-body ol {
   margin: 0 0 10px;
   padding-left: 20px;
+}
+
+.markdown-body blockquote {
+  margin: 0 0 12px;
+  padding: 8px 12px;
+  border-left: 3px solid #8bb8e8;
+  background: #f3f8fd;
+  color: #3a506c;
+}
+
+.markdown-body pre {
+  overflow-x: auto;
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  border-radius: 7px;
+  background: #101827;
+  color: #e5eefb;
+}
+
+.markdown-body pre code {
+  padding: 0;
+  border-radius: 0;
+  background: transparent;
+  color: inherit;
+}
+
+.markdown-body a {
+  color: #1d4ed8;
+  text-decoration: none;
+}
+
+.markdown-body a:hover {
+  text-decoration: underline;
 }
 
 .markdown-body code {

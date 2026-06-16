@@ -282,6 +282,7 @@ def test_synthesize_reading_report_with_llm_uses_local_provider(monkeypatch):
             "limitations": ["跨领域泛化仍需进一步验证"],
             "relevance_points": ["和用户关注的智能体方向高度相关"],
             "reading_focus": ["重点看 Method 和 Results"],
+            "institution": "OpenAI",
             "recommendation_label": "推荐阅读",
         }
 
@@ -302,7 +303,9 @@ def test_synthesize_reading_report_with_llm_uses_local_provider(monkeypatch):
     assert result["recommendation_label"] == "推荐阅读"
     assert result["main_contributions"][0] == "提出两阶段流程"
     assert result["generation_provider"] == "local"
+    assert result["institution"] == "OpenAI"
     assert "Scientific Planner" in captured["user_text"]
+    assert "institution" in captured["system_prompt"]
     assert "科研论文精读助手" in captured["system_prompt"]
 
 

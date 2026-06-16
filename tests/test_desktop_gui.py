@@ -1642,6 +1642,25 @@ def test_desktop_reports_view_uses_compact_reading_typography() -> None:
     assert ".reader-head h2 {\n  margin: 0 0 4px;\n  font-size: 18px;" in css
     assert ".markdown-body {\n  padding: 14px 0 4px;\n  color: #25354f;\n  line-height: 1.68;\n  font-size: 13.5px;" in css
     assert ".markdown-body h1 {\n  font-size: 19px;" in css
+    assert ".markdown-body blockquote {" in css
+    assert ".annotation-toolbar {" in css
+    assert ".annotation-swatch.bg-red {" in css
+
+
+def test_desktop_report_viewer_renders_markdown_and_annotations() -> None:
+    html = (PROJECT_ROOT / "deployments/desktop/static/index.html").read_text(encoding="utf-8")
+    script = (PROJECT_ROOT / "deployments/desktop/static/desktop.js").read_text(encoding="utf-8")
+
+    assert 'data-annotation-command="backColor"' in html
+    assert 'data-annotation-command="foreColor"' in html
+    assert 'id="clearReportAnnotationsBtn"' in html
+    assert "function renderMarkdown(markdown)" in script
+    assert "renderInlineMarkdown" in script
+    assert "blockquote" in script
+    assert "<strong>$1</strong>" in script
+    assert "paperflow.report.annotations." in script
+    assert "applyReportAnnotation" in script
+    assert "document.execCommand(command, false, value)" in script
 
 
 def test_desktop_direct_read_generation_shows_status_feedback() -> None:
@@ -1988,6 +2007,53 @@ def test_reading_report_template_supports_english_response_language() -> None:
     assert "- Recommendation: **Recommended**" in report
     assert "## 基本信息" not in report
     assert "预计阅读时间" not in report
+
+
+def test_reading_report_template_omits_resource_and_evidence_locator_blocks() -> None:
+    report = agents.reading_agent.generate_reading_report(
+        {
+            "title": "Clean Report Paper",
+            "abstract": "A structured abstract.",
+            "authors": ["Alice"],
+            "pdf_url": "https://arxiv.org/pdf/2606.16995v1",
+            "paper_url": "https://arxiv.org/abs/2606.16995v1",
+            "score": 0.9,
+        },
+        {"core_directions": {}},
+        report_payload={
+            "one_sentence_summary": "一条简洁总结。",
+            "abstract": "A structured abstract.",
+            "institution": "OpenAI",
+            "recommendation_label": "强烈推荐",
+            "analysis_source": "pdf",
+            "analysis_note": "参考了 PDF 检索证据。",
+            "report_evidence_anchors": {"method": ["p.1 method evidence"]},
+            "field_evidence_map": {"core_method": ["p.2 method anchor"], "key_results": ["p.3 result anchor"]},
+        },
+    )
+
+    assert "PDF: https://arxiv.org/pdf/2606.16995v1" not in report
+    assert "原文: https://arxiv.org/abs/2606.16995v1" not in report
+    assert "证据 PDF 全文 + 元数据" not in report
+    assert "PDF 证据定位" not in report
+    assert "方法证据锚点" not in report
+    assert "结果证据锚点" not in report
+    assert "代码与资源" not in report
+    assert "- 机构：OpenAI" in report
+    assert "★★★★★（5/5）" in report
+
+
+def test_recommendation_calibration_uses_plain_ranking_score() -> None:
+    assert agents.reading_agent.calibrate_recommendation_label(
+        {"score": 0.91},
+        "强烈推荐",
+        "pdf",
+    ) == "强烈推荐"
+    assert agents.reading_agent.calibrate_recommendation_label(
+        {"score": 0.5},
+        "强烈推荐",
+        "pdf",
+    ) == "值得快速浏览"
 
 
 def test_reading_report_english_heuristic_fallbacks_do_not_emit_chinese(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2969,7 +3035,9 @@ def test_reading_report_writes_obsidian_deep_reading_and_daily_note(
     assert report_path.parent == expected_dir
     assert report_path.name.startswith("Generative AI in K-12 Classrooms")
     assert report_path.suffix == ".md"
-    assert "[[Daily Note - May 2026]]" in report_path.read_text(encoding="utf-8")
+    report_text = report_path.read_text(encoding="utf-8")
+    assert "[[Daily Note - May 2026]]" not in report_text
+    assert "- PDF：" not in report_text
     assert pdf_dir == (daily_root / "Daily Note 2026" / "arXiv - May 2026").resolve()
     daily_text = daily_note.read_text(encoding="utf-8")
     assert "# AI for Education" in daily_text

@@ -868,18 +868,24 @@ def calibrate_recommendation_label(paper: Dict[str, Any], proposed_label: Any, a
         system_score = float(paper.get("system_score", paper.get("relevance_score", 0.0)) or 0.0)
     except (TypeError, ValueError):
         system_score = 0.0
+    for score_key in ("score", "relevance", "ranking_score", "final_score"):
+        try:
+            candidate_score = float(paper.get(score_key, 0.0) or 0.0)
+        except (TypeError, ValueError):
+            candidate_score = 0.0
+        system_score = max(system_score, candidate_score)
     try:
         oracle_score = float(paper.get("oracle_score", 0.0) or 0.0)
     except (TypeError, ValueError):
         oracle_score = 0.0
 
-    if system_label == "must_read" or oracle_label == "strong_relevant" or oracle_score >= 0.72:
+    if system_label == "must_read" or oracle_label == "strong_relevant" or system_score >= 0.82 or oracle_score >= 0.72:
         max_rank = 3
         default_rank = 3
-    elif system_label == "high_relevant" or oracle_label == "relevant" or system_score >= 0.58 or oracle_score >= 0.48:
+    elif system_label == "high_relevant" or oracle_label == "relevant" or system_score >= 0.62 or oracle_score >= 0.48:
         max_rank = 2
         default_rank = 2
-    elif system_label == "maybe_interested" or oracle_label == "weak_relevant" or system_score >= 0.38 or oracle_score >= 0.25:
+    elif system_label == "maybe_interested" or oracle_label == "weak_relevant" or system_score >= 0.36 or oracle_score >= 0.25:
         max_rank = 1
         default_rank = 1
     else:
@@ -2642,14 +2648,8 @@ def _save_reading_report_markdown(
         if value not in (None, "", [], {}):
             frontmatter.append(f"{key}: {json.dumps(value, ensure_ascii=False)}")
     frontmatter.extend(["---", ""])
-    obsidian_header = ""
-    if obsidian_report and daily_note_path:
-        daily_note_link = daily_note_path.with_suffix("").name
-        pdf_url = _clean_text(paper.get("pdf_url")) or _get_direct_pdf_url(paper)
-        pdf_line = f"- PDF：[{pdf_url}]({pdf_url})\n" if pdf_url else ""
-        obsidian_header = f"[[{daily_note_link}]]\n\n{pdf_line}\n"
     report_path.write_text(
-        "\n".join(frontmatter) + obsidian_header + report_content.strip() + "\n",
+        "\n".join(frontmatter) + report_content.strip() + "\n",
         encoding="utf-8",
     )
     daily_note_written = _sync_obsidian_daily_note(
@@ -4103,10 +4103,12 @@ def _merge_report_payload(base: Dict[str, Any], llm_payload: Optional[Dict[str, 
         "research_background",
         "core_method",
         "key_results",
+        "institution",
+        "affiliation",
     ):
         value = _clean_text(llm_payload.get(key))
         if value:
-            merged[key] = value
+            merged["institution" if key == "affiliation" else key] = value
 
     analysis_note = _clean_text(llm_payload.get("analysis_note"))
     if analysis_note:
@@ -4193,13 +4195,12 @@ def generate_reading_report(
         "untitled": "Untitled Paper" if is_en else "Untitled Paper",
         "source_no_abstract_link": "The source did not return a usable abstract. View the original paper here:" if is_en else "源站暂未返回可用摘要。请直接查看原文链接：",
         "source_no_abstract": "The source did not return a usable abstract. Check the original PDF or paper page directly." if is_en else "源站暂未返回可用摘要，建议直接查看原文 PDF 或论文主页。",
-        "analysis_pdf": "PDF full text + metadata" if is_en else "PDF 全文 + 元数据",
+        "analysis_pdf": "PDF full text" if is_en else "PDF 全文",
         "analysis_source_page": "source page + metadata" if is_en else "源站正文 + 元数据",
         "analysis_metadata": "abstract + metadata" if is_en else "摘要 + 元数据",
         "about_minutes": "about" if is_en else "约",
         "minutes": "min" if is_en else "分钟",
         "model": "model" if is_en else "模型",
-        "evidence": "evidence" if is_en else "证据",
         "keywords": "Keywords" if is_en else "关键词",
         "one_sentence": "One-Sentence Summary" if is_en else "一句话总结",
         "one_sentence_empty": "There is not enough information to generate a one-sentence summary yet." if is_en else "当前没有足够信息生成一句话总结。",
@@ -4214,8 +4215,6 @@ def generate_reading_report(
         "limitations_prefix": "Important boundaries include: " if is_en else "需要注意的边界包括：",
         "relevance_prefix": "Relationship to the user profile: " if is_en else "与用户画像的关系：",
         "summary_empty": "Current information is insufficient; connect the abstract, introduction, method, and conclusion in the original paper." if is_en else "当前信息不足，建议回到原文摘要、引言、方法和结论串联主线。",
-        "evidence_pdf": "PDF Evidence Locator" if is_en else "PDF 证据定位",
-        "evidence_full": "Full-Text Evidence Locator" if is_en else "全文证据定位",
         "recommendation": "Recommendation" if is_en else "推荐指数",
         "reason": "Reason" if is_en else "推荐理由",
         "details": "Paper Details" if is_en else "基本信息",
@@ -4230,10 +4229,7 @@ def generate_reading_report(
         "generation_model": "Generation model" if is_en else "生成模型",
         "not_provided": "Not provided" if is_en else "未提供",
         "unknown": "Unknown" if is_en else "未知",
-        "resources": "Code & Resources" if is_en else "代码与资源",
         "analysis_note": "Analysis note" if is_en else "解析说明",
-        "method_anchor": "Method evidence anchor" if is_en else "方法证据锚点",
-        "result_anchor": "Result evidence anchor" if is_en else "结果证据锚点",
     }
     field_sep = ": " if is_en else "："
     list_joiner = "; " if is_en else "；"
@@ -4277,29 +4273,21 @@ def generate_reading_report(
         else (labels["analysis_source_page"] if analysis_source == "source_page" else labels["analysis_metadata"])
     )
     analysis_note = _clean_text(payload.get("analysis_note"))
-    resource_items = _build_resource_items(paper, response_language=language)
-    action_links = _build_report_action_links(paper, response_language=language)
     subjects = _format_subjects(paper)
     if subjects == "未知" and is_en:
         subjects = labels["unknown"]
     generation_provider = _clean_text(payload.get("generation_provider")) or "heuristic"
     generation_model = _clean_text(payload.get("generation_model")) or "PaperFlow template"
     recommendation_reason = _build_recommendation_reason(payload, response_language=language)
-    report_evidence_anchors = payload.get("report_evidence_anchors") or {}
-    field_evidence_map = payload.get("field_evidence_map") or {}
 
     lines = []
     lines.append(f"# {title}")
     lines.append("")
-    if action_links:
-        lines.append(action_links)
-        lines.append("")
 
     lines.append(
         f"> {recommendation_stars} {recommendation_display_label} · "
         f"{labels['about_minutes']} {int(payload.get('estimated_reading_minutes') or 8)} {labels['minutes']} · "
-        f"{labels['model']} {generation_provider}/{generation_model} · "
-        f"{labels['evidence']} {analysis_source_label}"
+        f"{labels['model']} {generation_provider}/{generation_model}"
     )
     lines.append("")
 
@@ -4399,26 +4387,6 @@ def generate_reading_report(
     ):
         _append_template_qa_block(lines, qid, question_text, content, response_language=language)
 
-    if report_evidence_anchors:
-        bucket_labels = {
-            "background": "Background" if is_en else "研究背景",
-            "method": "Method" if is_en else "核心方法",
-            "results": "Results" if is_en else "主要结果",
-            "limitations": "Limitations" if is_en else "局限性",
-            "relevance": "Relevance" if is_en else "相关性",
-        }
-        evidence_heading = f"## {labels['evidence_pdf']}" if analysis_source == "pdf" else f"## {labels['evidence_full']}"
-        lines.append(evidence_heading)
-        lines.append("")
-        for bucket in ("background", "method", "results", "limitations", "relevance"):
-            items = report_evidence_anchors.get(bucket) or []
-            if not items:
-                continue
-            lines.append(f"- {bucket_labels.get(bucket, bucket)}{field_sep}")
-            for item in items:
-                lines.append(f"  {item}")
-        lines.append("")
-
     lines.append(f"## {labels['recommendation']}")
     lines.append("")
     lines.append(
@@ -4435,7 +4403,8 @@ def generate_reading_report(
     if authors_text == "未知" and is_en:
         authors_text = labels["unknown"]
     lines.append(f"- {labels['authors']}{field_sep}{authors_text}")
-    lines.append(f"- {labels['affiliation']}{field_sep}{_clean_text(paper.get('institution')) or labels['not_provided']}")
+    institution = _clean_text(payload.get("institution") or paper.get("institution") or paper.get("affiliation"))
+    lines.append(f"- {labels['affiliation']}{field_sep}{institution or labels['not_provided']}")
     lines.append(f"- {labels['source']}{field_sep}{_clean_text(paper.get('venue') or paper.get('journal') or paper.get('source')) or labels['unknown']}")
     lines.append(f"- {labels['subjects']}{field_sep}{subjects}")
     lines.append(f"- {labels['date']}{field_sep}{_clean_text(paper.get('publish_date')) or labels['unknown']}")
@@ -4447,20 +4416,8 @@ def generate_reading_report(
         lines.append(f"- arXiv ID{field_sep}`{arxiv_id}`")
     if doi:
         lines.append(f"- DOI{field_sep}`{doi}`")
-    lines.append("")
-
-    lines.append(f"## {labels['resources']}")
-    lines.append("")
-    for label, value in resource_items:
-        lines.append(f"- {label}{field_sep}{value}")
     if analysis_note:
         lines.append(f"- {labels['analysis_note']}{field_sep}{analysis_note}")
-    method_evidence = field_evidence_map.get("core_method") or []
-    result_evidence = field_evidence_map.get("key_results") or []
-    if method_evidence:
-        lines.append(f"- {labels['method_anchor']}{field_sep}{method_evidence[0]}")
-    if result_evidence:
-        lines.append(f"- {labels['result_anchor']}{field_sep}{result_evidence[0]}")
     lines.append("")
 
     return "\n".join(lines).rstrip() + "\n"

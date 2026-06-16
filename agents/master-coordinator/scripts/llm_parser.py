@@ -1656,6 +1656,7 @@ def synthesize_reading_report_with_llm(
                 "publish_date": paper.get("publish_date"),
                 "arxiv_id": paper.get("arxiv_id"),
                 "doi": paper.get("doi"),
+                "institution": paper.get("institution") or paper.get("affiliation"),
             },
             "sections": {
                 "introduction": _truncate_prompt_text(sections.get("introduction"), 1600),
@@ -1702,11 +1703,12 @@ def synthesize_reading_report_with_llm(
             "Return JSON only, with no Markdown, explanation, or code block. Keep JSON field names unchanged and fill these fields: "
             "one_sentence_summary, clean_abstract_summary, problem_analysis, related_work, solution_approach, experiments, "
             "future_directions, paper_summary, research_background, core_method, key_results, "
-            "main_contributions, limitations, relevance_points, reading_focus, keywords, recommendation_label, analysis_note. "
+            "institution, main_contributions, limitations, relevance_points, reading_focus, keywords, recommendation_label, analysis_note. "
             "problem_analysis answers what problem the paper tries to solve; related_work answers what related research it builds on; "
             "solution_approach answers how the paper solves the problem; experiments answers what experiments were run; "
             "future_directions answers what could be explored next; paper_summary summarizes the main content. "
             "research_background/core_method/key_results/main_contributions/limitations/relevance_points/reading_focus are compatibility fields and must also be filled. "
+            "institution should infer the authors' affiliation or institution from metadata and full text when possible; use an empty string if unsupported. "
             "main_contributions, limitations, relevance_points, reading_focus, and keywords must be string arrays; all other fields are strings. "
             "keywords should contain 5-8 lowercase English phrases sorted by core topic. "
             "analysis_note should be one English sentence explaining whether PDF retrieval evidence was used. "
@@ -1737,11 +1739,12 @@ def synthesize_reading_report_with_llm(
             "只输出 JSON 对象，不要 Markdown，不要解释，不要代码块。字段包括："
             "one_sentence_summary, clean_abstract_summary, problem_analysis, related_work, solution_approach, experiments, "
             "future_directions, paper_summary, research_background, core_method, key_results, "
-            "main_contributions, limitations, relevance_points, reading_focus, keywords, recommendation_label, analysis_note。"
+            "institution, main_contributions, limitations, relevance_points, reading_focus, keywords, recommendation_label, analysis_note。"
             "problem_analysis 对应“这篇论文试图解决什么问题”；related_work 对应“有哪些相关研究”；"
             "solution_approach 对应“论文如何解决这个问题”；experiments 对应“论文做了哪些实验”；"
             "future_directions 对应“有什么可以进一步探索的点”；paper_summary 对应“总结一下论文的主要内容”。"
             "research_background/core_method/key_results/main_contributions/limitations/relevance_points/reading_focus 是兼容旧模板的摘要字段，也要填写。"
+            "institution 用于根据元数据和 PDF 正文推断作者机构/单位；证据不足时返回空字符串，不要编造。"
             "main_contributions, limitations, relevance_points, reading_focus, keywords 必须是字符串数组；其他字段是字符串。"
             "keywords 用 5-8 个英文小写短语，按论文核心话题排序，例如 [\"diffusion model\", \"video generation\", \"long context\"]。"
             "analysis_note 用一句话说明本次生成是否参考了 PDF 检索证据。"
@@ -1773,12 +1776,14 @@ def synthesize_reading_report_with_llm(
         "research_background",
         "core_method",
         "key_results",
+        "institution",
+        "affiliation",
         "recommendation_label",
         "analysis_note",
     ):
         value = str(result.get(key, "")).strip()
         if value:
-            normalized[key] = value
+            normalized["institution" if key == "affiliation" else key] = value
 
     for key in ("generation_provider", "generation_model"):
         value = str(result.get(key, "")).strip()

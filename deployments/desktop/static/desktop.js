@@ -2565,34 +2565,161 @@
   }
 
   function renderMarkdown(markdown) {
-    const lines = String(markdown || "").split(/\r?\n/);
-    const html = [];
-    let inList = false;
-    for (const line of lines) {
-      if (line.startsWith("### ")) {
-        if (inList) html.push("</ul>");
-        inList = false;
-        html.push(`<h3>${escapeHtml(line.slice(4))}</h3>`);
-      } else if (line.startsWith("## ")) {
-        if (inList) html.push("</ul>");
-        inList = false;
-        html.push(`<h2>${escapeHtml(line.slice(3))}</h2>`);
-      } else if (line.startsWith("# ")) {
-        if (inList) html.push("</ul>");
-        inList = false;
-        html.push(`<h1>${escapeHtml(line.slice(2))}</h1>`);
-      } else if (line.startsWith("- ")) {
-        if (!inList) html.push("<ul>");
-        inList = true;
-        html.push(`<li>${escapeHtml(line.slice(2))}</li>`);
-      } else if (line.trim()) {
-        if (inList) html.push("</ul>");
-        inList = false;
-        html.push(`<p>${escapeHtml(line)}</p>`);
+    const lines = String(markdown || "").replace(/\r\n/g, "\n").split("\n");
+    const out = [];
+    let paragraph = [];
+    let listItems = [];
+    let listType = "";
+    let quoteLines = [];
+    let inCode = false;
+    let codeLines = [];
+
+    const renderInlineMarkdown = (text) => {
+      let html = escapeHtml(text || "");
+      html = html.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noreferrer">$1</a>');
+      html = html.replace(/`([^`]+)`/g, "<code>$1</code>");
+      html = html.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+      html = html.replace(/(^|[\s(])(https?:\/\/[^\s<)]+)/g, '$1<a href="$2" target="_blank" rel="noreferrer">$2</a>');
+      return html;
+    };
+    const flushParagraph = () => {
+      if (!paragraph.length) return;
+      out.push(`<p>${renderInlineMarkdown(paragraph.join(" "))}</p>`);
+      paragraph = [];
+    };
+    const flushList = () => {
+      if (!listItems.length) return;
+      out.push(`<${listType}>${listItems.map((item) => `<li>${renderInlineMarkdown(item)}</li>`).join("")}</${listType}>`);
+      listItems = [];
+      listType = "";
+    };
+    const flushQuote = () => {
+      if (!quoteLines.length) return;
+      out.push(`<blockquote>${quoteLines.map((item) => `<p>${renderInlineMarkdown(item)}</p>`).join("")}</blockquote>`);
+      quoteLines = [];
+    };
+    const flushCode = () => {
+      if (!inCode) return;
+      out.push(`<pre><code>${escapeHtml(codeLines.join("\n"))}</code></pre>`);
+      inCode = false;
+      codeLines = [];
+    };
+
+    for (const rawLine of lines) {
+      const line = rawLine.replace(/\t/g, "  ");
+      const trimmed = line.trim();
+      if (trimmed.startsWith("```")) {
+        flushParagraph();
+        flushList();
+        flushQuote();
+        if (inCode) flushCode();
+        else {
+          inCode = true;
+          codeLines = [];
+        }
+        continue;
       }
+      if (inCode) {
+        codeLines.push(line);
+        continue;
+      }
+      if (!trimmed) {
+        flushParagraph();
+        flushList();
+        flushQuote();
+        continue;
+      }
+      const heading = trimmed.match(/^(#{1,6})\s+(.*)$/);
+      if (heading) {
+        flushParagraph();
+        flushList();
+        flushQuote();
+        const level = heading[1].length;
+        out.push(`<h${level}>${renderInlineMarkdown(heading[2])}</h${level}>`);
+        continue;
+      }
+      const quote = trimmed.match(/^>\s?(.*)$/);
+      if (quote) {
+        flushParagraph();
+        flushList();
+        quoteLines.push(quote[1]);
+        continue;
+      }
+      const unordered = trimmed.match(/^[-*]\s+(.*)$/);
+      if (unordered) {
+        flushParagraph();
+        flushQuote();
+        if (listType && listType !== "ul") flushList();
+        listType = "ul";
+        listItems.push(unordered[1]);
+        continue;
+      }
+      const ordered = trimmed.match(/^\d+\.\s+(.*)$/);
+      if (ordered) {
+        flushParagraph();
+        flushQuote();
+        if (listType && listType !== "ol") flushList();
+        listType = "ol";
+        listItems.push(ordered[1]);
+        continue;
+      }
+      flushList();
+      flushQuote();
+      paragraph.push(trimmed);
     }
-    if (inList) html.push("</ul>");
-    return html.join("");
+
+    flushParagraph();
+    flushList();
+    flushQuote();
+    flushCode();
+    return out.join("");
+  }
+
+  function reportAnnotationKey(reportId) {
+    return `paperflow.report.annotations.${reportId || ""}`;
+  }
+
+  function loadReportAnnotation(reportId) {
+    if (!reportId) return "";
+    try {
+      return window.localStorage.getItem(reportAnnotationKey(reportId)) || "";
+    } catch (error) {
+      return "";
+    }
+  }
+
+  function saveReportAnnotation() {
+    const reportId = state.currentReport?.report_id;
+    const body = $("reportViewerBody");
+    if (!reportId || !body || body.classList.contains("empty")) return;
+    try {
+      window.localStorage.setItem(reportAnnotationKey(reportId), body.innerHTML);
+      $("clearReportAnnotationsBtn").disabled = false;
+    } catch (error) {
+      console.warn("Unable to save report annotation", error);
+    }
+  }
+
+  function applyReportAnnotation(command, value) {
+    const body = $("reportViewerBody");
+    const selection = window.getSelection();
+    if (!body || !selection || selection.rangeCount === 0 || selection.isCollapsed) return;
+    const range = selection.getRangeAt(0);
+    if (!body.contains(range.commonAncestorContainer)) return;
+    document.execCommand(command, false, value);
+    saveReportAnnotation();
+    selection.removeAllRanges();
+  }
+
+  function clearReportAnnotations() {
+    if (!state.currentReport?.report_id) return;
+    try {
+      window.localStorage.removeItem(reportAnnotationKey(state.currentReport.report_id));
+    } catch (error) {
+      console.warn("Unable to clear report annotation", error);
+    }
+    $("reportViewerBody").innerHTML = renderMarkdown(state.currentReport.markdown || "");
+    $("clearReportAnnotationsBtn").disabled = true;
   }
 
   function renderReportList(reports, activeId = "") {
@@ -2655,7 +2782,9 @@
     $("reportViewerTitle").textContent = report.title || ui().reports.defaultTitle;
     $("reportViewerMeta").textContent = [report.user_id, report.saved_at, report.report_path].filter(Boolean).join(" · ");
     $("reportViewerBody").className = "markdown-body";
-    $("reportViewerBody").innerHTML = renderMarkdown(report.markdown || "");
+    const annotatedHtml = loadReportAnnotation(report.report_id);
+    $("reportViewerBody").innerHTML = annotatedHtml || renderMarkdown(report.markdown || "");
+    $("clearReportAnnotationsBtn").disabled = !annotatedHtml;
     setReportLinks(report);
   }
 
@@ -5183,6 +5312,13 @@
       await navigator.clipboard.writeText(path);
       showFeedbackToast("success", ui().reports.copiedPath, path);
     }, "复制路径"));
+    document.querySelectorAll("[data-annotation-command]").forEach((button) => {
+      button.addEventListener("mousedown", (event) => event.preventDefault());
+      button.addEventListener("click", () => {
+        applyReportAnnotation(button.dataset.annotationCommand, button.dataset.annotationValue);
+      });
+    });
+    $("clearReportAnnotationsBtn")?.addEventListener("click", clearReportAnnotations);
     $("readArxivBtn").addEventListener("click", () => runAction(() => directRead("arxiv"), "生成报告"));
     $("readPdfBtn").addEventListener("click", () => runAction(() => directRead("pdf"), "生成报告"));
 
