@@ -1644,6 +1644,8 @@ def test_desktop_reports_view_uses_compact_reading_typography() -> None:
     assert ".markdown-body h1 {\n  font-size: 19px;" in css
     assert ".markdown-body blockquote {" in css
     assert ".annotation-toolbar {" in css
+    assert "position: fixed;" in css
+    assert ".annotation-toolbar.visible {" in css
     assert ".annotation-swatch.bg-red {" in css
 
 
@@ -1660,7 +1662,37 @@ def test_desktop_report_viewer_renders_markdown_and_annotations() -> None:
     assert "<strong>$1</strong>" in script
     assert "paperflow.report.annotations." in script
     assert "applyReportAnnotation" in script
+    assert "function updateReportAnnotationToolbar" in script
+    assert 'document.addEventListener("selectionchange", updateReportAnnotationToolbar)' in script
+    assert 'toolbar.classList.add("visible")' in script
     assert "document.execCommand(command, false, value)" in script
+
+
+def test_report_record_derives_abs_url_and_patches_missing_institution(tmp_path: Path) -> None:
+    report_path = tmp_path / "report.md"
+    report_path.write_text(
+        "\n".join(
+            [
+                "---",
+                'arxiv_id: "2606.17029v1"',
+                'title: "DEEPRUBRIC"',
+                'institution: "Shandong University; Zhongguancun Academy; Fudan University"',
+                "---",
+                "# DEEPRUBRIC",
+                "",
+                "## 基本信息",
+                "",
+                "- 机构：未提供",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    report = agents._report_record(report_path)  # noqa: SLF001 - report reader fallback contract
+
+    assert report["abs_url"] == "https://arxiv.org/abs/2606.17029v1"
+    assert report["institution"] == "Shandong University; Zhongguancun Academy; Fudan University"
+    assert "- 机构：Shandong University; Zhongguancun Academy; Fudan University" in report["markdown"]
 
 
 def test_desktop_direct_read_generation_shows_status_feedback() -> None:
@@ -2996,6 +3028,8 @@ def test_reading_report_writes_obsidian_deep_reading_and_daily_note(
         "arxiv_id": "2605.16277",
         "publish_date": "2026-05-20",
         "pdf_url": "https://arxiv.org/pdf/2605.16277",
+        "abs_url": "https://arxiv.org/abs/2605.16277",
+        "institution": "PaperFlow University",
         "subjects": ["cs.AI"],
         "abstract": "This paper studies generative AI in classrooms with teachers and students.",
     }
@@ -3038,6 +3072,8 @@ def test_reading_report_writes_obsidian_deep_reading_and_daily_note(
     report_text = report_path.read_text(encoding="utf-8")
     assert "[[Daily Note - May 2026]]" not in report_text
     assert "- PDF：" not in report_text
+    assert 'abs_url: "https://arxiv.org/abs/2605.16277"' in report_text
+    assert 'institution: "PaperFlow University"' in report_text
     assert pdf_dir == (daily_root / "Daily Note 2026" / "arXiv - May 2026").resolve()
     daily_text = daily_note.read_text(encoding="utf-8")
     assert "# AI for Education" in daily_text

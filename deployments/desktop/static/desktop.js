@@ -2700,6 +2700,38 @@
     }
   }
 
+  function hideReportAnnotationToolbar() {
+    const toolbar = document.querySelector(".annotation-toolbar");
+    if (!toolbar) return;
+    toolbar.classList.remove("visible");
+  }
+
+  function updateReportAnnotationToolbar() {
+    const toolbar = document.querySelector(".annotation-toolbar");
+    const body = $("reportViewerBody");
+    const selection = window.getSelection();
+    if (!toolbar || !body || body.classList.contains("empty") || !selection || selection.rangeCount === 0 || selection.isCollapsed) {
+      hideReportAnnotationToolbar();
+      return;
+    }
+    const range = selection.getRangeAt(0);
+    if (!body.contains(range.commonAncestorContainer)) {
+      hideReportAnnotationToolbar();
+      return;
+    }
+    const rect = range.getBoundingClientRect();
+    if (!rect.width && !rect.height) {
+      hideReportAnnotationToolbar();
+      return;
+    }
+    toolbar.classList.add("visible");
+    const toolbarRect = toolbar.getBoundingClientRect();
+    const left = Math.max(8, Math.min(window.innerWidth - toolbarRect.width - 8, rect.left + rect.width / 2 - toolbarRect.width / 2));
+    const top = Math.max(8, rect.top - toolbarRect.height - 8);
+    toolbar.style.left = `${left}px`;
+    toolbar.style.top = `${top}px`;
+  }
+
   function applyReportAnnotation(command, value) {
     const body = $("reportViewerBody");
     const selection = window.getSelection();
@@ -2709,6 +2741,7 @@
     document.execCommand(command, false, value);
     saveReportAnnotation();
     selection.removeAllRanges();
+    hideReportAnnotationToolbar();
   }
 
   function clearReportAnnotations() {
@@ -2720,6 +2753,7 @@
     }
     $("reportViewerBody").innerHTML = renderMarkdown(state.currentReport.markdown || "");
     $("clearReportAnnotationsBtn").disabled = true;
+    hideReportAnnotationToolbar();
   }
 
   function renderReportList(reports, activeId = "") {
@@ -2785,6 +2819,7 @@
     const annotatedHtml = loadReportAnnotation(report.report_id);
     $("reportViewerBody").innerHTML = annotatedHtml || renderMarkdown(report.markdown || "");
     $("clearReportAnnotationsBtn").disabled = !annotatedHtml;
+    hideReportAnnotationToolbar();
     setReportLinks(report);
   }
 
@@ -5319,6 +5354,10 @@
       });
     });
     $("clearReportAnnotationsBtn")?.addEventListener("click", clearReportAnnotations);
+    document.addEventListener("selectionchange", updateReportAnnotationToolbar);
+    $("reportViewerBody").addEventListener("mouseup", () => window.setTimeout(updateReportAnnotationToolbar, 0));
+    $("reportViewerBody").addEventListener("keyup", updateReportAnnotationToolbar);
+    window.addEventListener("scroll", hideReportAnnotationToolbar, true);
     $("readArxivBtn").addEventListener("click", () => runAction(() => directRead("arxiv"), "生成报告"));
     $("readPdfBtn").addEventListener("click", () => runAction(() => directRead("pdf"), "生成报告"));
 

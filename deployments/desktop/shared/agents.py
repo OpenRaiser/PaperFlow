@@ -525,6 +525,88 @@ def _first_matching_url(text: str, needle: str) -> str:
     return ""
 
 
+def _report_abs_url(metadata: Dict[str, Any], body: str) -> str:
+    for key in ("abs_url", "paper_url", "url", "openreview_url"):
+        value = str(metadata.get(key) or "").strip()
+        if value.startswith(("http://", "https://")):
+            return value
+    arxiv_id = _extract_arxiv_id(metadata.get("arxiv_id") or metadata.get("pdf_url") or metadata.get("pdf_path"))
+    if arxiv_id:
+        return f"https://arxiv.org/abs/{arxiv_id}"
+    doi_url = _doi_url(metadata.get("doi") or metadata.get("doi_url"))
+    if doi_url:
+        return doi_url
+    return _first_matching_url(body, "/abs/")
+
+
+def _extract_institution_from_pdf(pdf_path: Any) -> str:
+    path = Path(str(pdf_path or "")).expanduser()
+    if not path.exists() or not path.is_file():
+        return ""
+    try:
+        import fitz  # type: ignore
+    except Exception:
+        return ""
+    try:
+        with fitz.open(str(path)) as doc:
+            text = "\n".join(doc[index].get_text() for index in range(min(2, len(doc))))
+    except Exception:
+        return ""
+
+    institutions: List[str] = []
+    strong_institution_terms = (
+        "university",
+        "academy",
+        "institute",
+        "laboratory",
+        "lab",
+        "college",
+        "school",
+        "centre",
+        "center",
+    )
+    stop_terms = ("abstract", "introduction", "figure", "code is available")
+    for raw_line in text.splitlines()[:120]:
+        line = re.sub(r"^\s*\d+\s*", "", raw_line).strip()
+        line = re.sub(r"\s+", " ", line)
+        if not line:
+            continue
+        lowered = line.lower()
+        if any(term in lowered for term in stop_terms):
+            break
+        if "@" in line or len(line) > 140:
+            continue
+        if any(term in lowered for term in strong_institution_terms):
+            value = re.sub(r"^[*†‡§\d,\s]+", "", line).strip(" ;,")
+            if value and value not in institutions:
+                institutions.append(value)
+    return "; ".join(institutions[:8])
+
+
+def _report_institution(metadata: Dict[str, Any]) -> str:
+    for key in ("institution", "affiliation", "institutions", "affiliations"):
+        value = metadata.get(key)
+        if isinstance(value, list):
+            joined = "; ".join(str(item).strip() for item in value if str(item).strip())
+            if joined:
+                return joined
+        text = str(value or "").strip()
+        if text and text not in {"未提供", "Not provided", "unknown", "Unknown"}:
+            return text
+    return _extract_institution_from_pdf(metadata.get("pdf_path"))
+
+
+def _patch_report_body_institution(body: str, institution: str) -> str:
+    if not institution:
+        return body
+    return re.sub(
+        r"(^-\s*(?:机构|Affiliation)\s*[：:]\s*)(?:未提供|Not provided|unknown|Unknown)\s*$",
+        rf"\g<1>{institution}",
+        body,
+        flags=re.MULTILINE,
+    )
+
+
 def _report_snippet(body: str) -> str:
     for raw_line in body.splitlines():
         line = raw_line.strip()
@@ -554,7 +636,11 @@ def _report_record(path: Path) -> Dict[str, Any]:
     updated_at = datetime.fromtimestamp(stat.st_mtime).replace(microsecond=0).isoformat()
     doc_url = str(metadata.get("doc_url") or "")
     pdf_url = str(metadata.get("pdf_url") or _first_matching_url(body, "/pdf/"))
-    abs_url = str(metadata.get("abs_url") or _first_matching_url(body, "/abs/"))
+    abs_url = _report_abs_url(metadata, body)
+    institution = _report_institution(metadata)
+    if institution and not metadata.get("institution"):
+        metadata["institution"] = institution
+    body = _patch_report_body_institution(body, institution)
     return {
         "report_id": _report_id(path),
         "title": title,
@@ -568,6 +654,7 @@ def _report_record(path: Path) -> Dict[str, Any]:
         "doc_token": str(metadata.get("doc_token") or "").strip(),
         "pdf_url": pdf_url,
         "abs_url": abs_url,
+        "institution": institution,
         "report_version": str(metadata.get("report_version") or "").strip(),
         "generation_provider": str(metadata.get("generation_provider") or "").strip(),
         "generation_model": str(metadata.get("generation_model") or "").strip(),
