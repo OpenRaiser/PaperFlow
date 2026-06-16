@@ -1365,6 +1365,39 @@ def test_desktop_github_sync_rebases_remote_changes_before_push(tmp_path, monkey
     assert (clone_check / "Daily Note - Jun 2026.md").exists()
 
 
+def test_desktop_reading_agent_receives_derived_output_dirs(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    env_path = tmp_path / ".env"
+    notes_root = tmp_path / "Daily Note"
+    env_path.write_text(f'PAPERFLOW_NOTES_ROOT_DIR="{notes_root}"\n', encoding="utf-8")
+    monkeypatch.setattr(agents, "ENV_PATH", env_path)
+    monkeypatch.delenv("PAPERFLOW_NOTES_ROOT_DIR", raising=False)
+    monkeypatch.delenv("PAPERFLOW_READING_REPORTS_DIR", raising=False)
+    monkeypatch.delenv("PAPERFLOW_PDF_DIR", raising=False)
+
+    with agents._reading_agent_output_env_patch():  # noqa: SLF001 - output env bridge contract
+        assert agents.os.environ["PAPERFLOW_READING_REPORTS_DIR"] == str(notes_root)
+        assert agents.os.environ["PAPERFLOW_PDF_DIR"] == str(notes_root)
+
+    assert agents.os.environ.get("PAPERFLOW_READING_REPORTS_DIR") is None
+    assert agents.os.environ.get("PAPERFLOW_PDF_DIR") is None
+
+
+def test_desktop_report_dirs_include_legacy_exports_for_recent_generated_reports(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    project_root = tmp_path / "project"
+    configured = tmp_path / "Daily Note"
+    legacy_exports = project_root / "data" / "exports"
+    configured.mkdir()
+    legacy_exports.mkdir(parents=True)
+    monkeypatch.setattr(agents, "PROJECT_ROOT", project_root)
+    monkeypatch.setattr(agents, "_configured_path", lambda _env_name, _default_relative: str(configured))
+    monkeypatch.setattr(agents, "_env_text", lambda _name, default="": "")
+
+    dirs = agents._reading_report_dirs()  # noqa: SLF001 - report discovery contract
+
+    assert configured.resolve() in dirs
+    assert legacy_exports.resolve() in dirs
+
+
 def test_desktop_daily_push_uses_saved_settings_when_gui_omits_filters(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

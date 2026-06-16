@@ -465,7 +465,8 @@ def _reading_report_dirs() -> List[Path]:
     if _env_text("PAPERFLOW_READING_REPORTS_DIR", ""):
         return [configured] if configured.exists() and configured.is_dir() else [configured]
     fallback = (PROJECT_ROOT / "data" / "reading_reports").resolve()
-    ordered = [configured, fallback]
+    legacy_exports = (PROJECT_ROOT / "data" / "exports").resolve()
+    ordered = [configured, fallback, legacy_exports]
     results: List[Path] = []
     seen: Set[str] = set()
     for candidate in ordered:
@@ -855,6 +856,25 @@ def _local_only_feishu_doc_patch(enabled: bool):
             yield
         finally:
             reading_agent.create_doc = original
+
+
+@contextmanager
+def _reading_agent_output_env_patch():
+    """Expose GUI-derived output paths to reading-agent, which reads os.environ directly."""
+    patched = {
+        "PAPERFLOW_READING_REPORTS_DIR": _configured_path("PAPERFLOW_READING_REPORTS_DIR", "data/exports"),
+        "PAPERFLOW_PDF_DIR": _configured_path("PAPERFLOW_PDF_DIR", "data/exports"),
+    }
+    previous = {key: os.environ.get(key) for key in patched}
+    os.environ.update(patched)
+    try:
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 def health() -> Dict[str, Any]:
@@ -2206,7 +2226,7 @@ def create_reading_reports(
     if not selected:
         return _reports_payload([], write_feishu_requested=should_write_feishu)
 
-    with _local_only_feishu_doc_patch(not should_write_feishu):
+    with _reading_agent_output_env_patch(), _local_only_feishu_doc_patch(not should_write_feishu):
         docs = reading_agent.create_reading_report(
             user_id=user_id,
             paper_ids=selected,
@@ -2262,7 +2282,7 @@ def read_arxiv(
 
     should_write_feishu = _env_bool("PAPERFLOW_WRITE_FEISHU", default=False) if write_feishu is None else bool(write_feishu)
     language = _normalize_response_language(response_language)
-    with _local_only_feishu_doc_patch(not should_write_feishu):
+    with _reading_agent_output_env_patch(), _local_only_feishu_doc_patch(not should_write_feishu):
         docs = reading_agent.create_reading_report(
             user_id=user_id,
             paper_ids=[],
@@ -2305,7 +2325,7 @@ def read_local_pdf(
     }
     should_write_feishu = _env_bool("PAPERFLOW_WRITE_FEISHU", default=False) if write_feishu is None else bool(write_feishu)
     language = _normalize_response_language(response_language)
-    with _local_only_feishu_doc_patch(not should_write_feishu):
+    with _reading_agent_output_env_patch(), _local_only_feishu_doc_patch(not should_write_feishu):
         docs = reading_agent.create_reading_report(
             user_id=user_id,
             paper_ids=[],
