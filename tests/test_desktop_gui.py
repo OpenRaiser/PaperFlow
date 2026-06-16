@@ -1318,6 +1318,53 @@ def test_desktop_github_sync_commits_notes_with_llm_review(tmp_path, monkeypatch
     assert "*.bak-*" in (clone_check / ".gitignore").read_text(encoding="utf-8")
 
 
+def test_desktop_github_sync_rebases_remote_changes_before_push(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    bare = tmp_path / "notes.git"
+    seed = tmp_path / "seed"
+    remote_work = tmp_path / "remote-work"
+    notes = tmp_path / "Daily Note 2026"
+    agents._run_git(["init", "--bare", str(bare)], tmp_path)  # noqa: SLF001 - git sync contract
+    seed.mkdir()
+    agents._run_git(["init"], seed)  # noqa: SLF001
+    agents._run_git(["checkout", "-b", "main"], seed)  # noqa: SLF001
+    agents._run_git(["config", "user.email", "paperflow@example.com"], seed)  # noqa: SLF001
+    agents._run_git(["config", "user.name", "PaperFlow Test"], seed)  # noqa: SLF001
+    (seed / "Table of Content - 2026.md").write_text("# Reading Notes\n", encoding="utf-8")
+    agents._run_git(["add", "."], seed)  # noqa: SLF001
+    agents._run_git(["commit", "-m", "Initialize reading notes"], seed)  # noqa: SLF001
+    agents._run_git(["remote", "add", "origin", str(bare)], seed)  # noqa: SLF001
+    agents._run_git(["push", "-u", "origin", "main"], seed)  # noqa: SLF001
+
+    agents._run_git(["clone", "-b", "main", str(bare), str(notes)], tmp_path)  # noqa: SLF001
+    agents._run_git(["config", "user.email", "paperflow@example.com"], notes)  # noqa: SLF001
+    agents._run_git(["config", "user.name", "PaperFlow Test"], notes)  # noqa: SLF001
+
+    agents._run_git(["clone", "-b", "main", str(bare), str(remote_work)], tmp_path)  # noqa: SLF001
+    agents._run_git(["config", "user.email", "paperflow@example.com"], remote_work)  # noqa: SLF001
+    agents._run_git(["config", "user.name", "PaperFlow Test"], remote_work)  # noqa: SLF001
+    (remote_work / "Daily Note - May 2026.md").write_text("# Remote May Note\n", encoding="utf-8")
+    agents._run_git(["add", "."], remote_work)  # noqa: SLF001
+    agents._run_git(["commit", "-m", "Add remote May note"], remote_work)  # noqa: SLF001
+    agents._run_git(["push", "origin", "main"], remote_work)  # noqa: SLF001
+
+    (notes / "Daily Note - Jun 2026.md").write_text("# Local Jun Note\n", encoding="utf-8")
+    monkeypatch.setattr(agents, "_configured_reading_notes_git_dir", lambda: notes)
+    monkeypatch.setattr(agents, "_configured_reading_notes_git_remote", lambda: str(bare))
+    monkeypatch.setattr(agents, "_configured_reading_notes_git_branch", lambda: "main")
+    monkeypatch.setenv("PAPERFLOW_READING_NOTES_GIT_LLM_REVIEW", "false")
+
+    result = agents.sync_reading_notes_github("user_test")
+
+    assert result["committed"] is True
+    assert result["rebased"] is True
+    assert result["pushed"] is True
+    assert result["pull_warning"] == ""
+    clone_check = tmp_path / "check-rebased"
+    agents._run_git(["clone", "-b", "main", str(bare), str(clone_check)], tmp_path)  # noqa: SLF001
+    assert (clone_check / "Daily Note - May 2026.md").exists()
+    assert (clone_check / "Daily Note - Jun 2026.md").exists()
+
+
 def test_desktop_daily_push_uses_saved_settings_when_gui_omits_filters(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1987,6 +2034,75 @@ def test_reading_report_creation_passes_response_language_to_heuristics(tmp_path
     assert captured["response_language"] == "en"
     assert docs[0]["title"].startswith("[Reading]")
     assert docs[0]["report_payload"]["response_language"] == "en"
+
+
+def test_reading_report_creation_generates_missing_reports_concurrently(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    active = 0
+    max_active = 0
+    lock = threading.Lock()
+    papers = [
+        {"id": 1, "title": "Concurrent Paper One", "abstract": "A", "authors": ["Alice"]},
+        {"id": 2, "title": "Concurrent Paper Two", "abstract": "B", "authors": ["Bob"]},
+    ]
+
+    monkeypatch.setenv("PAPERFLOW_READING_REPORT_CONCURRENCY", "2")
+    monkeypatch.setattr(agents.reading_agent, "get_profile", lambda _user_id: {"core_directions": {}})
+    monkeypatch.setattr(agents.reading_agent, "ensure_profile_schema", lambda profile: profile)
+    monkeypatch.setattr(agents.reading_agent, "get_existing_reading_reports_for_papers", lambda _user_id, _paper_ids: {})
+    monkeypatch.setattr(agents.reading_agent, "_enrich_paper_for_reading_report_compat", lambda item, user_id=None: (item, None, None))
+    monkeypatch.setattr(agents.reading_agent, "build_heuristic_report_payload", lambda *_args, **_kwargs: {"analysis_source": "abstract", "recommendation_label": "推荐阅读"})
+    monkeypatch.setattr(agents.reading_agent, "generate_reading_report", lambda paper, *_args, **_kwargs: f"# {paper['title']}")
+    monkeypatch.setattr(agents.reading_agent, "_save_reading_report_markdown", lambda **kwargs: str(tmp_path / f"{kwargs['paper']['id']}.md"))
+    monkeypatch.setattr(agents.reading_agent, "ingest_reading_report_to_wiki", lambda **_kwargs: {})
+    monkeypatch.setattr(agents.reading_agent, "log_behavior", lambda **_kwargs: None)
+    monkeypatch.setattr(agents.reading_agent, "_annotate_tracking_links", lambda _docs, _user_id: None)
+
+    def fake_synthesize(*_args, **_kwargs):
+        nonlocal active, max_active
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+        time.sleep(0.1)
+        with lock:
+            active -= 1
+        return {}
+
+    monkeypatch.setattr(agents.reading_agent, "_synthesize_report_with_llm", fake_synthesize)
+
+    docs = agents.reading_agent.create_reading_report(
+        user_id="user_concurrent",
+        paper_ids=[1, 2],
+        papers=papers,
+        send_to_feishu=False,
+    )
+
+    assert len(docs) == 2
+    assert [doc["paper"]["id"] for doc in docs] == [1, 2]
+    assert max_active == 2
+
+
+def test_daily_note_classification_repairs_missing_object_commas() -> None:
+    first = "<!-- paperflow:aaaaaaaaaaaaaaaa -->"
+    second = "<!-- paperflow:bbbbbbbbbbbbbbbb -->"
+    response = f"""
+    ```json
+    {{
+      "assignments": [
+        {{"marker": "{first}", "category": "AI Research"}}
+        {{"marker": "{second}", "category": "Machine Learning"}},
+      ]
+    }}
+    ```
+    """
+
+    result = reading_agent._parse_daily_note_classification_response(  # noqa: SLF001 - parser resilience contract
+        response,
+        {first, second},
+    )
+
+    assert result == {first: "AI Research", second: "Machine Learning"}
 
 
 def test_desktop_backfills_reused_reading_report_to_wiki(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:

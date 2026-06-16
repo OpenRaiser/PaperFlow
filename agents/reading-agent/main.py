@@ -20,6 +20,7 @@ import hashlib
 import shutil
 import tempfile
 import inspect
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from html import unescape
 from datetime import datetime
 from typing import Dict, Iterable, List, Optional, Any, Tuple
@@ -166,6 +167,25 @@ def _env_flag(name: str, default: bool = False) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() not in {"0", "false", "off", "no", ""}
+
+
+def _env_int(name: str, default: int, *, minimum: int = 1, maximum: int = 16) -> int:
+    raw = os.environ.get(name, "").strip()
+    try:
+        value = int(raw) if raw else int(default)
+    except (TypeError, ValueError):
+        value = int(default)
+    return max(minimum, min(maximum, value))
+
+
+def _reading_report_concurrency_limit(task_count: int) -> int:
+    configured = _env_int(
+        "PAPERFLOW_READING_REPORT_CONCURRENCY",
+        _env_int("PAPERFLOW_MAX_CONCURRENCY", 3, minimum=1, maximum=8),
+        minimum=1,
+        maximum=8,
+    )
+    return max(1, min(int(task_count or 1), configured))
 
 
 def _resolve_configured_dir(
@@ -2429,7 +2449,7 @@ def _parse_daily_note_classification_response(text: str, markers: set[str]) -> D
     end = content.rfind("}")
     if start >= 0 and end > start:
         content = content[start : end + 1]
-    parsed = json.loads(content)
+    parsed = _loads_daily_note_classification_json(content)
     assignments = parsed.get("assignments") if isinstance(parsed, dict) else None
     if not isinstance(assignments, list):
         return {}
@@ -2443,6 +2463,21 @@ def _parse_daily_note_classification_response(text: str, markers: set[str]) -> D
         if marker in markers and category in allowed:
             result[marker] = category
     return result
+
+
+def _loads_daily_note_classification_json(content: str) -> Dict[str, Any]:
+    try:
+        parsed = json.loads(content)
+        return parsed if isinstance(parsed, dict) else {}
+    except json.JSONDecodeError:
+        pass
+
+    repaired = str(content or "")
+    repaired = re.sub(r",\s*([}\]])", r"\1", repaired)
+    repaired = re.sub(r"}\s*(?={)", "},", repaired)
+    repaired = re.sub(r"}\s*\n\s*(?={)", "},\n", repaired)
+    parsed = json.loads(repaired)
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def _llm_daily_note_category_assignments(
@@ -4720,13 +4755,12 @@ def create_reading_report(
     if reused_count:
         print(f"Reusing {reused_count} existing reading report(s); generating only missing ones.")
 
-    for display_index, (target_index, raw_paper) in enumerate(pending_entries, start=1):
-        print(
-            f"\n[{display_index}/{len(pending_entries)}] Processing: "
-            f"{str(raw_paper.get('title', 'Unknown'))[:60]}"
-        )
-
+    def build_pending_report(display_index: int, target_index: int, raw_paper: Dict[str, Any]) -> Dict[str, Any]:
         try:
+            print(
+                f"\n[{display_index}/{len(pending_entries)}] Processing: "
+                f"{str(raw_paper.get('title', 'Unknown'))[:60]}"
+            )
             enriched_paper, parsed_pdf, pdf_error = _enrich_paper_for_reading_report_compat(
                 raw_paper,
                 user_id=user_id,
@@ -4769,6 +4803,49 @@ def create_reading_report(
 
             doc_prefix = "[Reading]" if response_language == "en" else "[精读]"
             doc_title = f"{doc_prefix} {enriched_paper.get('title', 'Unknown')[:80]}"
+            return {
+                "target_index": target_index,
+                "enriched_paper": enriched_paper,
+                "parsed_pdf": parsed_pdf,
+                "report_payload": report_payload,
+                "report_content": report_content,
+                "doc_title": doc_title,
+            }
+        except Exception as exc:
+            print(f"  Error creating reading report: {exc}")
+            return {"target_index": target_index, "error": str(exc)}
+
+    pending_results: List[Dict[str, Any]] = []
+    concurrency = _reading_report_concurrency_limit(len(pending_entries))
+    if len(pending_entries) > 1 and concurrency > 1:
+        print(f"Generating {len(pending_entries)} missing reading report(s) with concurrency={concurrency}.")
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            futures = [
+                executor.submit(build_pending_report, display_index, target_index, raw_paper)
+                for display_index, (target_index, raw_paper) in enumerate(pending_entries, start=1)
+            ]
+            for future in as_completed(futures):
+                try:
+                    pending_results.append(future.result())
+                except Exception as exc:
+                    print(f"  Error creating reading report: {exc}")
+    else:
+        pending_results = [
+            build_pending_report(display_index, target_index, raw_paper)
+            for display_index, (target_index, raw_paper) in enumerate(pending_entries, start=1)
+        ]
+
+    for result in sorted(pending_results, key=lambda item: int(item.get("target_index", 0))):
+        if result.get("error"):
+            continue
+        target_index = int(result["target_index"])
+        enriched_paper = result["enriched_paper"]
+        parsed_pdf = result["parsed_pdf"]
+        report_payload = result["report_payload"]
+        report_content = result["report_content"]
+        doc_title = result["doc_title"]
+
+        try:
             doc_info: Dict[str, Any] = {"title": doc_title, "local_only": True}
             doc_url = None
             doc_token = None

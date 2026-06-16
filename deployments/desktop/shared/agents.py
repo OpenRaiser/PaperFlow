@@ -1178,6 +1178,15 @@ def _git_output(args: List[str], cwd: Path, *, timeout: int = 60) -> str:
     return (result.stdout or "").strip()
 
 
+def _git_ahead_behind(repo_dir: Path, branch: str) -> Tuple[int, int]:
+    try:
+        output = _git_output(["rev-list", "--left-right", "--count", f"HEAD...origin/{branch}"], repo_dir)
+        ahead_text, behind_text = output.split()
+        return int(ahead_text), int(behind_text)
+    except Exception:
+        return 0, 0
+
+
 def _ensure_notes_gitignore(repo_dir: Path) -> None:
     ignore_path = repo_dir / ".gitignore"
     existing = ignore_path.read_text(encoding="utf-8").splitlines() if ignore_path.exists() else []
@@ -1214,6 +1223,31 @@ def _ensure_notes_git_repo(repo_dir: Path, remote_url: str, branch: str) -> None
             _run_git(["symbolic-ref", "HEAD", f"refs/heads/{branch}"], repo_dir)
             _run_git(["update-ref", f"refs/heads/{branch}", f"refs/remotes/origin/{branch}"], repo_dir)
             _run_git(["reset", "--mixed"], repo_dir)
+
+
+def _rebase_notes_branch(repo_dir: Path, branch: str, language: str) -> str:
+    try:
+        result = _run_git(["rebase", f"origin/{branch}"], repo_dir, timeout=120)
+        return (result.stdout or result.stderr or "").strip()
+    except subprocess.CalledProcessError as exc:
+        rebase_output = (exc.stderr or exc.stdout or str(exc)).strip()
+        _run_git(["rebase", "--abort"], repo_dir, check=False, timeout=60)
+        raise RuntimeError(
+            (
+                "GitHub sync needs remote changes, but automatic rebase conflicted. "
+                f"Resolve the reading-notes repo manually, then sync again: {rebase_output}"
+            )
+            if language == "en"
+            else (
+                "GitHub 同步需要合并远端新提交，但自动 rebase 发生冲突。"
+                f"请手动处理阅读笔记仓库冲突后再同步：{rebase_output}"
+            )
+        ) from exc
+
+
+def _is_non_fast_forward_push(output: str) -> bool:
+    normalized = output.lower()
+    return "non-fast-forward" in normalized or "fetch first" in normalized
 
 
 def _notes_llm_sync_review(
@@ -1320,21 +1354,9 @@ def sync_reading_notes_github(user_id: str = "", response_language: str = "zh") 
     _ensure_notes_git_repo(repo_dir, remote_url, branch)
     _ensure_notes_gitignore(repo_dir)
 
-    initial_status = _git_output(["status", "--short"], repo_dir)
+    _run_git(["fetch", "origin", branch], repo_dir, timeout=120)
     pulled = False
     pull_warning = ""
-    if not initial_status:
-        try:
-            _run_git(["pull", "--ff-only", "origin", branch], repo_dir, timeout=120)
-            pulled = True
-        except subprocess.CalledProcessError as exc:
-            pull_warning = (exc.stderr or exc.stdout or str(exc)).strip()
-    else:
-        pull_warning = (
-            "Local note changes are uncommitted, so automatic pull was skipped to avoid overwriting current Obsidian content."
-            if language == "en"
-            else "本地有未提交笔记改动，已跳过自动 pull，避免覆盖 Obsidian 当前内容。"
-        )
 
     _run_git(["add", "."], repo_dir)
     llm_review = _notes_llm_sync_review(
@@ -1352,18 +1374,46 @@ def sync_reading_notes_github(user_id: str = "", response_language: str = "zh") 
         committed = True
         commit_hash = _git_output(["rev-parse", "--short", "HEAD"], repo_dir)
 
+    rebased = False
+    rebase_output = ""
+    _local_ahead, remote_ahead = _git_ahead_behind(repo_dir, branch)
+    if remote_ahead:
+        rebase_output = _rebase_notes_branch(repo_dir, branch, language)
+        rebased = True
+        pulled = True
+
+    local_ahead, _remote_ahead = _git_ahead_behind(repo_dir, branch)
     pushed = False
     push_output = ""
-    if committed or pulled:
+    if local_ahead:
         try:
             result = _run_git(["push", "-u", "origin", branch], repo_dir, timeout=120)
             push_output = (result.stdout or result.stderr or "").strip()
             pushed = True
         except subprocess.CalledProcessError as exc:
             push_output = (exc.stderr or exc.stdout or str(exc)).strip()
-            raise RuntimeError(
-                f"GitHub push failed: {push_output}" if language == "en" else f"GitHub push 失败：{push_output}"
-            ) from exc
+            if not _is_non_fast_forward_push(push_output):
+                raise RuntimeError(
+                    f"GitHub push failed: {push_output}" if language == "en" else f"GitHub push 失败：{push_output}"
+                ) from exc
+            _run_git(["fetch", "origin", branch], repo_dir, timeout=120)
+            retry_rebase_output = _rebase_notes_branch(repo_dir, branch, language)
+            rebase_output = "\n".join([item for item in [rebase_output, retry_rebase_output] if item]).strip()
+            rebased = True
+            pulled = True
+            retry_ahead, _retry_behind = _git_ahead_behind(repo_dir, branch)
+            if retry_ahead:
+                try:
+                    result = _run_git(["push", "-u", "origin", branch], repo_dir, timeout=120)
+                    push_output = (result.stdout or result.stderr or "").strip()
+                    pushed = True
+                except subprocess.CalledProcessError as retry_exc:
+                    push_output = (retry_exc.stderr or retry_exc.stdout or str(retry_exc)).strip()
+                    raise RuntimeError(
+                        f"GitHub push failed: {push_output}" if language == "en" else f"GitHub push 失败：{push_output}"
+                    ) from retry_exc
+            else:
+                push_output = ""
 
     final_status = _git_output(["status", "--short", "--ignored"], repo_dir)
     return {
@@ -1372,10 +1422,12 @@ def sync_reading_notes_github(user_id: str = "", response_language: str = "zh") 
         "remote": remote_url,
         "branch": branch,
         "pulled": pulled,
+        "rebased": rebased,
         "committed": committed,
         "commit": commit_hash,
         "pushed": pushed,
         "pull_warning": pull_warning,
+        "rebase_output": rebase_output,
         "push_output": push_output,
         "llm_review": llm_review,
         "status": final_status,
