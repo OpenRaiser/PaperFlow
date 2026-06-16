@@ -124,6 +124,7 @@ def _get_openai_parser_model() -> str:
 def _get_fallback_generation_model() -> str:
     return (
         _get_first_env_value(
+            "PAPERFLOW_FALLBACK_LLM_MODEL",
             "PAPERFLOW_LLM_MODEL",
             "LLM_PARSER_OPENAI_MODEL",
             "DASHSCOPE_LLM_MODEL",

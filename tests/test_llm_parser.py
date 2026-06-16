@@ -69,6 +69,13 @@ def test_openai_parser_model_accepts_legacy_parser_alias(monkeypatch):
     assert llm_parser._get_openai_parser_model() == "legacy-parser-model"
 
 
+def test_fallback_generation_model_prefers_backup_model_env(monkeypatch):
+    monkeypatch.setenv("PAPERFLOW_LLM_MODEL", "primary-model")
+    monkeypatch.setenv("PAPERFLOW_FALLBACK_LLM_MODEL", "backup-model")
+
+    assert llm_parser._get_fallback_generation_model() == "backup-model"
+
+
 def test_profile_updater_handles_mismatched_interest_vector_dimensions():
     updated = profile_updater.update_interest_vector(
         current_vector=[1.0, 0.0],

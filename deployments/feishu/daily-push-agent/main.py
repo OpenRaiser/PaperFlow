@@ -454,7 +454,7 @@ def apply_relevance_threshold_override(weights: Dict) -> Dict:
     raw_daily_limit = str(os.environ.get("PAPERFLOW_DAILY_LIMIT", "") or "").strip()
     if raw_daily_limit:
         try:
-            daily_limit = max(1, min(100, int(float(raw_daily_limit))))
+            daily_limit = max(1, min(500, int(float(raw_daily_limit))))
         except ValueError:
             daily_limit = None
         if daily_limit is not None:
@@ -1667,7 +1667,7 @@ def daily_push(
     # 2. 加载权重配置
     weights = load_scoring_weights()
     if push_limit is not None:
-        resolved_push_limit = max(1, min(100, int(push_limit)))
+        resolved_push_limit = max(1, min(500, int(push_limit)))
         weights["push_target_count"] = resolved_push_limit
         weights["push_max_count"] = resolved_push_limit
         weights["paperflow_daily_limit"] = resolved_push_limit

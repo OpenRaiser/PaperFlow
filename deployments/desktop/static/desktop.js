@@ -2141,7 +2141,7 @@
   function configuredDailyLimit() {
     const value = Number($("dailyLimitInput")?.value || state.settings?.advanced?.daily_limit || 30);
     if (!Number.isFinite(value)) return 30;
-    return Math.max(1, Math.min(100, Math.round(value)));
+    return Math.max(1, Math.min(500, Math.round(value)));
   }
 
   function collectDailyOptions() {
@@ -4658,16 +4658,6 @@
 
   function setConferenceAccessMode(mode) {
     const normalized = ["public", "credential", "manual"].includes(mode) ? mode : "public";
-    $("fallbackModelInput").addEventListener("input", () => {
-      const modelInput = document.querySelector('[data-env-key="PAPERFLOW_LLM_MODEL"]');
-      if (modelInput) modelInput.value = $("fallbackModelInput").value;
-    });
-    document.addEventListener("input", (event) => {
-      const input = event.target.closest?.("[data-env-key]");
-      if (input?.dataset.envKey === "PAPERFLOW_LLM_MODEL") {
-        $("fallbackModelInput").value = input.value;
-      }
-    });
     ["settingEnableArxiv", "settingEnableOpenReview"].forEach((id) => {
       $(id).addEventListener("change", () => syncDailySourceControls({
         ...(state.settings?.source_preferences || {}),
@@ -5083,9 +5073,9 @@
 
     const env = envMap(data);
     const concurrency = envInfo(env, "PAPERFLOW_MAX_CONCURRENCY", "5");
-    const model = envInfo(env, "PAPERFLOW_LLM_MODEL", "GPT-4o");
+    const fallbackModel = envInfo(env, "PAPERFLOW_FALLBACK_LLM_MODEL", "GPT-4o");
     if ($("maxConcurrencyInput")) $("maxConcurrencyInput").value = concurrency.value || "5";
-    if ($("fallbackModelInput")) $("fallbackModelInput").value = model.value || "GPT-4o";
+    if ($("fallbackModelInput")) $("fallbackModelInput").value = fallbackModel.value || "GPT-4o";
     const sourcePrefs = data.source_preferences || {};
     const reportPrefs = data.report_preferences || {};
     const advanced = data.advanced || {};
@@ -5141,6 +5131,9 @@
     });
     if ($("maxConcurrencyInput")) {
       values.PAPERFLOW_MAX_CONCURRENCY = $("maxConcurrencyInput").value;
+    }
+    if ($("fallbackModelInput")) {
+      values.PAPERFLOW_FALLBACK_LLM_MODEL = $("fallbackModelInput").value;
     }
     values.PAPERFLOW_DEFAULT_ARXIV_CATEGORIES = Array.from($("settingArxivCategories").querySelectorAll("span")).map((item) => item.textContent.trim()).filter(Boolean).join(",");
     values.PAPERFLOW_DEFAULT_CONFERENCES = selectedSettingConferences().join(",");

@@ -1208,6 +1208,7 @@ def test_desktop_save_settings_updates_env_file(tmp_path, monkeypatch: pytest.Mo
     result = agents.save_settings(
         {
             "PAPERFLOW_LLM_MODEL": "new-model",
+            "PAPERFLOW_FALLBACK_LLM_MODEL": "backup-model",
             "OPENAI_API_KEY": "***",
             "PAPERFLOW_WRITE_FEISHU": "true",
             "PAPERFLOW_ENABLE_ARXIV": "false",
@@ -1231,6 +1232,7 @@ def test_desktop_save_settings_updates_env_file(tmp_path, monkeypatch: pytest.Mo
 
     text = env_path.read_text(encoding="utf-8")
     assert "PAPERFLOW_LLM_MODEL=new-model" in text
+    assert "PAPERFLOW_FALLBACK_LLM_MODEL=backup-model" in text
     assert "OPENAI_API_KEY=sk-existing" in text
     assert "PAPERFLOW_WRITE_FEISHU=true" in text
     assert "PAPERFLOW_ENABLE_ARXIV=false" in text
@@ -1456,6 +1458,8 @@ def test_desktop_relevance_threshold_changes_daily_push_weights(monkeypatch: pyt
     monkeypatch.setenv("PAPERFLOW_RELEVANCE_THRESHOLD", "30")
     monkeypatch.setenv("PAPERFLOW_DAILY_LIMIT", "8")
     relaxed = agents.daily_agent.apply_relevance_threshold_override(base)
+    monkeypatch.setenv("PAPERFLOW_DAILY_LIMIT", "600")
+    capped = agents.daily_agent.apply_relevance_threshold_override(base)
 
     assert strict["threshold_edge_relevant"] > base["threshold_edge_relevant"]
     assert relaxed["threshold_edge_relevant"] < base["threshold_edge_relevant"]
@@ -1463,6 +1467,8 @@ def test_desktop_relevance_threshold_changes_daily_push_weights(monkeypatch: pyt
     assert strict["push_target_count"] == 12
     assert strict["push_max_count"] == 12
     assert relaxed["push_target_count"] == 8
+    assert capped["push_target_count"] == 500
+    assert capped["push_max_count"] == 500
 
 
 def test_daily_push_custom_rss_fetcher_builds_paper_cards(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1597,7 +1603,12 @@ def test_desktop_source_settings_explain_conference_auth() -> None:
     assert "state.settings = data || {}" in script
     assert "syncDailySourceControls(sourcePrefs)" in script
     assert "limit_per_source: configuredDailyLimit()" in script
+    assert 'id="dailyLimitInput" type="number" min="1" max="500" value="30"' in html
+    assert "Math.min(500, Math.round(value))" in script
     assert "PAPERFLOW_LLM_MODEL" in script
+    assert "PAPERFLOW_FALLBACK_LLM_MODEL" in script
+    assert 'input?.dataset.envKey === "PAPERFLOW_LLM_MODEL"' not in script
+    assert '[data-env-key="PAPERFLOW_LLM_MODEL"]' not in script
     assert ".source-auth-panel" in css
     assert ".conference-source-list" in css
     assert ".conference-source-item.active" in css
