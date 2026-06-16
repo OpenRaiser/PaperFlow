@@ -1655,6 +1655,8 @@ def test_desktop_report_viewer_renders_markdown_and_annotations() -> None:
 
     assert 'data-annotation-command="backColor"' in html
     assert 'data-annotation-command="foreColor"' in html
+    assert 'data-annotation-command="bold"' in html
+    assert 'data-annotation-command="italic"' in html
     assert 'id="clearReportAnnotationsBtn"' in html
     assert "function renderMarkdown(markdown)" in script
     assert "renderInlineMarkdown" in script
@@ -1663,9 +1665,14 @@ def test_desktop_report_viewer_renders_markdown_and_annotations() -> None:
     assert "paperflow.report.annotations." in script
     assert "applyReportAnnotation" in script
     assert "function updateReportAnnotationToolbar" in script
+    assert "function selectedReportAnnotationRange" in script
     assert 'document.addEventListener("selectionchange", updateReportAnnotationToolbar)' in script
     assert 'toolbar.classList.add("visible")' in script
-    assert "document.execCommand(command, false, value)" in script
+    assert "wrapper.dataset.paperflowAnnotation = command" in script
+    assert "wrapper.style.backgroundColor = value" in script
+    assert 'wrapper.style.fontWeight = "700"' in script
+    assert 'wrapper.style.fontStyle = "italic"' in script
+    assert "range.extractContents()" in script
 
 
 def test_report_record_derives_abs_url_and_patches_missing_institution(tmp_path: Path) -> None:

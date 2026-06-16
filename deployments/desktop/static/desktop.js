@@ -23,6 +23,7 @@
     sourceOptions: null,
     reports: [],
     currentReport: null,
+    reportAnnotationRange: null,
     wikiNodes: [],
     wikiGraph: null,
     wikiMap: null,
@@ -2719,6 +2720,7 @@
       hideReportAnnotationToolbar();
       return;
     }
+    state.reportAnnotationRange = range.cloneRange();
     const rect = range.getBoundingClientRect();
     if (!rect.width && !rect.height) {
       hideReportAnnotationToolbar();
@@ -2732,15 +2734,38 @@
     toolbar.style.top = `${top}px`;
   }
 
-  function applyReportAnnotation(command, value) {
+  function selectedReportAnnotationRange() {
     const body = $("reportViewerBody");
     const selection = window.getSelection();
-    if (!body || !selection || selection.rangeCount === 0 || selection.isCollapsed) return;
-    const range = selection.getRangeAt(0);
-    if (!body.contains(range.commonAncestorContainer)) return;
-    document.execCommand(command, false, value);
+    if (body && selection && selection.rangeCount > 0 && !selection.isCollapsed) {
+      const range = selection.getRangeAt(0);
+      if (body.contains(range.commonAncestorContainer)) {
+        return range.cloneRange();
+      }
+    }
+    const saved = state.reportAnnotationRange;
+    if (body && saved && body.contains(saved.commonAncestorContainer)) {
+      return saved.cloneRange();
+    }
+    return null;
+  }
+
+  function applyReportAnnotation(command, value) {
+    const body = $("reportViewerBody");
+    const range = selectedReportAnnotationRange();
+    if (!body || !range || range.collapsed || !body.contains(range.commonAncestorContainer)) return;
+    const wrapper = document.createElement("span");
+    wrapper.dataset.paperflowAnnotation = command;
+    if (command === "foreColor") wrapper.style.color = value;
+    else if (command === "bold") wrapper.style.fontWeight = "700";
+    else if (command === "italic") wrapper.style.fontStyle = "italic";
+    else wrapper.style.backgroundColor = value;
+    wrapper.appendChild(range.extractContents());
+    range.insertNode(wrapper);
     saveReportAnnotation();
-    selection.removeAllRanges();
+    const selection = window.getSelection();
+    selection?.removeAllRanges();
+    state.reportAnnotationRange = null;
     hideReportAnnotationToolbar();
   }
 

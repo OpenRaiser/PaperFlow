@@ -1210,10 +1210,27 @@ body.chat-view #chat {
   color: #15803d;
 }
 
+.annotation-swatch.style-bold,
+.annotation-swatch.style-italic {
+  background: #fff;
+  color: #25354f;
+}
+
 .annotation-swatch.text-red::before,
 .annotation-swatch.text-yellow::before,
 .annotation-swatch.text-green::before {
   content: "A";
+  font-weight: 700;
+}
+
+.annotation-swatch.style-bold::before {
+  content: "B";
+  font-weight: 800;
+}
+
+.annotation-swatch.style-italic::before {
+  content: "I";
+  font-style: italic;
   font-weight: 700;
 }
 
