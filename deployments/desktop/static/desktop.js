@@ -3,6 +3,7 @@
 
   const DEMO_MODE = new URLSearchParams(window.location.search).get("demo") === "1";
   const LOCALE_KEY = "paperflow.desktop.locale";
+  const REPORT_HIGHLIGHTS_KEY = "paperflow.report.cardHighlights";
   const supportedLocales = new Set(["zh", "en"]);
   const requestedLocale = new URLSearchParams(window.location.search).get("lang");
   const savedLocale = window.localStorage.getItem(LOCALE_KEY);
@@ -24,6 +25,7 @@
     reports: [],
     currentReport: null,
     reportAnnotationRange: null,
+    highlightedReports: new Set(),
     wikiNodes: [],
     wikiGraph: null,
     wikiMap: null,
@@ -2680,6 +2682,36 @@
     return `paperflow.report.annotations.${reportId || ""}`;
   }
 
+  function loadReportCardHighlights() {
+    try {
+      const parsed = JSON.parse(window.localStorage.getItem(REPORT_HIGHLIGHTS_KEY) || "[]");
+      state.highlightedReports = new Set(Array.isArray(parsed) ? parsed.filter(Boolean).map(String) : []);
+    } catch (error) {
+      state.highlightedReports = new Set();
+    }
+  }
+
+  function saveReportCardHighlights() {
+    try {
+      window.localStorage.setItem(REPORT_HIGHLIGHTS_KEY, JSON.stringify([...state.highlightedReports]));
+    } catch (error) {
+      console.warn("Unable to save report card highlights", error);
+    }
+  }
+
+  function toggleReportCardHighlight(reportId) {
+    if (!reportId) return;
+    if (state.highlightedReports.has(reportId)) {
+      state.highlightedReports.delete(reportId);
+      showFeedbackToast("success", "已取消高亮", reportId);
+    } else {
+      state.highlightedReports.add(reportId);
+      showFeedbackToast("success", "已高亮报告", "右键可取消高亮");
+    }
+    saveReportCardHighlights();
+    renderReportList(state.reports, state.currentReport?.report_id || reportId);
+  }
+
   function loadReportAnnotation(reportId) {
     if (!reportId) return "";
     try {
@@ -2790,7 +2822,7 @@
     }
     target.className = "reports-list";
     target.innerHTML = reports.map((report) => `
-      <button class="report-row ${report.report_id === activeId ? "active" : ""}" data-report-id="${escapeHtml(report.report_id)}" type="button">
+      <button class="report-row ${report.report_id === activeId ? "active" : ""} ${state.highlightedReports.has(report.report_id) ? "highlighted" : ""}" data-report-id="${escapeHtml(report.report_id)}" type="button">
         <h3>${escapeHtml(report.title || ui().reports.defaultTitle)}</h3>
         <p>${escapeHtml(report.saved_at || "")} · ${escapeHtml(report.status || ui().reports.completed)}</p>
         <p>${escapeHtml(report.snippet || report.report_path || "")}</p>
@@ -5346,6 +5378,12 @@
       const row = event.target.closest("[data-report-id]");
       if (row) runAction(() => loadReportContent(row.dataset.reportId), "打开报告");
     });
+    $("reportsList").addEventListener("contextmenu", (event) => {
+      const row = event.target.closest("[data-report-id]");
+      if (!row) return;
+      event.preventDefault();
+      toggleReportCardHighlight(row.dataset.reportId);
+    });
     ["openReportAbsBtn", "openReportPdfBtn", "openReportDocBtn"].forEach((id) => {
       $(id).addEventListener("click", () => {
         const href = $(id).dataset.href;
@@ -5618,6 +5656,7 @@
   }
 
   async function init() {
+    loadReportCardHighlights();
     bindEvents();
     applyLocale();
     renderChatSources();

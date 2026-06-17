@@ -3,6 +3,7 @@ from __future__ import annotations
 import threading
 import time
 import importlib
+import os
 from datetime import timedelta
 from pathlib import Path
 
@@ -1473,16 +1474,21 @@ def test_desktop_reading_agent_receives_derived_output_dirs(tmp_path, monkeypatc
 def test_desktop_report_dirs_include_legacy_exports_for_recent_generated_reports(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     project_root = tmp_path / "project"
     configured = tmp_path / "Daily Note"
+    notes_year = configured / "Daily Note 2026"
+    deep_reading = notes_year / "Deep Reading - Jun 2026"
     legacy_exports = project_root / "data" / "exports"
-    configured.mkdir()
+    deep_reading.mkdir(parents=True)
     legacy_exports.mkdir(parents=True)
     monkeypatch.setattr(agents, "PROJECT_ROOT", project_root)
     monkeypatch.setattr(agents, "_configured_path", lambda _env_name, _default_relative: str(configured))
+    monkeypatch.setattr(agents, "_configured_reading_notes_git_dir", lambda: notes_year)
     monkeypatch.setattr(agents, "_env_text", lambda _name, default="": "")
 
     dirs = agents._reading_report_dirs()  # noqa: SLF001 - report discovery contract
 
     assert configured.resolve() in dirs
+    assert notes_year.resolve() in dirs
+    assert deep_reading.resolve() in dirs
     assert legacy_exports.resolve() in dirs
 
 
@@ -1744,6 +1750,8 @@ def test_desktop_reports_view_uses_compact_reading_typography() -> None:
     assert "position: fixed;" in css
     assert ".annotation-toolbar.visible {" in css
     assert ".annotation-swatch.bg-red {" in css
+    assert ".report-row.highlighted {" in css
+    assert "box-shadow: inset 3px 0 0 #d99a00;" in css
 
 
 def test_desktop_report_viewer_renders_markdown_and_annotations() -> None:
@@ -1770,6 +1778,68 @@ def test_desktop_report_viewer_renders_markdown_and_annotations() -> None:
     assert 'wrapper.style.fontWeight = "700"' in script
     assert 'wrapper.style.fontStyle = "italic"' in script
     assert "range.extractContents()" in script
+    assert "paperflow.report.cardHighlights" in script
+    assert "function toggleReportCardHighlight" in script
+    assert '.addEventListener("contextmenu"' in script
+    assert "state.highlightedReports.has(report.report_id)" in script
+
+
+def test_report_list_dedupes_to_current_notes_but_sorts_by_time(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    project_root = tmp_path / "project"
+    notes_root = tmp_path / "Daily Note"
+    notes_year = notes_root / "Daily Note 2026"
+    deep_dir = notes_year / "Deep Reading - Jun 2026"
+    legacy_dir = project_root / "data" / "exports" / "Daily Note 2026" / "Deep Reading - Jun 2026"
+    other_dir = project_root / "data" / "reading_reports"
+    for path in (deep_dir, legacy_dir, other_dir):
+        path.mkdir(parents=True)
+
+    current = deep_dir / "Duplicate Current.md"
+    legacy = legacy_dir / "Duplicate Legacy.md"
+    unique = legacy_dir / "Unique Legacy.md"
+    current.write_text(
+        "---\n"
+        'title: "Duplicate Paper"\n'
+        'arxiv_id: "2606.00001v1"\n'
+        'report_version: "v-current"\n'
+        "---\n"
+        "# Duplicate Paper\n\nCurrent notes copy.",
+        encoding="utf-8",
+    )
+    legacy.write_text(
+        "---\n"
+        'title: "Duplicate Paper"\n'
+        'arxiv_id: "2606.00001v1"\n'
+        'report_version: "v-legacy"\n'
+        "---\n"
+        "# Duplicate Paper\n\nLegacy copy.",
+        encoding="utf-8",
+    )
+    unique.write_text(
+        "---\n"
+        'title: "Unique Legacy"\n'
+        'arxiv_id: "2606.00002v1"\n'
+        'report_version: "v-legacy"\n'
+        "---\n"
+        "# Unique Legacy\n",
+        encoding="utf-8",
+    )
+    os.utime(current, (100, 100))
+    os.utime(legacy, (300, 300))
+    os.utime(unique, (200, 200))
+
+    monkeypatch.setattr(agents, "PROJECT_ROOT", project_root)
+    monkeypatch.setattr(agents, "_configured_path", lambda _env_name, _default_relative: str(notes_root))
+    monkeypatch.setattr(agents, "_configured_notes_root_dir", lambda: notes_root)
+    monkeypatch.setattr(agents, "_configured_reading_notes_git_dir", lambda: notes_year)
+    monkeypatch.setattr(agents, "_env_text", lambda _name, default="": "")
+
+    reports = agents._all_report_records()  # noqa: SLF001 - report list ordering contract
+
+    assert [report["title"] for report in reports] == ["Unique Legacy", "Duplicate Paper"]
+    duplicate = next(report for report in reports if report["title"] == "Duplicate Paper")
+    assert duplicate["report_path"] == str(current)
+    assert "Current notes copy" in duplicate["markdown"]
 
 
 def test_report_record_derives_abs_url_and_patches_missing_institution(tmp_path: Path) -> None:

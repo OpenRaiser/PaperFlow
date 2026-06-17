@@ -1102,6 +1102,17 @@ body.chat-view #chat {
   background: #f1f6ff;
 }
 
+.report-row.highlighted {
+  border-color: #f4c84a;
+  background: #fff8d8;
+  box-shadow: inset 3px 0 0 #d99a00;
+}
+
+.report-row.highlighted.active {
+  border-color: #d99a00;
+  background: #fff3bd;
+}
+
 .report-row h3 {
   margin: 0 0 4px;
   font-size: 12.5px;

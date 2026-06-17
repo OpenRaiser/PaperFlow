@@ -467,7 +467,12 @@ def _reading_report_dirs() -> List[Path]:
         return [configured] if configured.exists() and configured.is_dir() else [configured]
     fallback = (PROJECT_ROOT / "data" / "reading_reports").resolve()
     legacy_exports = (PROJECT_ROOT / "data" / "exports").resolve()
-    ordered = [configured, fallback, legacy_exports]
+    ordered = [configured]
+    notes_git_dir = _configured_reading_notes_git_dir()
+    if notes_git_dir is not None:
+        ordered.append(notes_git_dir.resolve())
+        ordered.extend(path.resolve() for path in notes_git_dir.glob("Deep Reading - *") if path.is_dir())
+    ordered.extend([fallback, legacy_exports])
     results: List[Path] = []
     seen: Set[str] = set()
     for candidate in ordered:
@@ -678,8 +683,42 @@ def _is_reading_report_record(report: Dict[str, Any]) -> bool:
     return source_type in {"arxiv", "pdf", "local_pdf", "feishu_file_key", "reading_report"}
 
 
+def _normalized_report_dedupe_key(report: Dict[str, Any]) -> str:
+    arxiv_id = str(report.get("arxiv_id") or "").strip().lower()
+    if arxiv_id:
+        return f"arxiv:{arxiv_id}"
+    doi = str((report.get("metadata") or {}).get("doi") or "").strip().lower()
+    if doi:
+        return f"doi:{doi}"
+    title = re.sub(r"[^a-z0-9]+", " ", str(report.get("title") or "").lower()).strip()
+    return f"title:{title}" if title else f"path:{report.get('report_path') or report.get('report_id')}"
+
+
+def _report_source_priority(path: Path) -> int:
+    resolved = path.resolve()
+    notes_git_dir = _configured_reading_notes_git_dir()
+    if notes_git_dir is not None:
+        try:
+            resolved.relative_to(notes_git_dir.resolve())
+            return 30
+        except ValueError:
+            pass
+    notes_root = _configured_notes_root_dir()
+    if notes_root is not None:
+        try:
+            resolved.relative_to(notes_root.resolve())
+            return 20
+        except ValueError:
+            pass
+    try:
+        resolved.relative_to((PROJECT_ROOT / "data" / "exports").resolve())
+        return 0
+    except ValueError:
+        return 10
+
+
 def _all_report_records() -> List[Dict[str, Any]]:
-    reports: List[Dict[str, Any]] = []
+    reports_by_key: Dict[str, Dict[str, Any]] = {}
     seen: Set[str] = set()
     for root in _reading_report_dirs():
         for path in root.rglob("*.md"):
@@ -692,8 +731,19 @@ def _all_report_records() -> List[Dict[str, Any]]:
             report = _report_record(path)
             if not _is_reading_report_record(report):
                 continue
-            reports.append(report)
-    reports.sort(key=lambda item: item["_sort_ts"], reverse=True)
+            report["_source_priority"] = _report_source_priority(path)
+            dedupe_key = _normalized_report_dedupe_key(report)
+            existing = reports_by_key.get(dedupe_key)
+            if existing is None or (
+                int(report.get("_source_priority") or 0),
+                float(report.get("_sort_ts") or 0),
+            ) > (
+                int(existing.get("_source_priority") or 0),
+                float(existing.get("_sort_ts") or 0),
+            ):
+                reports_by_key[dedupe_key] = report
+    reports = list(reports_by_key.values())
+    reports.sort(key=lambda item: float(item.get("_sort_ts") or 0), reverse=True)
     return reports
 
 
