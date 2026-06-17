@@ -75,9 +75,24 @@ local SQLite state and backend workflows as the CLI, so the UI is not a static
 mock: paper pulls, feedback, reading reports, Wiki graph updates, and settings
 all route through the local backend.
 
-<div align="center">
-  <img src="https://github.com/user-attachments/assets/c852c134-5ddb-478e-8a13-3fa313dcd812" alt="PaperFlow offline desktop workflow demo" width="92%">
-</div>
+The embedded workflow demo shows the offline desktop loop end to end without
+storing large media files in the Git repository.
+
+<table width="100%">
+  <tr>
+    <th><p align="center">PaperFlow Desktop Workflow</p></th>
+  </tr>
+  <tr>
+    <td align="center" width="100%">
+      <a href="https://github.com/user-attachments/assets/ebfd979a-93f2-4140-9d4c-7bd64aa86b5e">
+        <img src="https://github.com/user-attachments/assets/c852c134-5ddb-478e-8a13-3fa313dcd812" alt="PaperFlow desktop workflow video preview" width="100%">
+      </a>
+      <br>
+      <a href="https://github.com/user-attachments/assets/ebfd979a-93f2-4140-9d4c-7bd64aa86b5e"><b>Watch the desktop workflow video</b></a>
+    </td>
+  </tr>
+</table>
+<sub><i>Demo: daily paper pull, feedback actions, deep reading, report review, local Wiki graph, cited Q&A, and settings.</i></sub>
 
 <br>
 
