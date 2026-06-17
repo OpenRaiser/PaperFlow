@@ -1368,6 +1368,44 @@ def test_desktop_github_sync_applies_local_changes_after_remote_first_sync(tmp_p
     assert (clone_check / "Daily Note - Jun 2026.md").exists()
 
 
+def test_desktop_github_sync_blocks_reading_note_deletions(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    bare = tmp_path / "notes.git"
+    seed = tmp_path / "seed"
+    notes = tmp_path / "Daily Note 2026"
+    agents._run_git(["init", "--bare", str(bare)], tmp_path)  # noqa: SLF001 - git sync contract
+    seed.mkdir()
+    agents._run_git(["init"], seed)  # noqa: SLF001
+    agents._run_git(["checkout", "-b", "main"], seed)  # noqa: SLF001
+    agents._run_git(["config", "user.email", "paperflow@example.com"], seed)  # noqa: SLF001
+    agents._run_git(["config", "user.name", "PaperFlow Test"], seed)  # noqa: SLF001
+    (seed / "Daily Note - Jan 2026.md").write_text("# Jan Note\n", encoding="utf-8")
+    (seed / "Daily Note - Jun 2026.md").write_text("# Jun Note\n", encoding="utf-8")
+    agents._run_git(["add", "."], seed)  # noqa: SLF001
+    agents._run_git(["commit", "-m", "Initialize reading notes"], seed)  # noqa: SLF001
+    agents._run_git(["remote", "add", "origin", str(bare)], seed)  # noqa: SLF001
+    agents._run_git(["push", "-u", "origin", "main"], seed)  # noqa: SLF001
+
+    agents._run_git(["clone", "-b", "main", str(bare), str(notes)], tmp_path)  # noqa: SLF001
+    agents._run_git(["config", "user.email", "paperflow@example.com"], notes)  # noqa: SLF001
+    agents._run_git(["config", "user.name", "PaperFlow Test"], notes)  # noqa: SLF001
+    (notes / "Daily Note - Jan 2026.md").unlink()
+    (notes / "Daily Note - Jun 2026.md").write_text("# Jun Note\n\nNew local content.\n", encoding="utf-8")
+
+    monkeypatch.setattr(agents, "_configured_reading_notes_git_dir", lambda: notes)
+    monkeypatch.setattr(agents, "_configured_reading_notes_git_remote", lambda: str(bare))
+    monkeypatch.setattr(agents, "_configured_reading_notes_git_branch", lambda: "main")
+    monkeypatch.setenv("PAPERFLOW_READING_NOTES_GIT_LLM_REVIEW", "false")
+
+    with pytest.raises(RuntimeError, match="删除阅读笔记文件"):
+        agents.sync_reading_notes_github("user_test")
+
+    assert (notes / "Daily Note - Jan 2026.md").exists()
+    clone_check = tmp_path / "check-delete-guard"
+    agents._run_git(["clone", "-b", "main", str(bare), str(clone_check)], tmp_path)  # noqa: SLF001
+    assert (clone_check / "Daily Note - Jan 2026.md").exists()
+    assert "New local content" not in (clone_check / "Daily Note - Jun 2026.md").read_text(encoding="utf-8")
+
+
 def test_desktop_github_sync_keeps_remote_on_note_conflict_without_branch(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

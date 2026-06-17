@@ -1368,6 +1368,33 @@ def _is_non_fast_forward_push(output: str) -> bool:
     return "non-fast-forward" in normalized or "fetch first" in normalized
 
 
+def _guard_reading_notes_deletions(repo_dir: Path, language: str) -> None:
+    deleted = [
+        line.strip()
+        for line in _git_output(["diff", "--cached", "--name-only", "--diff-filter=D"], repo_dir).splitlines()
+        if line.strip()
+    ]
+    if not deleted:
+        return
+    _run_git(["checkout", "HEAD", "--", *deleted], repo_dir, check=False)
+    preview = "\n".join(f"- {path}" for path in deleted[:12])
+    if len(deleted) > 12:
+        preview += f"\n- ... and {len(deleted) - 12} more"
+    raise RuntimeError(
+        (
+            "GitHub sync blocked because it would delete reading-note files. "
+            "PaperFlow GUI sync is additive by default; delete files manually with Git if that is intended.\n"
+            f"{preview}"
+        )
+        if language == "en"
+        else (
+            "GitHub 同步已阻止：本次同步会删除阅读笔记文件。"
+            "PaperFlow GUI 同步默认只允许新增/修改；如果确实要删除文件，请手动用 Git 删除后提交。\n"
+            f"{preview}"
+        )
+    )
+
+
 def _remote_first_sync_notes_worktree(repo_dir: Path, branch: str, language: str) -> Tuple[bool, bool, str]:
     local_patch = ""
     if _git_output(["status", "--short"], repo_dir):
@@ -1503,6 +1530,7 @@ def sync_reading_notes_github(user_id: str = "", response_language: str = "zh") 
     pull_warning = remote_first_message if remote_conflict_discarded else ""
 
     _run_git(["add", "."], repo_dir)
+    _guard_reading_notes_deletions(repo_dir, language)
     llm_review = _notes_llm_sync_review(
         repo_dir,
         branch,
