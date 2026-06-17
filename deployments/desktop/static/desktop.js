@@ -2141,7 +2141,7 @@
   function configuredDailyLimit() {
     const value = Number($("dailyLimitInput")?.value || state.settings?.advanced?.daily_limit || 30);
     if (!Number.isFinite(value)) return 30;
-    return Math.max(1, Math.min(500, Math.round(value)));
+    return Math.max(1, Math.min(1000, Math.round(value)));
   }
 
   function collectDailyOptions() {

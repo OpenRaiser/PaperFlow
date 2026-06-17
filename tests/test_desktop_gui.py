@@ -1506,7 +1506,7 @@ def test_desktop_relevance_threshold_changes_daily_push_weights(monkeypatch: pyt
     monkeypatch.setenv("PAPERFLOW_RELEVANCE_THRESHOLD", "30")
     monkeypatch.setenv("PAPERFLOW_DAILY_LIMIT", "8")
     relaxed = agents.daily_agent.apply_relevance_threshold_override(base)
-    monkeypatch.setenv("PAPERFLOW_DAILY_LIMIT", "600")
+    monkeypatch.setenv("PAPERFLOW_DAILY_LIMIT", "1200")
     capped = agents.daily_agent.apply_relevance_threshold_override(base)
 
     assert strict["threshold_edge_relevant"] > base["threshold_edge_relevant"]
@@ -1515,8 +1515,8 @@ def test_desktop_relevance_threshold_changes_daily_push_weights(monkeypatch: pyt
     assert strict["push_target_count"] == 12
     assert strict["push_max_count"] == 12
     assert relaxed["push_target_count"] == 8
-    assert capped["push_target_count"] == 500
-    assert capped["push_max_count"] == 500
+    assert capped["push_target_count"] == 1000
+    assert capped["push_max_count"] == 1000
 
 
 def test_daily_push_custom_rss_fetcher_builds_paper_cards(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1651,8 +1651,8 @@ def test_desktop_source_settings_explain_conference_auth() -> None:
     assert "state.settings = data || {}" in script
     assert "syncDailySourceControls(sourcePrefs)" in script
     assert "limit_per_source: configuredDailyLimit()" in script
-    assert 'id="dailyLimitInput" type="number" min="1" max="500" value="30"' in html
-    assert "Math.min(500, Math.round(value))" in script
+    assert 'id="dailyLimitInput" type="number" min="1" max="1000" value="30"' in html
+    assert "Math.min(1000, Math.round(value))" in script
     assert "PAPERFLOW_LLM_MODEL" in script
     assert "PAPERFLOW_FALLBACK_LLM_MODEL" in script
     assert 'input?.dataset.envKey === "PAPERFLOW_LLM_MODEL"' not in script
