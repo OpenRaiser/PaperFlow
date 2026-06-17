@@ -1272,11 +1272,19 @@ def export_data(user_id: str, export_format: str = "markdown") -> Dict[str, Any]
     raise ValueError("export_format must be markdown or zip")
 
 
-def _run_git(args: List[str], cwd: Path, *, check: bool = True, timeout: int = 60) -> subprocess.CompletedProcess[str]:
+def _run_git(
+    args: List[str],
+    cwd: Path,
+    *,
+    check: bool = True,
+    timeout: int = 60,
+    input: Optional[str] = None,
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["git", *args],
         cwd=str(cwd),
         text=True,
+        input=input,
         capture_output=True,
         check=check,
         timeout=timeout,
@@ -1358,6 +1366,33 @@ def _rebase_notes_branch(repo_dir: Path, branch: str, language: str) -> str:
 def _is_non_fast_forward_push(output: str) -> bool:
     normalized = output.lower()
     return "non-fast-forward" in normalized or "fetch first" in normalized
+
+
+def _remote_first_sync_notes_worktree(repo_dir: Path, branch: str, language: str) -> Tuple[bool, bool, str]:
+    local_patch = ""
+    if _git_output(["status", "--short"], repo_dir):
+        _run_git(["add", "-N", "."], repo_dir, check=False)
+        local_patch = _run_git(["diff", "--binary", "HEAD"], repo_dir).stdout or ""
+    _run_git(["reset", "--hard", "HEAD"], repo_dir)
+    _run_git(["clean", "-fd"], repo_dir)
+    _run_git(["fetch", "origin", branch], repo_dir, timeout=120)
+    _run_git(["reset", "--hard", f"origin/{branch}"], repo_dir, timeout=120)
+    if not local_patch:
+        return True, False, ""
+
+    applied = _run_git(["apply", "--3way", "--whitespace=nowarn", "-"], repo_dir, check=False, timeout=120, input=local_patch)
+    if applied.returncode == 0:
+        return True, False, (applied.stdout or applied.stderr or "").strip()
+
+    _run_git(["reset", "--hard", f"origin/{branch}"], repo_dir, timeout=120)
+    _run_git(["clean", "-fd"], repo_dir)
+    warning = (
+        "Remote version was kept because local note changes conflicted with remote updates."
+        if language == "en"
+        else "本地笔记改动与远端更新冲突，已按远端版本保留并丢弃本地冲突改动。"
+    )
+    detail = (applied.stderr or applied.stdout or "").strip()
+    return True, True, f"{warning} {detail}".strip()
 
 
 def _notes_llm_sync_review(
@@ -1464,9 +1499,8 @@ def sync_reading_notes_github(user_id: str = "", response_language: str = "zh") 
     _ensure_notes_git_repo(repo_dir, remote_url, branch)
     _ensure_notes_gitignore(repo_dir)
 
-    _run_git(["fetch", "origin", branch], repo_dir, timeout=120)
-    pulled = False
-    pull_warning = ""
+    pulled, remote_conflict_discarded, remote_first_message = _remote_first_sync_notes_worktree(repo_dir, branch, language)
+    pull_warning = remote_first_message if remote_conflict_discarded else ""
 
     _run_git(["add", "."], repo_dir)
     llm_review = _notes_llm_sync_review(
@@ -1486,11 +1520,6 @@ def sync_reading_notes_github(user_id: str = "", response_language: str = "zh") 
 
     rebased = False
     rebase_output = ""
-    _local_ahead, remote_ahead = _git_ahead_behind(repo_dir, branch)
-    if remote_ahead:
-        rebase_output = _rebase_notes_branch(repo_dir, branch, language)
-        rebased = True
-        pulled = True
 
     local_ahead, _remote_ahead = _git_ahead_behind(repo_dir, branch)
     pushed = False
@@ -1506,11 +1535,29 @@ def sync_reading_notes_github(user_id: str = "", response_language: str = "zh") 
                 raise RuntimeError(
                     f"GitHub push failed: {push_output}" if language == "en" else f"GitHub push 失败：{push_output}"
                 ) from exc
+            local_commit_patch = _run_git(["diff", "--binary", f"origin/{branch}..HEAD"], repo_dir).stdout or ""
             _run_git(["fetch", "origin", branch], repo_dir, timeout=120)
-            retry_rebase_output = _rebase_notes_branch(repo_dir, branch, language)
-            rebase_output = "\n".join([item for item in [rebase_output, retry_rebase_output] if item]).strip()
-            rebased = True
+            _run_git(["reset", "--hard", f"origin/{branch}"], repo_dir, timeout=120)
             pulled = True
+            if local_commit_patch:
+                applied = _run_git(["apply", "--3way", "--whitespace=nowarn", "-"], repo_dir, check=False, timeout=120, input=local_commit_patch)
+                if applied.returncode != 0:
+                    _run_git(["reset", "--hard", f"origin/{branch}"], repo_dir, timeout=120)
+                    _run_git(["clean", "-fd"], repo_dir)
+                    pull_warning = (
+                        "Remote version was kept because local note changes conflicted with remote updates."
+                        if language == "en"
+                        else "本地笔记改动与远端更新冲突，已按远端版本保留并丢弃本地冲突改动。"
+                    )
+                    push_output = ""
+                    local_commit_patch = ""
+                else:
+                    _run_git(["add", "."], repo_dir)
+                    if _git_output(["status", "--short"], repo_dir):
+                        message = f"Sync PaperFlow reading notes {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+                        _run_git(["commit", "-m", message], repo_dir, timeout=120)
+                        committed = True
+                        commit_hash = _git_output(["rev-parse", "--short", "HEAD"], repo_dir)
             retry_ahead, _retry_behind = _git_ahead_behind(repo_dir, branch)
             if retry_ahead:
                 try:
