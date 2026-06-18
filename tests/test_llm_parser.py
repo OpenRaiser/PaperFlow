@@ -76,6 +76,34 @@ def test_fallback_generation_model_prefers_backup_model_env(monkeypatch):
     assert llm_parser._get_fallback_generation_model() == "backup-model"
 
 
+def test_openai_parser_retries_backup_model_before_returning_none(monkeypatch):
+    calls = []
+
+    monkeypatch.setenv("PAPERFLOW_LLM_MODEL", "primary-model")
+    monkeypatch.setenv("PAPERFLOW_FALLBACK_LLM_MODEL", "backup-model")
+    monkeypatch.setattr(llm_parser, "_get_llm_parser_provider", lambda: "openai")
+
+    def fake_openai(*_args, **kwargs):
+        calls.append(kwargs.get("model_override") or "primary-model")
+        if kwargs.get("model_override") == "backup-model":
+            return {"one_sentence_summary": "backup summary"}
+        return None
+
+    monkeypatch.setattr(llm_parser, "_generate_json_with_openai", fake_openai)
+
+    result = llm_parser._generate_json_with_configured_llm(
+        system_prompt="Return JSON",
+        user_text="Paper",
+        max_tokens=1024,
+        timeout_override=180,
+    )
+
+    assert calls == ["primary-model", "backup-model"]
+    assert result["one_sentence_summary"] == "backup summary"
+    assert result["generation_provider"] == "openai-compatible"
+    assert result["generation_model"] == "backup-model"
+
+
 def test_profile_updater_handles_mismatched_interest_vector_dimensions():
     updated = profile_updater.update_interest_vector(
         current_vector=[1.0, 0.0],

@@ -135,6 +135,12 @@ def _get_fallback_generation_model() -> str:
     )
 
 
+def _get_openai_fallback_parser_model() -> str:
+    fallback = _get_first_env_value("PAPERFLOW_FALLBACK_LLM_MODEL")
+    primary = _get_openai_parser_model()
+    return fallback if fallback and fallback != primary else ""
+
+
 def _should_prefer_dashscope_credentials(provider_hint: Optional[str] = None) -> bool:
     hint = str(provider_hint or "").strip().lower()
     if hint in {"dashscope", "aliyun", "bailian"}:
@@ -1180,6 +1186,7 @@ def _generate_json_with_openai(
     user_text: str,
     max_tokens: int = 500,
     timeout_override: Optional[float] = None,
+    model_override: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Generate a JSON response from OpenAI."""
     client = (
@@ -1190,7 +1197,7 @@ def _generate_json_with_openai(
     if client is None:
         return None
 
-    model = _get_openai_parser_model()
+    model = (model_override or "").strip() or _get_openai_parser_model()
     messages = [
         {
             "role": "system",
@@ -1292,12 +1299,6 @@ def _generate_json_with_configured_llm(
             return annotate(hf_result, f"huggingface:{hf_provider}", _get_hf_llm_model())
 
     if provider in {"openai", "auto"}:
-        openai_result = _generate_json_with_openai(
-            system_prompt,
-            user_text,
-            max_tokens=max_tokens,
-            timeout_override=timeout_override,
-        )
         raw_provider = os.environ.get("LLM_PARSER_PROVIDER", "").strip().lower()
         openai_provider = (
             "dashscope"
@@ -1305,6 +1306,25 @@ def _generate_json_with_configured_llm(
             else "openai-compatible"
         )
         model = _get_openai_parser_model()
+        openai_result = _generate_json_with_openai(
+            system_prompt,
+            user_text,
+            max_tokens=max_tokens,
+            timeout_override=timeout_override,
+        )
+        if openai_result is None:
+            fallback_model = _get_openai_fallback_parser_model()
+            if fallback_model:
+                print(f"Primary LLM parser model failed; retrying with fallback model: {fallback_model}")
+                openai_result = _generate_json_with_openai(
+                    system_prompt,
+                    user_text,
+                    max_tokens=max_tokens,
+                    timeout_override=timeout_override,
+                    model_override=fallback_model,
+                )
+                if openai_result is not None:
+                    model = fallback_model
         return annotate(openai_result, openai_provider, model)
 
     return None
