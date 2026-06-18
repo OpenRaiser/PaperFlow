@@ -681,6 +681,7 @@ def _report_record(path: Path) -> Dict[str, Any]:
     body = _strip_duplicate_report_heading(body, title)
     return {
         "report_id": _report_id(path),
+        "_path": str(path.resolve()),
         "title": title,
         "user_id": str(metadata.get("user_id") or "").strip(),
         "paper_id": metadata.get("paper_id"),
@@ -2657,6 +2658,12 @@ def _write_reading_placeholder(
     report_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 
 
+def _reading_language_notice(response_language: str) -> str:
+    if _normalize_response_language(response_language) == "en":
+        return "The GUI language is set to English; this reading report will be written in English."
+    return "GUI 页面当前选择语言为中文；本次精读报告将按中文生成。"
+
+
 def _reading_task_payload(task: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if not task:
         return None
@@ -2696,6 +2703,7 @@ def _finish_reading_task(task_id: str) -> None:
                 status="running",
                 steps=[
                     "已创建精读报告占位文件。",
+                    _reading_language_notice(response_language),
                     "正在解析 PDF；如已配置 MinerU，会优先使用 MinerU。",
                     "正在调用 LLM 生成 Q1-Q7 精读内容。",
                 ],
@@ -2723,7 +2731,7 @@ def _finish_reading_task(task_id: str) -> None:
                 paper=paper,
                 report_path=report_path,
                 status="failed",
-                steps=["已创建精读报告占位文件。", "后台精读任务执行失败。"],
+                steps=["已创建精读报告占位文件。", _reading_language_notice(response_language), "后台精读任务执行失败。"],
                 error=error,
                 response_language=response_language,
             )
@@ -2766,7 +2774,7 @@ def start_reading_reports_task(
             paper=normalized_paper,
             report_path=report_path,
             status="queued",
-            steps=["已加入后台精读队列。", "刷新本页面可查看最新进度。"],
+            steps=["已加入后台精读队列。", _reading_language_notice(language), "刷新本页面可查看最新进度。"],
             response_language=language,
         )
         docs.append(
@@ -2948,6 +2956,29 @@ def get_report_content(report_id: str) -> Dict[str, Any]:
                 "metadata": report["metadata"],
                 "markdown": report["markdown"],
             }
+        }
+    raise ValueError(f"Report not found: {normalized_id}")
+
+
+def delete_report(report_id: str) -> Dict[str, Any]:
+    normalized_id = str(report_id or "").strip()
+    if not normalized_id:
+        raise ValueError("report_id is required")
+    allowed_roots = [path.resolve() for path in _reading_report_dirs()]
+    for report in _all_report_records():
+        if report["report_id"] != normalized_id:
+            continue
+        path = Path(str(report.get("_path") or "")).resolve()
+        if path.suffix.lower() != ".md" or not path.is_file():
+            raise ValueError(f"Report file not found: {normalized_id}")
+        if not any(path == root or path.is_relative_to(root) for root in allowed_roots):
+            raise ValueError("Report path is outside configured report directories")
+        path.unlink()
+        return {
+            "deleted": True,
+            "report_id": normalized_id,
+            "title": report.get("title") or "",
+            "report_path": _display_path(path),
         }
     raise ValueError(f"Report not found: {normalized_id}")
 

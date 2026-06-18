@@ -26,6 +26,7 @@
     currentReport: null,
     reportAnnotationRange: null,
     highlightedReports: new Set(),
+    reportContextMenu: null,
     readingPollToken: 0,
     wikiNodes: [],
     wikiGraph: null,
@@ -1823,6 +1824,9 @@
     if (route === "/api/reports/content") {
       return { ok: true, report: demoReports.find((item) => item.report_id === url.searchParams.get("report_id")) || demoReports[0] };
     }
+    if (route === "/api/reports/delete") {
+      return { ok: true, deleted: true, report_id: body.report_id || "" };
+    }
     if (route === "/api/wiki/stats") {
       return { ok: true, nodes: 112, edges: 248, citations: 436, wiki_dir: "data/wiki/user_demo" };
     }
@@ -2718,6 +2722,88 @@
     renderReportList(state.reports, state.currentReport?.report_id || reportId);
   }
 
+  function reportContextLabels(reportId) {
+    const isEn = responseLanguage() === "en";
+    return {
+      highlight: state.highlightedReports.has(reportId)
+        ? (isEn ? "Remove highlight" : "取消高亮")
+        : (isEn ? "Highlight" : "高亮"),
+      delete: isEn ? "Delete report" : "删除报告"
+    };
+  }
+
+  function ensureReportContextMenu() {
+    if (state.reportContextMenu) return state.reportContextMenu;
+    const menu = document.createElement("div");
+    menu.id = "reportContextMenu";
+    menu.className = "report-context-menu hidden";
+    menu.setAttribute("role", "menu");
+    menu.innerHTML = `
+      <button type="button" data-report-menu-action="highlight" role="menuitem"></button>
+      <button type="button" data-report-menu-action="delete" role="menuitem" class="danger"></button>
+    `;
+    menu.addEventListener("click", (event) => {
+      const button = event.target.closest("[data-report-menu-action]");
+      if (!button) return;
+      const reportId = menu.dataset.reportId || "";
+      const action = button.dataset.reportMenuAction;
+      hideReportContextMenu();
+      if (action === "highlight") {
+        toggleReportCardHighlight(reportId);
+      } else if (action === "delete") {
+        runAction(() => deleteReportCard(reportId), "删除报告");
+      }
+    });
+    document.body.appendChild(menu);
+    state.reportContextMenu = menu;
+    return menu;
+  }
+
+  function hideReportContextMenu() {
+    if (!state.reportContextMenu) return;
+    state.reportContextMenu.classList.add("hidden");
+    state.reportContextMenu.dataset.reportId = "";
+  }
+
+  function showReportContextMenu(reportId, x, y) {
+    if (!reportId) return;
+    const menu = ensureReportContextMenu();
+    const labels = reportContextLabels(reportId);
+    menu.dataset.reportId = reportId;
+    menu.querySelector('[data-report-menu-action="highlight"]').textContent = labels.highlight;
+    menu.querySelector('[data-report-menu-action="delete"]').textContent = labels.delete;
+    menu.classList.remove("hidden");
+    const rect = menu.getBoundingClientRect();
+    const left = Math.min(Math.max(8, x), window.innerWidth - rect.width - 8);
+    const top = Math.min(Math.max(8, y), window.innerHeight - rect.height - 8);
+    menu.style.left = `${left}px`;
+    menu.style.top = `${top}px`;
+  }
+
+  async function deleteReportCard(reportId) {
+    if (!reportId) return;
+    const report = state.reports.find((item) => item.report_id === reportId) || state.currentReport || {};
+    const title = report.title || ui().reports.defaultTitle;
+    const confirmText = responseLanguage() === "en"
+      ? `Delete this local reading report?\n\n${title}`
+      : `删除这个本地精读报告？\n\n${title}`;
+    if (!window.confirm(confirmText)) return;
+    await api("/api/reports/delete", {
+      method: "POST",
+      body: JSON.stringify({ report_id: reportId })
+    });
+    state.highlightedReports.delete(reportId);
+    saveReportCardHighlights();
+    try {
+      window.localStorage.removeItem(reportAnnotationKey(reportId));
+    } catch (error) {
+      console.warn("Unable to clear deleted report annotation", error);
+    }
+    if (state.currentReport?.report_id === reportId) clearReportViewer();
+    showFeedbackToast("success", responseLanguage() === "en" ? "Report deleted" : "报告已删除", title);
+    await refreshReports({ keepSelection: false });
+  }
+
   function loadReportAnnotation(reportId) {
     if (!reportId) return "";
     try {
@@ -2836,6 +2922,17 @@
     `).join("");
   }
 
+  function clearReportViewer() {
+    state.currentReport = null;
+    $("reportViewerTitle").textContent = ui().reports.defaultTitle;
+    $("reportViewerMeta").textContent = "";
+    $("reportViewerBody").className = "markdown-body";
+    $("reportViewerBody").innerHTML = "";
+    $("clearReportAnnotationsBtn").disabled = true;
+    hideReportAnnotationToolbar();
+    setReportLinks({});
+  }
+
   async function refreshReports(options = {}) {
     const scopedUser = $("reportsCurrentOnly").checked ? currentUser() : "";
     const query = $("reportQuery").value.trim();
@@ -2850,6 +2947,7 @@
     const activeId = options.activeReportId || (options.keepSelection && state.currentReport ? state.currentReport.report_id : state.reports[0]?.report_id || "");
     renderReportList(state.reports, activeId);
     if (activeId) await loadReportContent(activeId, true);
+    else clearReportViewer();
   }
 
   async function pollReadingTask(taskId, activeReportId = "") {
@@ -5407,6 +5505,7 @@
       runAction(() => refreshReports({ keepSelection: false }), "筛选报告");
     });
     $("reportsList").addEventListener("click", (event) => {
+      hideReportContextMenu();
       const row = event.target.closest("[data-report-id]");
       if (row) runAction(() => loadReportContent(row.dataset.reportId), "打开报告");
     });
@@ -5414,8 +5513,19 @@
       const row = event.target.closest("[data-report-id]");
       if (!row) return;
       event.preventDefault();
-      toggleReportCardHighlight(row.dataset.reportId);
+      const reportId = row.dataset.reportId;
+      runAction(async () => {
+        await loadReportContent(reportId, true);
+        showReportContextMenu(reportId, event.clientX, event.clientY);
+      }, "打开报告菜单");
     });
+    document.addEventListener("click", (event) => {
+      if (!event.target.closest("#reportContextMenu")) hideReportContextMenu();
+    });
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") hideReportContextMenu();
+    });
+    window.addEventListener("scroll", hideReportContextMenu, true);
     ["openReportAbsBtn", "openReportPdfBtn", "openReportDocBtn"].forEach((id) => {
       $(id).addEventListener("click", () => {
         const href = $(id).dataset.href;

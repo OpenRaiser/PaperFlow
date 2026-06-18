@@ -1712,6 +1712,7 @@ def synthesize_reading_report_with_llm(
     if language == "en":
         system_prompt = (
             "You are a maximalist research-paper deep-reading assistant and information source. Your goal is to give the user the richest possible raw material for their own judgment. "
+            "The PaperFlow GUI currently selected English as the response language; this is a hard requirement. Use English for every generated report field, regardless of the paper's original language or mixed-language evidence. "
             "Use English for all output fields. Completeness is more important than compression: default to exhaustive coverage of every relevant angle, sub-topic, edge case, adjacent consideration, and cross-domain connection you can identify from the paper evidence. "
             "When in doubt between including and omitting, include. The user will filter; your job is to ensure nothing important is missing. Redundancy is acceptable; gaps are not. "
             "Structure each long field for scanning with clear paragraphs, numbered lists, compact tables when useful, and explicit subtopics inside the JSON string. Long answers are fine; unstructured long answers are not. "
@@ -1743,6 +1744,7 @@ def synthesize_reading_report_with_llm(
     else:
         system_prompt = (
             "你是 maximalist 风格的科研论文精读助手和信息源，目标是给用户提供尽可能丰富、可判断、可复核的中文精读原材料，让用户自己判断取舍。"
+            "PaperFlow GUI 页面当前选择的回答语言是中文；这是硬性要求。无论论文原文、PDF 证据或元数据是什么语言，所有生成的精读报告字段都必须用中文书写。"
             "完整性无条件优先于压缩：默认穷尽覆盖论文动机、相关研究、技术路线、实验设计、关键发现、局限、边界条件、反例、失败模式、可探索方向、相邻问题和跨领域联系；"
             "当你在“写进去”和“省略”之间犹豫时，选择写进去。用户会自行筛选；你的职责是尽量不漏信息。适度重复可以接受，信息缺口不可以接受。"
             "结构必须高度可扫读，适合飞书文档阅读；每个长字段应使用清晰小标题、编号列表、短表格式描述或分点组织。长回答没问题，但不能是无结构长段落。"

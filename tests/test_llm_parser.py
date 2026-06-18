@@ -349,6 +349,42 @@ def test_synthesize_reading_report_with_llm_uses_local_provider(monkeypatch):
     assert "800-1800 个中文字" in captured["system_prompt"]
     assert "1200-3000 个中文字" in captured["system_prompt"]
     assert "科研论文精读助手" in captured["system_prompt"]
+    assert "PaperFlow GUI 页面当前选择的回答语言是中文" in captured["system_prompt"]
+    assert "所有生成的精读报告字段都必须用中文书写" in captured["system_prompt"]
+
+
+def test_synthesize_reading_report_with_llm_includes_gui_language_requirement_for_english(monkeypatch):
+    captured = {}
+
+    def fake_generate(system_prompt, user_text, max_tokens=500, timeout_override=None, **kwargs):
+        captured["system_prompt"] = system_prompt
+        captured["user_text"] = user_text
+        return {
+            "one_sentence_summary": "This paper proposes a robust planner.",
+            "research_background": "The paper studies robust research planning.",
+            "core_method": "It uses a two-stage planner.",
+            "key_results": "The method improves planning quality.",
+            "main_contributions": ["A two-stage planning framework"],
+            "limitations": ["More cross-domain evaluation is needed"],
+            "relevance_points": ["Relevant to research agents"],
+            "reading_focus": ["Read the method and experiments first"],
+            "recommendation_label": "推荐阅读",
+        }
+
+    monkeypatch.setattr(llm_parser, "_generate_json_with_configured_llm", fake_generate)
+
+    result = llm_parser.synthesize_reading_report_with_llm(
+        paper={"title": "Planner", "abstract": "We propose a planner.", "authors": ["Alice"]},
+        user_profile={},
+        parsed_pdf=None,
+        heuristic_payload={},
+        response_language="en",
+    )
+
+    assert result["one_sentence_summary"] == "This paper proposes a robust planner."
+    assert "PaperFlow GUI currently selected English" in captured["system_prompt"]
+    assert "Use English for every generated report field" in captured["system_prompt"]
+    assert '"response_language": "en"' in captured["user_text"]
 
 
 def test_synthesize_reading_report_with_llm_uses_hf_api_provider(monkeypatch):

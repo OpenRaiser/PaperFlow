@@ -32,6 +32,7 @@ def test_desktop_server_routes_are_registered() -> None:
     assert "/api/read/status" in server.GET_ROUTES
     assert "/api/read/arxiv" in server.POST_ROUTES
     assert "/api/read/pdf" in server.POST_ROUTES
+    assert "/api/reports/delete" in server.POST_ROUTES
     assert "/api/provider-test" in server.POST_ROUTES
     assert "/api/daily/status" in server.GET_ROUTES
     assert "/api/daily/start" in server.POST_ROUTES
@@ -1775,6 +1776,7 @@ def test_desktop_reports_view_uses_compact_reading_typography() -> None:
 def test_desktop_report_viewer_renders_markdown_and_annotations() -> None:
     html = (PROJECT_ROOT / "deployments/desktop/static/index.html").read_text(encoding="utf-8")
     script = (PROJECT_ROOT / "deployments/desktop/static/desktop.js").read_text(encoding="utf-8")
+    css = (PROJECT_ROOT / "deployments/desktop/static/desktop.css").read_text(encoding="utf-8")
 
     assert 'data-annotation-command="backColor"' in html
     assert 'data-annotation-command="foreColor"' in html
@@ -1798,6 +1800,13 @@ def test_desktop_report_viewer_renders_markdown_and_annotations() -> None:
     assert "range.extractContents()" in script
     assert "paperflow.report.cardHighlights" in script
     assert "function toggleReportCardHighlight" in script
+    assert "function showReportContextMenu" in script
+    assert "function deleteReportCard" in script
+    assert "/api/reports/delete" in script
+    assert 'data-report-menu-action="highlight"' in script
+    assert 'data-report-menu-action="delete"' in script
+    assert "window.confirm(confirmText)" in script
+    assert ".report-context-menu" in css
     assert '.addEventListener("contextmenu"' in script
     assert "state.highlightedReports.has(report.report_id)" in script
 
@@ -3345,6 +3354,7 @@ def test_desktop_reading_task_creates_placeholder_without_blocking(tmp_path, mon
     assert doc["report_id"]
     assert report_path.exists()
     assert "已加入后台精读队列" in report_path.read_text(encoding="utf-8")
+    assert "GUI 页面当前选择语言为中文；本次精读报告将按中文生成。" in report_path.read_text(encoding="utf-8")
     assert "正在精读中" in report_path.read_text(encoding="utf-8")
     assert "internal_docs" not in status
     assert "thread" not in status
@@ -3392,7 +3402,49 @@ def test_desktop_reading_task_writes_error_to_placeholder(tmp_path, monkeypatch:
     assert task["status"] == "failed"
     assert task["failed_count"] == 1
     assert "精读失败" in report_text
+    assert "GUI 页面当前选择语言为中文；本次精读报告将按中文生成。" in report_text
     assert "LLM timed out" in report_text
+
+
+def test_desktop_reading_placeholder_mentions_english_gui_language(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    report_root = tmp_path / "reports"
+    monkeypatch.setattr(agents, "_configured_path", lambda env_name, default: str(report_root))
+    monkeypatch.setattr(
+        agents.db_ops,
+        "get_push_papers",
+        lambda push_id: {
+            "push_id": push_id,
+            "papers": [
+                {
+                    "id": 103,
+                    "title": "English Placeholder Paper",
+                    "arxiv_id": "2606.00003",
+                    "publish_date": "2026-06-01",
+                }
+            ],
+        },
+    )
+
+    class FakeThread:
+        def __init__(self, target, args=(), daemon=False):
+            self.target = target
+            self.args = args
+            self.daemon = daemon
+
+        def start(self):
+            return None
+
+    monkeypatch.setattr(agents.threading, "Thread", FakeThread)
+
+    result = agents.start_reading_reports_task(
+        user_id="user_english",
+        push_id="push_english",
+        paper_numbers=[1],
+        response_language="en",
+    )
+
+    report_text = Path(result["created_docs"][0]["report_path"]).read_text(encoding="utf-8")
+    assert "The GUI language is set to English; this reading report will be written in English." in report_text
 
 
 def test_desktop_report_record_strips_duplicate_title_heading(tmp_path) -> None:
@@ -3419,6 +3471,33 @@ def test_desktop_report_record_strips_duplicate_title_heading(tmp_path) -> None:
     assert record["title"] == "Duplicate Title Paper"
     assert not record["markdown"].lstrip().startswith("# Duplicate Title Paper")
     assert record["markdown"].lstrip().startswith("## Q1")
+
+
+def test_desktop_delete_report_removes_configured_report_file(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    report_root = tmp_path / "reports"
+    report_root.mkdir()
+    report_path = report_root / "delete-me.md"
+    report_path.write_text(
+        "\n".join(
+            [
+                "---",
+                'title: "Delete Me"',
+                'report_version: "test"',
+                "---",
+                "",
+                "Report body.",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(agents, "_configured_path", lambda env_name, default: str(report_root))
+    report_id = agents.list_reports(days=365)["reports"][0]["report_id"]
+
+    result = server.POST_ROUTES["/api/reports/delete"]({}, {"report_id": report_id})
+
+    assert result["deleted"] is True
+    assert result["report_id"] == report_id
+    assert not report_path.exists()
 
 
 def test_reading_report_writes_obsidian_deep_reading_and_daily_note(

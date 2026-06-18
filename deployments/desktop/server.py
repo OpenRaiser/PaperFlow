@@ -219,6 +219,10 @@ def _api_report_content(query_params: Dict[str, Any], _body: Dict[str, Any]) -> 
     return agents.get_report_content(str(query_params.get("report_id") or "").strip())
 
 
+def _api_report_delete(_query_params: Dict[str, Any], body: Dict[str, Any]) -> Dict[str, Any]:
+    return agents.delete_report(str(body.get("report_id") or "").strip())
+
+
 def _api_read_status(query_params: Dict[str, Any], _body: Dict[str, Any]) -> Dict[str, Any]:
     return agents.get_reading_reports_task(str(query_params.get("task_id") or "").strip())
 
@@ -467,6 +471,7 @@ POST_ROUTES: Dict[str, ApiHandler] = {
     "/api/read/arxiv": _api_read_arxiv,
     "/api/read/pdf": _api_read_pdf,
     "/api/submit": _api_submit,
+    "/api/reports/delete": _api_report_delete,
     "/api/wiki/ask": _api_wiki_ask,
     "/api/wiki/ask/stream": _api_wiki_ask,
     "/api/wiki/refresh": _api_wiki_refresh,
