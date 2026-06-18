@@ -153,6 +153,10 @@ def test_desktop_settings_page_renders_storage_paths_as_inputs() -> None:
     assert "Daily Note ${currentYear}" in script
     assert "PAPERFLOW_READING_NOTES_GIT_REMOTE" in script
     assert "PAPERFLOW_READING_NOTES_GIT_BRANCH" in script
+    assert "MINERU_API_KEY" in script
+    assert "MINERU_PARSE_ENABLED" in script
+    assert "MINERU_MODEL_VERSION" in script
+    assert "MINERU_API_KEY" in agents.EDITABLE_ENV_KEYS
     assert 'id="syncGithubBtn"' in html
     assert 'id="notesGitLlmReviewSetting"' in html
 
@@ -2297,6 +2301,59 @@ def test_recommendation_calibration_uses_plain_ranking_score() -> None:
         "强烈推荐",
         "pdf",
     ) == "值得快速浏览"
+
+
+def test_reading_report_mineru_parser_downloads_markdown_zip(monkeypatch: pytest.MonkeyPatch) -> None:
+    import io
+    import zipfile
+
+    archive_buffer = io.BytesIO()
+    with zipfile.ZipFile(archive_buffer, "w") as archive:
+        archive.writestr(
+            "paper/full.md",
+            "# Title\n\n## Abstract\n\nMinerU extracted abstract.\n\n## Method\n\nMinerU extracted method.",
+        )
+
+    class FakeResponse:
+        def __init__(self, payload=None, content=b""):
+            self._payload = payload or {}
+            self.content = content
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._payload
+
+    calls = []
+
+    def fake_post(url, **kwargs):
+        calls.append(("post", url, kwargs))
+        return FakeResponse({"code": 0, "data": {"task_id": "task-1"}})
+
+    def fake_get(url, **kwargs):
+        calls.append(("get", url, kwargs))
+        if url.endswith("/task-1"):
+            return FakeResponse({"code": 0, "data": {"state": "done", "full_zip_url": "https://mineru.example/full.zip"}})
+        return FakeResponse(content=archive_buffer.getvalue())
+
+    monkeypatch.setenv("MINERU_API_KEY", "mineru-test-key")
+    monkeypatch.setenv("MINERU_API_BASE_URL", "https://mineru.example")
+    monkeypatch.setenv("MINERU_MODEL_VERSION", "vlm")
+    monkeypatch.setenv("MINERU_PARSE_POLL_INTERVAL", "0")
+    monkeypatch.setattr(reading_agent.requests, "post", fake_post)
+    monkeypatch.setattr(reading_agent.requests, "get", fake_get)
+
+    parsed = reading_agent._parse_pdf_url_with_mineru("https://arxiv.org/pdf/2606.00001v1")  # noqa: SLF001
+
+    assert parsed["source_kind"] == "mineru"
+    assert parsed["task_id"] == "task-1"
+    assert parsed["sections"]["abstract"] == "MinerU extracted abstract."
+    assert parsed["sections"]["method"] == "MinerU extracted method."
+    assert "MinerU extracted method" in parsed["full_text"]
+    assert calls[0][0] == "post"
+    assert calls[0][2]["headers"]["Authorization"] == "Bearer mineru-test-key"
+    assert calls[0][2]["json"]["model_version"] == "vlm"
 
 
 def test_reading_report_english_heuristic_fallbacks_do_not_emit_chinese(monkeypatch: pytest.MonkeyPatch) -> None:

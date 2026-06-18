@@ -20,6 +20,9 @@ import hashlib
 import shutil
 import tempfile
 import inspect
+import io
+import zipfile
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from html import unescape
 from datetime import datetime
@@ -84,6 +87,10 @@ except Exception:
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 PDF_DOWNLOAD_TIMEOUT = float(os.environ.get("READING_REPORT_PDF_TIMEOUT", "60"))
 ARXIV_DETAIL_TIMEOUT = float(os.environ.get("READING_REPORT_ARXIV_TIMEOUT", "12"))
+MINERU_API_BASE_URL = os.environ.get("MINERU_API_BASE_URL", "https://mineru.net").strip().rstrip("/")
+MINERU_PARSE_TIMEOUT = float(os.environ.get("MINERU_PARSE_TIMEOUT", "300"))
+MINERU_PARSE_POLL_INTERVAL = float(os.environ.get("MINERU_PARSE_POLL_INTERVAL", "5"))
+MINERU_MODEL_VERSION = os.environ.get("MINERU_MODEL_VERSION", "vlm").strip() or "vlm"
 MAX_ABSTRACT_CHARS = int(os.environ.get("READING_REPORT_ABSTRACT_CHARS", "1200"))
 MAX_SECTION_CHARS = int(os.environ.get("READING_REPORT_SECTION_CHARS", "1800"))
 READING_REPORT_CHUNK_CHARS = int(os.environ.get("READING_REPORT_CHUNK_CHARS", "1200"))
@@ -2679,6 +2686,128 @@ def _parse_pdf_for_report(pdf_path: str) -> Dict[str, Any]:
     }
 
 
+def _mineru_enabled() -> bool:
+    return _env_flag("MINERU_PARSE_ENABLED", default=True) and bool(os.environ.get("MINERU_API_KEY", "").strip())
+
+
+def _mineru_headers() -> Dict[str, str]:
+    token = os.environ.get("MINERU_API_KEY", "").strip()
+    return {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+
+
+def _mineru_extract_data(payload: Any) -> Dict[str, Any]:
+    if isinstance(payload, dict):
+        data = payload.get("data")
+        if isinstance(data, dict):
+            return data
+        return payload
+    return {}
+
+
+def _mineru_task_id(payload: Dict[str, Any]) -> str:
+    data = _mineru_extract_data(payload)
+    for key in ("task_id", "taskId", "id"):
+        value = data.get(key) or payload.get(key)
+        if value:
+            return str(value)
+    return ""
+
+
+def _mineru_task_state(payload: Dict[str, Any]) -> str:
+    data = _mineru_extract_data(payload)
+    return str(data.get("state") or data.get("status") or payload.get("state") or payload.get("status") or "").strip().lower()
+
+
+def _mineru_zip_url(payload: Dict[str, Any]) -> str:
+    data = _mineru_extract_data(payload)
+    for key in ("full_zip_url", "fullZipUrl", "zip_url", "zipUrl", "result_url", "resultUrl"):
+        value = data.get(key) or payload.get(key)
+        if value:
+            return str(value)
+    return ""
+
+
+def _download_mineru_markdown(zip_url: str) -> str:
+    response = requests.get(zip_url, timeout=PDF_DOWNLOAD_TIMEOUT)
+    response.raise_for_status()
+    with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+        names = archive.namelist()
+        preferred = [
+            name for name in names
+            if name.lower().endswith("full.md") or name.lower().endswith("/full.md")
+        ]
+        candidates = preferred or [name for name in names if name.lower().endswith(".md")]
+        if not candidates:
+            raise RuntimeError("MinerU result zip did not contain markdown")
+        with archive.open(candidates[0]) as handle:
+            return handle.read().decode("utf-8", errors="replace")
+
+
+def _sections_from_markdown(markdown: str) -> Dict[str, str]:
+    sections: Dict[str, List[str]] = {}
+    current = "full_text"
+    for raw_line in str(markdown or "").splitlines():
+        heading = re.match(r"^\s{0,3}#{1,4}\s+(.+?)\s*$", raw_line)
+        if heading:
+            label = re.sub(r"[^a-z0-9]+", "_", heading.group(1).strip().lower()).strip("_") or "section"
+            current = label[:80]
+            sections.setdefault(current, [])
+            continue
+        sections.setdefault(current, []).append(raw_line)
+    return {key: _clean_text("\n".join(value)) for key, value in sections.items() if _clean_text("\n".join(value))}
+
+
+def _parse_pdf_url_with_mineru(pdf_url: str) -> Dict[str, Any]:
+    if not _mineru_enabled():
+        raise RuntimeError("MinerU parser is disabled or MINERU_API_KEY is not configured")
+    base_url = os.environ.get("MINERU_API_BASE_URL", MINERU_API_BASE_URL).strip().rstrip("/") or "https://mineru.net"
+    submit_url = f"{base_url}/api/v4/extract/task"
+    payload = {
+        "url": pdf_url,
+        "model_version": os.environ.get("MINERU_MODEL_VERSION", MINERU_MODEL_VERSION).strip() or "vlm",
+        "is_ocr": True,
+        "enable_formula": True,
+        "enable_table": True,
+    }
+    response = requests.post(submit_url, headers=_mineru_headers(), json=payload, timeout=PDF_DOWNLOAD_TIMEOUT)
+    response.raise_for_status()
+    task_payload = response.json()
+    task_id = _mineru_task_id(task_payload)
+    if not task_id:
+        raise RuntimeError(f"MinerU did not return task_id: {task_payload}")
+
+    deadline = datetime.now().timestamp() + float(os.environ.get("MINERU_PARSE_TIMEOUT", MINERU_PARSE_TIMEOUT))
+    status_url = f"{base_url}/api/v4/extract/task/{task_id}"
+    last_payload: Dict[str, Any] = task_payload if isinstance(task_payload, dict) else {}
+    while datetime.now().timestamp() < deadline:
+        status_response = requests.get(status_url, headers=_mineru_headers(), timeout=PDF_DOWNLOAD_TIMEOUT)
+        status_response.raise_for_status()
+        last_payload = status_response.json()
+        state = _mineru_task_state(last_payload)
+        zip_url = _mineru_zip_url(last_payload)
+        if zip_url and state in {"done", "success", "succeeded", "completed", "finished"}:
+            markdown = _download_mineru_markdown(zip_url)
+            full_text = _clean_text(re.sub(r"!\[[^\]]*\]\([^)]+\)", " ", markdown))
+            sections = _sections_from_markdown(markdown)
+            abstract = sections.get("abstract", "")
+            return {
+                "source_kind": "mineru",
+                "parser": "mineru",
+                "task_id": task_id,
+                "markdown": markdown,
+                "full_text": full_text,
+                "sections": sections,
+                "abstract": abstract,
+            }
+        if state in {"failed", "error", "canceled", "cancelled"}:
+            raise RuntimeError(f"MinerU task failed: {last_payload}")
+        time.sleep(float(os.environ.get("MINERU_PARSE_POLL_INTERVAL", MINERU_PARSE_POLL_INTERVAL)))
+    raise TimeoutError(f"MinerU task timed out: {last_payload}")
+
+
 def enrich_paper_for_reading_report(
     paper: Dict[str, Any],
     user_id: Optional[str] = None,
@@ -2802,6 +2931,42 @@ def enrich_paper_for_reading_report(
             for download_candidate in download_candidates:
                 try:
                     download_referer = _pick_download_referer(enriched, download_candidate)
+                    mineru_parsed = False
+                    if _mineru_enabled():
+                        try:
+                            print(f"  Parsing PDF with MinerU: {download_candidate[:120]}")
+                            parsed_pdf = _parse_pdf_url_with_mineru(download_candidate)
+                            parsed_pdf["source_kind"] = "mineru"
+                            enriched["pdf_url"] = download_candidate
+                            mineru_parsed = True
+                            pdf_error = None
+                            print("  MinerU PDF parsing completed")
+                        except Exception as mineru_exc:
+                            last_exception = mineru_exc
+                            pdf_error = str(mineru_exc)
+                            print(f"  MinerU parsing failed; falling back to local PDF parser: {mineru_exc}")
+
+                    if mineru_parsed:
+                        try:
+                            print(f"  Downloading PDF for storage: {download_candidate[:120]}")
+                            temp_pdf_path = _download_pdf(
+                                download_candidate,
+                                enriched.get("title", "paper"),
+                                referer=download_referer,
+                            )
+                            stored_pdf_path = _persist_pdf_file(
+                                temp_pdf_path,
+                                enriched,
+                                download_candidate,
+                                user_id=user_id,
+                            )
+                            if stored_pdf_path:
+                                enriched["pdf_path"] = stored_pdf_path
+                        except Exception as storage_exc:
+                            print(f"  PDF storage download failed after MinerU parse: {storage_exc}")
+                        print("  PDF enrichment parsed successfully")
+                        break
+
                     print(f"  Downloading PDF for enrichment: {download_candidate[:120]}")
                     temp_pdf_path = _download_pdf(
                         download_candidate,
