@@ -47,6 +47,8 @@ _FEISHU_DOC_PATCH_LOCK = threading.Lock()
 _DAILY_TASK_LOCK = threading.Lock()
 _DAILY_TASKS: Dict[str, Dict[str, Any]] = {}
 _DAILY_TASK_BY_USER: Dict[str, str] = {}
+_READING_TASK_LOCK = threading.Lock()
+_READING_TASKS: Dict[str, Dict[str, Any]] = {}
 
 ENV_PATH = PROJECT_ROOT / ".env"
 
@@ -618,6 +620,28 @@ def _patch_report_body_institution(body: str, institution: str) -> str:
     )
 
 
+def _strip_duplicate_report_heading(body: str, title: str) -> str:
+    lines = str(body or "").splitlines()
+    if not lines:
+        return body
+    index = 0
+    while index < len(lines) and not lines[index].strip():
+        index += 1
+    if index >= len(lines):
+        return body
+    match = re.match(r"^\s*#\s+(.+?)\s*$", lines[index])
+    if not match:
+        return body
+    normalized_heading = re.sub(r"\s+", " ", match.group(1)).strip().casefold()
+    normalized_title = re.sub(r"\s+", " ", str(title or "")).strip().casefold()
+    if normalized_heading != normalized_title:
+        return body
+    next_index = index + 1
+    while next_index < len(lines) and not lines[next_index].strip():
+        next_index += 1
+    return "\n".join(lines[:index] + lines[next_index:]).lstrip()
+
+
 def _report_snippet(body: str) -> str:
     for raw_line in body.splitlines():
         line = raw_line.strip()
@@ -654,6 +678,7 @@ def _report_record(path: Path) -> Dict[str, Any]:
     if institution and not metadata.get("institution"):
         metadata["institution"] = institution
     body = _patch_report_body_institution(body, institution)
+    body = _strip_duplicate_report_heading(body, title)
     return {
         "report_id": _report_id(path),
         "title": title,
@@ -2565,6 +2590,231 @@ def read_local_pdf(
     return payload
 
 
+def _reading_placeholder_path(user_id: str, paper: Dict[str, Any]) -> Path:
+    with _reading_agent_output_env_patch():
+        target_dir = reading_agent._resolve_configured_dir(  # noqa: SLF001 - shared storage contract
+            "PAPERFLOW_READING_REPORTS_DIR",
+            "data/exports",
+            paper,
+            user_id=user_id,
+            category="reading_reports",
+        )
+    target_dir.mkdir(parents=True, exist_ok=True)
+    obsidian_report = target_dir.name.startswith("Deep Reading - ")
+    stem = (
+        reading_agent._paper_title_file_stem(paper)  # noqa: SLF001
+        if obsidian_report
+        else f"{reading_agent._paper_file_stem(paper)} - reading-report"  # noqa: SLF001
+    )
+    return target_dir / f"{stem}.md"
+
+
+def _write_reading_placeholder(
+    *,
+    user_id: str,
+    paper: Dict[str, Any],
+    report_path: Path,
+    status: str,
+    steps: Iterable[str],
+    error: str = "",
+    response_language: str = "zh",
+) -> None:
+    title = str(paper.get("title") or report_path.stem).strip() or report_path.stem
+    now = datetime.now().isoformat(timespec="seconds")
+    is_en = _normalize_response_language(response_language) == "en"
+    status_title = "Reading in progress" if is_en else "正在精读中"
+    if status == "failed":
+        status_title = "Reading failed" if is_en else "精读失败"
+    elif status == "queued":
+        status_title = "Reading in progress" if is_en else "正在精读中"
+    frontmatter = {
+        "user_id": user_id,
+        "paper_id": paper.get("id"),
+        "arxiv_id": paper.get("arxiv_id"),
+        "doi": paper.get("doi"),
+        "title": title,
+        "publish_date": paper.get("publish_date"),
+        "pdf_url": paper.get("pdf_url"),
+        "abs_url": paper.get("abs_url") or paper.get("paper_url") or paper.get("url"),
+        "generation_provider": "paperflow",
+        "generation_model": "background-reading-task",
+        "report_version": "in-progress",
+        "report_status": status,
+        "saved_at": now,
+        "updated_at": now,
+    }
+    lines = ["---"]
+    for key, value in frontmatter.items():
+        if value not in (None, "", [], {}):
+            lines.append(f"{key}: {json.dumps(value, ensure_ascii=False)}")
+    lines.extend(["---", "", f"# {title}", "", f"> {status_title}", "", "## 进度" if not is_en else "## Progress", ""])
+    for step in steps:
+        text = str(step or "").strip()
+        if text:
+            lines.append(f"- {text}")
+    if error:
+        lines.extend(["", "## 错误" if not is_en else "## Error", "", f"```text\n{error.strip()}\n```"])
+    report_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+
+
+def _reading_task_payload(task: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not task:
+        return None
+    return {key: value for key, value in task.items() if key not in {"thread", "internal_docs"}}
+
+
+def _finish_reading_task(task_id: str) -> None:
+    with _READING_TASK_LOCK:
+        task = _READING_TASKS.get(task_id)
+        if not task:
+            return
+        task["status"] = "running"
+        task["progress_phase"] = "running"
+        task["updated_at"] = _task_timestamp()
+    user_id = str(task.get("user_id") or "")
+    push_id = str(task.get("push_id") or "")
+    response_language = str(task.get("response_language") or "zh")
+    write_feishu = task.get("write_feishu")
+    selected_numbers = list(task.get("selected_numbers") or [])
+    docs = list(task.get("internal_docs") or [])
+    completed_docs: List[Dict[str, Any]] = []
+    errors: List[str] = []
+
+    for index, number in enumerate(selected_numbers):
+        doc = docs[index] if index < len(docs) else {}
+        paper = doc.get("paper_raw") or doc.get("paper") or {}
+        report_path = Path(str(doc.get("report_path") or ""))
+        try:
+            with _READING_TASK_LOCK:
+                task["current_index"] = index + 1
+                task["progress_phase"] = "reading"
+                task["updated_at"] = _task_timestamp()
+            _write_reading_placeholder(
+                user_id=user_id,
+                paper=paper,
+                report_path=report_path,
+                status="running",
+                steps=[
+                    "已创建精读报告占位文件。",
+                    "正在解析 PDF；如已配置 MinerU，会优先使用 MinerU。",
+                    "正在调用 LLM 生成 Q1-Q7 精读内容。",
+                ],
+                response_language=response_language,
+            )
+            result = create_reading_reports(
+                user_id=user_id,
+                push_id=push_id,
+                paper_numbers=[number],
+                write_feishu=write_feishu,
+                response_language=response_language,
+            )
+            result_docs = list(result.get("created_docs") or [])
+            completed_docs.extend(result_docs)
+            with _READING_TASK_LOCK:
+                task["completed_count"] = int(task.get("completed_count") or 0) + len(result_docs)
+                if result_docs and index < len(task.get("created_docs") or []):
+                    task["created_docs"][index] = result_docs[0]
+                task["updated_at"] = _task_timestamp()
+        except Exception as exc:
+            error = str(exc)
+            errors.append(f"{paper.get('title') or number}: {error}")
+            _write_reading_placeholder(
+                user_id=user_id,
+                paper=paper,
+                report_path=report_path,
+                status="failed",
+                steps=["已创建精读报告占位文件。", "后台精读任务执行失败。"],
+                error=error,
+                response_language=response_language,
+            )
+            with _READING_TASK_LOCK:
+                task["failed_count"] = int(task.get("failed_count") or 0) + 1
+                task["updated_at"] = _task_timestamp()
+
+    with _READING_TASK_LOCK:
+        task = _READING_TASKS.get(task_id)
+        if task:
+            task["status"] = "failed" if errors and not completed_docs else "completed"
+            task["progress_phase"] = task["status"]
+            task["completed_docs"] = completed_docs
+            task["errors"] = errors
+            task["completed_at"] = _task_timestamp()
+            task["updated_at"] = task["completed_at"]
+
+
+def start_reading_reports_task(
+    *,
+    user_id: str,
+    push_id: str,
+    paper_numbers: Iterable[Any],
+    write_feishu: Optional[bool] = None,
+    response_language: str = "zh",
+) -> Dict[str, Any]:
+    push = db_ops.get_push_papers(push_id)
+    if not push or not push.get("papers"):
+        raise ValueError(f"Push not found: {push_id}")
+    papers = list(push["papers"])
+    selected = _unique_ints(paper_numbers, maximum=len(papers))
+    selected_papers = reading_agent.resolve_selected_papers(selected, papers)
+    docs: List[Dict[str, Any]] = []
+    language = _normalize_response_language(response_language)
+    for paper in selected_papers:
+        normalized_paper = reading_agent._normalize_paper(paper)  # noqa: SLF001
+        report_path = _reading_placeholder_path(user_id, normalized_paper)
+        _write_reading_placeholder(
+            user_id=user_id,
+            paper=normalized_paper,
+            report_path=report_path,
+            status="queued",
+            steps=["已加入后台精读队列。", "刷新本页面可查看最新进度。"],
+            response_language=language,
+        )
+        docs.append(
+            {
+                "title": f"[精读] {normalized_paper.get('title', 'Unknown')[:80]}",
+                "url": None,
+                "doc_token": None,
+                "report_path": str(report_path),
+                "pdf_path": normalized_paper.get("pdf_path"),
+                "paper": normalized_paper,
+                "paper_raw": normalized_paper,
+                "report_payload": {"generation_provider": "paperflow", "generation_model": "background-reading-task"},
+            }
+        )
+
+    task_id = f"reading_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid4().hex[:8]}"
+    now = _task_timestamp()
+    task: Dict[str, Any] = {
+        "task_id": task_id,
+        "kind": "reading_reports",
+        "status": "queued",
+        "progress_phase": "queued",
+        "user_id": user_id,
+        "push_id": push_id,
+        "selected_numbers": selected,
+        "total_count": len(docs),
+        "completed_count": 0,
+        "failed_count": 0,
+        "created_docs": _doc_payloads(docs),
+        "internal_docs": docs,
+        "response_language": language,
+        "write_feishu": write_feishu,
+        "created_at": now,
+        "updated_at": now,
+    }
+    thread = threading.Thread(target=_finish_reading_task, args=(task_id,), daemon=True)
+    task["thread"] = thread
+    with _READING_TASK_LOCK:
+        _READING_TASKS[task_id] = task
+    thread.start()
+    return {"task": _reading_task_payload(task), "created_docs": task["created_docs"], "count": len(docs)}
+
+
+def get_reading_reports_task(task_id: str) -> Dict[str, Any]:
+    with _READING_TASK_LOCK:
+        return {"task": _reading_task_payload(_READING_TASKS.get(str(task_id or "").strip()))}
+
+
 def _doc_payloads(docs: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return [
         {
@@ -2776,13 +3026,15 @@ def submit_and_read(
     )
     reports = {"created_docs": [], "count": 0}
     if generate_reports and feedback["selected_numbers"]:
-        reports = create_reading_reports(
+        reports = start_reading_reports_task(
             user_id=user_id,
             push_id=push_id,
             paper_numbers=feedback["selected_numbers"],
             write_feishu=write_feishu,
             response_language=response_language,
         )
+        reports["write_feishu_requested"] = bool(write_feishu)
+        reports["background"] = True
     return {"feedback": feedback, "reports": reports}
 
 

@@ -219,6 +219,10 @@ def _api_report_content(query_params: Dict[str, Any], _body: Dict[str, Any]) -> 
     return agents.get_report_content(str(query_params.get("report_id") or "").strip())
 
 
+def _api_read_status(query_params: Dict[str, Any], _body: Dict[str, Any]) -> Dict[str, Any]:
+    return agents.get_reading_reports_task(str(query_params.get("task_id") or "").strip())
+
+
 def _api_must_read(query_params: Dict[str, Any], _body: Dict[str, Any]) -> Dict[str, Any]:
     return agents.list_must_read(_required_user(query_params))
 
@@ -447,6 +451,7 @@ GET_ROUTES: Dict[str, ApiHandler] = {
     "/api/activity": _api_activity,
     "/api/reports": _api_reports,
     "/api/reports/content": _api_report_content,
+    "/api/read/status": _api_read_status,
     "/api/must-read": _api_must_read,
 }
 

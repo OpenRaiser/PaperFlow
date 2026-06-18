@@ -26,6 +26,7 @@
     currentReport: null,
     reportAnnotationRange: null,
     highlightedReports: new Set(),
+    readingPollToken: 0,
     wikiNodes: [],
     wikiGraph: null,
     wikiMap: null,
@@ -2553,6 +2554,11 @@
         const docs = data.reports?.created_docs || [];
         if (docs[0]?.report_id) {
           await openReport(docs[0].report_id);
+          if (data.reports?.task?.task_id) {
+            pollReadingTask(data.reports.task.task_id, docs[0].report_id).catch((error) => {
+              showFeedbackToast("warning", "精读进度刷新失败", error.message || String(error));
+            });
+          }
         } else {
           setView("reports");
         }
@@ -2844,6 +2850,27 @@
     const activeId = options.activeReportId || (options.keepSelection && state.currentReport ? state.currentReport.report_id : state.reports[0]?.report_id || "");
     renderReportList(state.reports, activeId);
     if (activeId) await loadReportContent(activeId, true);
+  }
+
+  async function pollReadingTask(taskId, activeReportId = "") {
+    if (!taskId) return;
+    const pollToken = ++state.readingPollToken;
+    while (pollToken === state.readingPollToken) {
+      await new Promise((resolve) => window.setTimeout(resolve, 2500));
+      const data = await api(`/api/read/status?task_id=${encodeURIComponent(taskId)}`);
+      if (pollToken !== state.readingPollToken) return;
+      const task = data.task;
+      if (!task) return;
+      await refreshReports({
+        keepSelection: true,
+        activeReportId: state.currentReport?.report_id || activeReportId
+      });
+      if (task.status === "completed" || task.status === "failed") {
+        const detail = `${task.completed_count || 0}/${task.total_count || 0}`;
+        showFeedbackToast(task.status === "failed" ? "warning" : "success", task.status === "failed" ? "精读任务结束但有错误" : "精读任务完成", detail);
+        return;
+      }
+    }
   }
 
   function setReportLinks(report) {

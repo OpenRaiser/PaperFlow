@@ -29,6 +29,7 @@ def test_desktop_server_routes_are_registered() -> None:
     assert "/api/roles" in server.POST_ROUTES
     assert "/api/must-read" in server.GET_ROUTES
     assert "/api/must-read" in server.POST_ROUTES
+    assert "/api/read/status" in server.GET_ROUTES
     assert "/api/read/arxiv" in server.POST_ROUTES
     assert "/api/read/pdf" in server.POST_ROUTES
     assert "/api/provider-test" in server.POST_ROUTES
@@ -98,14 +99,17 @@ def test_desktop_server_forwards_response_language_to_agents(monkeypatch: pytest
 
     monkeypatch.setattr(agents, "wiki_ask", lambda **kwargs: captured.setdefault("wiki", kwargs) or {"text": ""})
     monkeypatch.setattr(agents, "create_reading_reports", lambda **kwargs: captured.setdefault("read", kwargs) or {"created_docs": []})
+    monkeypatch.setattr(agents, "submit_and_read", lambda **kwargs: captured.setdefault("submit", kwargs) or {"reports": {"created_docs": []}})
     monkeypatch.setattr(agents, "sync_reading_notes_github", lambda user_id, response_language="zh": captured.setdefault("github", {"user_id": user_id, "response_language": response_language}) or {"ok": True})
 
     server.POST_ROUTES["/api/wiki/ask"]({}, {"user_id": "user_test", "question": "What is RAG?", "response_language": "en"})
     server.POST_ROUTES["/api/read"]({}, {"user_id": "user_test", "push_id": "push_test", "selected_numbers": [1], "response_language": "en"})
+    server.POST_ROUTES["/api/submit"]({}, {"user_id": "user_test", "push_id": "push_test", "selected_numbers": [1], "generate_reports": True, "response_language": "en"})
     server.POST_ROUTES["/api/github/sync"]({}, {"user_id": "user_test", "response_language": "en"})
 
     assert captured["wiki"]["response_language"] == "en"
     assert captured["read"]["response_language"] == "en"
+    assert captured["submit"]["response_language"] == "en"
     assert captured["github"]["response_language"] == "en"
 
 
@@ -159,6 +163,16 @@ def test_desktop_settings_page_renders_storage_paths_as_inputs() -> None:
     assert "MINERU_API_KEY" in agents.EDITABLE_ENV_KEYS
     assert 'id="syncGithubBtn"' in html
     assert 'id="notesGitLlmReviewSetting"' in html
+
+
+def test_desktop_submit_and_read_polls_background_report_task() -> None:
+    script = (PROJECT_ROOT / "deployments" / "desktop" / "static" / "desktop.js").read_text(encoding="utf-8")
+
+    assert "readingPollToken" in script
+    assert "async function pollReadingTask" in script
+    assert "/api/read/status?task_id=" in script
+    assert "data.reports?.task?.task_id" in script
+    assert "refreshReports({" in script
 
 
 def test_desktop_wiki_graph_uses_user_nodes_and_edges(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2115,11 +2129,11 @@ def test_desktop_submit_and_read_forwards_feishu_choice(monkeypatch: pytest.Monk
         },
     )
 
-    def fake_create_reading_reports(**kwargs):
+    def fake_start_reading_reports_task(**kwargs):
         captured.update(kwargs)
         return {"created_docs": [], "count": 0}
 
-    monkeypatch.setattr(agents, "create_reading_reports", fake_create_reading_reports)
+    monkeypatch.setattr(agents, "start_reading_reports_task", fake_start_reading_reports_task)
 
     agents.submit_and_read(
         user_id="user_test",
@@ -3281,6 +3295,130 @@ def test_desktop_reports_payload_warns_on_feishu_failure() -> None:
     assert payload["write_feishu_requested"] is True
     assert "飞书文档发送失败" in payload["feishu_warning"]
     assert payload["created_docs"][0]["feishu_error"] == "missing feishu config"
+
+
+def test_desktop_reading_task_creates_placeholder_without_blocking(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    report_root = tmp_path / "reports"
+    monkeypatch.setattr(agents, "_configured_path", lambda env_name, default: str(report_root))
+    monkeypatch.setattr(
+        agents.db_ops,
+        "get_push_papers",
+        lambda push_id: {
+            "push_id": push_id,
+            "papers": [
+                {
+                    "id": 101,
+                    "title": "Placeholder Report Paper",
+                    "arxiv_id": "2606.00001",
+                    "publish_date": "2026-06-01",
+                    "pdf_url": "https://arxiv.org/pdf/2606.00001",
+                    "abs_url": "https://arxiv.org/abs/2606.00001",
+                }
+            ],
+        },
+    )
+
+    class FakeThread:
+        def __init__(self, target, args=(), daemon=False):
+            self.target = target
+            self.args = args
+            self.daemon = daemon
+            self.started = False
+
+        def start(self):
+            self.started = True
+
+    monkeypatch.setattr(agents.threading, "Thread", FakeThread)
+
+    result = agents.start_reading_reports_task(
+        user_id="user_placeholder",
+        push_id="push_placeholder",
+        paper_numbers=[1],
+        response_language="zh",
+    )
+
+    doc = result["created_docs"][0]
+    report_path = Path(doc["report_path"])
+    status = agents.get_reading_reports_task(result["task"]["task_id"])["task"]
+
+    assert result["task"]["status"] == "queued"
+    assert doc["report_id"]
+    assert report_path.exists()
+    assert "已加入后台精读队列" in report_path.read_text(encoding="utf-8")
+    assert "正在精读中" in report_path.read_text(encoding="utf-8")
+    assert "internal_docs" not in status
+    assert "thread" not in status
+    assert status["created_docs"][0]["report_id"] == doc["report_id"]
+
+
+def test_desktop_reading_task_writes_error_to_placeholder(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    report_root = tmp_path / "reports"
+    monkeypatch.setattr(agents, "_configured_path", lambda env_name, default: str(report_root))
+    monkeypatch.setattr(
+        agents.db_ops,
+        "get_push_papers",
+        lambda push_id: {
+            "push_id": push_id,
+            "papers": [
+                {
+                    "id": 102,
+                    "title": "Failing Report Paper",
+                    "arxiv_id": "2606.00002",
+                    "publish_date": "2026-06-01",
+                    "pdf_url": "https://arxiv.org/pdf/2606.00002",
+                    "abs_url": "https://arxiv.org/abs/2606.00002",
+                }
+            ],
+        },
+    )
+    monkeypatch.setattr(agents, "create_reading_reports", lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("LLM timed out")))
+
+    result = agents.start_reading_reports_task(
+        user_id="user_error",
+        push_id="push_error",
+        paper_numbers=[1],
+        response_language="zh",
+    )
+
+    task = None
+    for _ in range(50):
+        task = agents.get_reading_reports_task(result["task"]["task_id"])["task"]
+        if task and task["status"] == "failed":
+            break
+        time.sleep(0.02)
+
+    report_text = Path(result["created_docs"][0]["report_path"]).read_text(encoding="utf-8")
+    assert task is not None
+    assert task["status"] == "failed"
+    assert task["failed_count"] == 1
+    assert "精读失败" in report_text
+    assert "LLM timed out" in report_text
+
+
+def test_desktop_report_record_strips_duplicate_title_heading(tmp_path) -> None:
+    report_path = tmp_path / "duplicate-title.md"
+    report_path.write_text(
+        "\n".join(
+            [
+                "---",
+                'title: "Duplicate Title Paper"',
+                "---",
+                "",
+                "# Duplicate Title Paper",
+                "",
+                "## Q1",
+                "",
+                "正文内容。",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    record = agents._report_record(report_path)  # noqa: SLF001 - report rendering contract
+
+    assert record["title"] == "Duplicate Title Paper"
+    assert not record["markdown"].lstrip().startswith("# Duplicate Title Paper")
+    assert record["markdown"].lstrip().startswith("## Q1")
 
 
 def test_reading_report_writes_obsidian_deep_reading_and_daily_note(
