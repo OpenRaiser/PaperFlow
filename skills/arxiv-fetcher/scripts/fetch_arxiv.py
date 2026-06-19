@@ -89,54 +89,73 @@ def _clean_html_text(value: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def _parse_list_heading_date(value: str) -> str:
+    text = re.sub(r"\(.*?\)", "", _clean_html_text(value)).strip()
+    for fmt in ("%a, %d %b %Y", "%a, %d %B %Y"):
+        try:
+            return datetime.strptime(text, fmt).date().isoformat()
+        except ValueError:
+            pass
+    return ""
+
+
 def _parse_arxiv_list_page(html: str, category: str, limit: int) -> List[Dict]:
-    pairs = re.findall(r"<dt>(.*?)</dt>\s*<dd>(.*?)</dd>", html or "", flags=re.DOTALL | re.IGNORECASE)
+    chunks = re.split(r"(<h3[^>]*>.*?</h3>)", html or "", flags=re.DOTALL | re.IGNORECASE)
     papers: List[Dict] = []
-    for dt_html, dd_html in pairs:
-        id_match = re.search(r"""href\s*=\s*["']/abs/([^"']+)["']""", dt_html, flags=re.IGNORECASE)
-        if not id_match:
+    current_date = ""
+    requested_category = str(category or "").strip()
+    for chunk in chunks:
+        if re.match(r"<h3", chunk or "", flags=re.IGNORECASE):
+            current_date = _parse_list_heading_date(chunk)
             continue
-        arxiv_id = unescape(id_match.group(1)).strip()
-        title_match = re.search(
-            r"""<div\s+class=["']list-title[^"']*["']>\s*<span[^>]*>\s*Title:\s*</span>(.*?)</div>""",
-            dd_html,
-            flags=re.DOTALL | re.IGNORECASE,
-        )
-        author_block = re.search(
-            r"""<div\s+class=["']list-authors[^"']*["']>(.*?)</div>""",
-            dd_html,
-            flags=re.DOTALL | re.IGNORECASE,
-        )
-        subjects_block = re.search(
-            r"""<div\s+class=["']list-subjects[^"']*["']>(.*?)</div>""",
-            dd_html,
-            flags=re.DOTALL | re.IGNORECASE,
-        )
-        authors_html = author_block.group(1) if author_block else ""
-        authors = [
-            _clean_html_text(match)
-            for match in re.findall(r"<a[^>]*>(.*?)</a>", authors_html, flags=re.DOTALL | re.IGNORECASE)
-        ]
-        title = _clean_html_text(title_match.group(1) if title_match else "")
-        if not title:
-            continue
-        subjects_text = _clean_html_text(subjects_block.group(1) if subjects_block else "")
-        categories = re.findall(r"\(([a-z-]+(?:\.[A-Z]{2})?)\)", subjects_text)
-        if category and category not in categories:
-            categories.insert(0, category)
-        papers.append(
-            {
-                "arxiv_id": arxiv_id,
-                "title": title,
-                "authors": [author for author in authors if author],
-                "abstract": "",
-                "categories": categories or [category],
-                "publish_date": "",
-                "url": f"https://arxiv.org/abs/{arxiv_id}",
-                "paper_url": f"https://arxiv.org/abs/{arxiv_id}",
-                "pdf_url": f"https://arxiv.org/pdf/{arxiv_id}",
-            }
-        )
+        pairs = re.findall(r"<dt>(.*?)</dt>\s*<dd>(.*?)</dd>", chunk or "", flags=re.DOTALL | re.IGNORECASE)
+        for dt_html, dd_html in pairs:
+            id_match = re.search(r"""href\s*=\s*["']/abs/([^"']+)["']""", dt_html, flags=re.IGNORECASE)
+            if not id_match:
+                continue
+            arxiv_id = unescape(id_match.group(1)).strip()
+            title_match = re.search(
+                r"""<div\s+class=["']list-title[^"']*["']>\s*<span[^>]*>\s*Title:\s*</span>(.*?)</div>""",
+                dd_html,
+                flags=re.DOTALL | re.IGNORECASE,
+            )
+            author_block = re.search(
+                r"""<div\s+class=["']list-authors[^"']*["']>(.*?)</div>""",
+                dd_html,
+                flags=re.DOTALL | re.IGNORECASE,
+            )
+            subjects_block = re.search(
+                r"""<div\s+class=["']list-subjects[^"']*["']>(.*?)</div>""",
+                dd_html,
+                flags=re.DOTALL | re.IGNORECASE,
+            )
+            authors_html = author_block.group(1) if author_block else ""
+            authors = [
+                _clean_html_text(match)
+                for match in re.findall(r"<a[^>]*>(.*?)</a>", authors_html, flags=re.DOTALL | re.IGNORECASE)
+            ]
+            title = _clean_html_text(title_match.group(1) if title_match else "")
+            if not title:
+                continue
+            subjects_text = _clean_html_text(subjects_block.group(1) if subjects_block else "")
+            categories = re.findall(r"\(([a-z-]+(?:\.[A-Z]{2})?)\)", subjects_text)
+            if requested_category and "." in requested_category and categories and requested_category not in categories:
+                continue
+            papers.append(
+                {
+                    "arxiv_id": arxiv_id,
+                    "title": title,
+                    "authors": [author for author in authors if author],
+                    "abstract": "",
+                    "categories": categories or ([requested_category] if requested_category else []),
+                    "publish_date": current_date,
+                    "url": f"https://arxiv.org/abs/{arxiv_id}",
+                    "paper_url": f"https://arxiv.org/abs/{arxiv_id}",
+                    "pdf_url": f"https://arxiv.org/pdf/{arxiv_id}",
+                }
+            )
+            if len(papers) >= limit:
+                break
         if len(papers) >= limit:
             break
     return papers

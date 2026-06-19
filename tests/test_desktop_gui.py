@@ -1557,19 +1557,37 @@ def test_desktop_daily_push_uses_saved_settings_when_gui_omits_filters(
 
 
 def test_daily_arxiv_fetch_filters_out_old_papers(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        agents.daily_agent,
-        "arxiv_fetch_by_date",
-        lambda **_kwargs: [
+    captured: dict[str, str] = {}
+
+    def fake_arxiv_fetch_by_date(**kwargs):
+        captured["start_date"] = kwargs.get("start_date")
+        captured["end_date"] = kwargs.get("end_date")
+        return [
             {
                 "title": "Old May Biomolecular Paper",
                 "arxiv_id": "2605.99999v1",
                 "publish_date": "2026-05-20",
                 "categories": ["q-bio.BM"],
             }
+        ]
+
+    monkeypatch.setattr(
+        agents.daily_agent,
+        "arxiv_fetch_by_date",
+        fake_arxiv_fetch_by_date,
+    )
+    monkeypatch.setattr(
+        agents.daily_agent,
+        "arxiv_fetch_recent_list_page",
+        lambda **_kwargs: [
+            {
+                "title": "Infant Spontaneous Movement Noise Improves Exploration in Deep RL",
+                "arxiv_id": "2606.16590",
+                "publish_date": "2026-06-16",
+                "categories": ["q-bio.BM"],
+            }
         ],
     )
-    monkeypatch.setattr(agents.daily_agent, "arxiv_fetch_recent_list_page", lambda **_kwargs: [])
     monkeypatch.setattr(agents.daily_agent, "openreview_fetch_by_date", lambda **_kwargs: [])
     monkeypatch.setattr(agents.daily_agent, "journal_fetch_recent", lambda **_kwargs: [])
     monkeypatch.setattr(agents.daily_agent, "prepare_paper_features", lambda papers: papers)
@@ -1604,10 +1622,13 @@ def test_daily_arxiv_fetch_filters_out_old_papers(monkeypatch: pytest.MonkeyPatc
     )
 
     assert papers == []
+    assert captured["start_date"] == "20260619"
+    assert captured["end_date"] == "20260619"
 
 
 def test_arxiv_recent_list_parser_handles_current_html_shape() -> None:
     html = """
+<h3>Tue, 16 Jun 2026 (showing 34 of 34 entries )</h3>
 <dt>
   <a href ="/abs/2606.20489" title="Abstract" id="2606.20489">arXiv:2606.20489</a>
 </dt>
@@ -1618,7 +1639,7 @@ def test_arxiv_recent_list_parser_handles_current_html_shape() -> None:
     </div>
     <div class='list-authors'><a href="/search/q-bio?query=Fontana">Andrea Fontana</a></div>
     <div class='list-subjects'><span class='descriptor'>Subjects:</span>
-      <span class="primary-subject">Populations and Evolution (q-bio.PE)</span>; Applications (stat.AP)
+      <span class="primary-subject">Biomolecules (q-bio.BM)</span>; Populations and Evolution (q-bio.PE); Applications (stat.AP)
     </div>
   </div>
 </dd>
@@ -1629,6 +1650,7 @@ def test_arxiv_recent_list_parser_handles_current_html_shape() -> None:
     assert papers[0]["title"].startswith("West Nile virus")
     assert papers[0]["authors"] == ["Andrea Fontana"]
     assert papers[0]["categories"] == ["q-bio.BM", "q-bio.PE", "stat.AP"]
+    assert papers[0]["publish_date"] == "2026-06-16"
 
 
 def test_desktop_relevance_threshold_changes_daily_push_weights(monkeypatch: pytest.MonkeyPatch) -> None:

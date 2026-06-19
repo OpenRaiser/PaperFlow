@@ -90,6 +90,7 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(_
 EMPTY_PUSH_FALLBACK_DAYS = 7
 EMPTY_PUSH_FALLBACK_TOP_K = 7
 DEFAULT_LIMIT_PER_SOURCE = 100
+ALLOW_STALE_DAILY_FALLBACK_ENV = "PAPERFLOW_ALLOW_STALE_DAILY_FALLBACK"
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -257,7 +258,7 @@ def fetch_semantic_scholar_papers(
         end_date = datetime.strptime(str(target_date or "").strip(), "%Y-%m-%d").date() if target_date else datetime.now().date()
     except ValueError:
         end_date = datetime.now().date()
-    min_date = end_date - timedelta(days=max(1, int(days or 1)))
+    min_date = end_date - timedelta(days=max(1, int(days or 1)) - 1)
     fields = "title,abstract,authors,year,url,venue,externalIds,publicationDate"
 
     def fetch_one_query(query: str) -> List[Dict]:
@@ -1137,7 +1138,7 @@ def fetch_and_process_papers(
         if not arxiv_categories:
             print("Skipping arXiv fetch: no categories selected")
             return []
-        start_day = (today - timedelta(days=fetch_days)).date()
+        start_day = (today - timedelta(days=max(1, int(fetch_days or 1)) - 1)).date()
         start_date = start_day.strftime("%Y%m%d")
         papers: List[Dict] = []
         per_category_limit = max(1, int(math.ceil(limit_per_source / max(1, len(arxiv_categories)))))
@@ -1159,6 +1160,10 @@ def fetch_and_process_papers(
                     category=category,
                     limit=per_category_limit,
                 ) or []
+                category_papers = [
+                    paper for paper in category_papers
+                    if _paper_date_in_window(paper, start_day, end_day)
+                ]
             papers.extend(category_papers)
             if category_papers:
                 emit_fetched("arxiv", [{**paper, "source": "arxiv"} for paper in category_papers])
@@ -1172,7 +1177,7 @@ def fetch_and_process_papers(
         if not conferences:
             print("Skipping OpenReview fetch: no conferences selected")
             return []
-        start_date = (today - timedelta(days=fetch_days)).strftime("%Y%m%d")
+        start_date = (today - timedelta(days=max(1, int(fetch_days or 1)) - 1)).strftime("%Y%m%d")
         print(f"Fetching from OpenReview (conferences: {conferences})...")
         papers = openreview_fetch_by_date(
             start_date=start_date,
@@ -1208,7 +1213,7 @@ def fetch_and_process_papers(
         if not arxiv_categories:
             return []
         try:
-            start_day = (today - timedelta(days=max(1, int(days or 1)))).date()
+            start_day = (today - timedelta(days=max(1, int(days or 1)) - 1)).date()
             conn = db_ops.get_connection()
             cursor = conn.cursor()
             cursor.execute(
@@ -1293,9 +1298,10 @@ def fetch_and_process_papers(
     if not all_papers:
         all_papers.extend(fetch_cached_arxiv_papers())
 
+    allow_stale_fallback = _env_bool(ALLOW_STALE_DAILY_FALLBACK_ENV, default=False)
     fallback_days = max(days, 7)
     min_candidate_pool = max(10, limit_per_source // 2)
-    if days < fallback_days and not all_papers:
+    if allow_stale_fallback and days < fallback_days and not all_papers:
         print(
             f"Candidate pool too small ({len(all_papers)} papers); "
             f"widening sparse sources to {fallback_days} days..."
@@ -1723,7 +1729,8 @@ def daily_push(
     }
 
     fallback_days = max(EMPTY_PUSH_FALLBACK_DAYS, int(days or 1))
-    if not scored_papers and int(days or 1) < fallback_days:
+    allow_stale_fallback = _env_bool(ALLOW_STALE_DAILY_FALLBACK_ENV, default=False)
+    if allow_stale_fallback and not scored_papers and int(days or 1) < fallback_days:
         print(
             f"No papers passed strict filtering for {days} day(s); "
             f"trying {fallback_days}-day unhandled fallback..."
