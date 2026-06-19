@@ -2223,7 +2223,9 @@
     parts.push(ui().papers.recommendations(papers.length));
     if (metadata.daily_limit) parts.push(ui().papers.dailyLimit(metadata.daily_limit));
     if (metadata.limit_per_source) parts.push(ui().papers.perSourceLimit(metadata.limit_per_source));
-    if (metadata.relevance_threshold) parts.push(ui().papers.threshold(metadata.relevance_threshold));
+    if (metadata.relevance_threshold !== undefined && metadata.relevance_threshold !== null && metadata.relevance_threshold !== "") {
+      parts.push(ui().papers.threshold(metadata.relevance_threshold));
+    }
     const sourceParts = [
       metadata.arxiv_categories?.length ? `arXiv ${metadata.arxiv_categories.length}` : "",
       metadata.conferences?.length ? ui().papers.conferenceCount(metadata.conferences.length) : "",
@@ -5274,8 +5276,8 @@
     $("directPdfWriteFeishu").checked = Boolean(reportPrefs.write_feishu);
     $("wikiIngestSetting").checked = reportPrefs.wiki_ingest !== false;
     if ($("notesGitLlmReviewSetting")) $("notesGitLlmReviewSetting").checked = paths.reading_notes_git_llm_review !== false;
-    $("dailyLimitInput").value = advanced.daily_limit || 30;
-    $("relevanceThreshold").value = advanced.relevance_threshold || 60;
+    $("dailyLimitInput").value = advanced.daily_limit ?? 30;
+    $("relevanceThreshold").value = advanced.relevance_threshold ?? 60;
     $("relevanceValue").textContent = $("relevanceThreshold").value;
     $("proxyInput").value = advanced.http_proxy || "";
     $("envSettingsForm").className = "env-form";

@@ -1289,6 +1289,25 @@ def test_desktop_save_settings_updates_env_file(tmp_path, monkeypatch: pytest.Mo
     assert result["source_preferences"]["auth_status"]["semantic_scholar_api_key"] is True
 
 
+def test_desktop_settings_preserves_zero_relevance_threshold(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    env_path = tmp_path / ".env"
+    env_path.write_text("PAPERFLOW_RELEVANCE_THRESHOLD=60\n", encoding="utf-8")
+    monkeypatch.setattr(agents, "ENV_PATH", env_path)
+
+    result = agents.save_settings({"PAPERFLOW_RELEVANCE_THRESHOLD": "0"})
+
+    assert "PAPERFLOW_RELEVANCE_THRESHOLD=0" in env_path.read_text(encoding="utf-8")
+    assert result["advanced"]["relevance_threshold"] == 0
+
+
+def test_desktop_settings_ui_does_not_fallback_zero_relevance_threshold() -> None:
+    script = (PROJECT_ROOT / "deployments/desktop/static/desktop.js").read_text(encoding="utf-8")
+
+    assert "$(\"relevanceThreshold\").value = advanced.relevance_threshold ?? 60;" in script
+    assert "$(\"relevanceThreshold\").value = advanced.relevance_threshold || 60;" not in script
+    assert "metadata.relevance_threshold !== undefined" in script
+
+
 def test_desktop_github_sync_commits_notes_with_llm_review(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     bare = tmp_path / "notes.git"
     seed = tmp_path / "seed"
