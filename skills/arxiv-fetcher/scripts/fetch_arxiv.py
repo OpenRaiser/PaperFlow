@@ -93,17 +93,22 @@ def _parse_arxiv_list_page(html: str, category: str, limit: int) -> List[Dict]:
     pairs = re.findall(r"<dt>(.*?)</dt>\s*<dd>(.*?)</dd>", html or "", flags=re.DOTALL | re.IGNORECASE)
     papers: List[Dict] = []
     for dt_html, dd_html in pairs:
-        id_match = re.search(r'href="/abs/([^"]+)"', dt_html)
+        id_match = re.search(r"""href\s*=\s*["']/abs/([^"']+)["']""", dt_html, flags=re.IGNORECASE)
         if not id_match:
             continue
         arxiv_id = unescape(id_match.group(1)).strip()
         title_match = re.search(
-            r'<div class="list-title[^"]*">\s*<span[^>]*>\s*Title:\s*</span>(.*?)</div>',
+            r"""<div\s+class=["']list-title[^"']*["']>\s*<span[^>]*>\s*Title:\s*</span>(.*?)</div>""",
             dd_html,
             flags=re.DOTALL | re.IGNORECASE,
         )
         author_block = re.search(
-            r'<div class="list-authors[^"]*">(.*?)</div>',
+            r"""<div\s+class=["']list-authors[^"']*["']>(.*?)</div>""",
+            dd_html,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+        subjects_block = re.search(
+            r"""<div\s+class=["']list-subjects[^"']*["']>(.*?)</div>""",
             dd_html,
             flags=re.DOTALL | re.IGNORECASE,
         )
@@ -115,13 +120,17 @@ def _parse_arxiv_list_page(html: str, category: str, limit: int) -> List[Dict]:
         title = _clean_html_text(title_match.group(1) if title_match else "")
         if not title:
             continue
+        subjects_text = _clean_html_text(subjects_block.group(1) if subjects_block else "")
+        categories = re.findall(r"\(([a-z-]+(?:\.[A-Z]{2})?)\)", subjects_text)
+        if category and category not in categories:
+            categories.insert(0, category)
         papers.append(
             {
                 "arxiv_id": arxiv_id,
                 "title": title,
                 "authors": [author for author in authors if author],
                 "abstract": "",
-                "categories": [category],
+                "categories": categories or [category],
                 "publish_date": "",
                 "url": f"https://arxiv.org/abs/{arxiv_id}",
                 "paper_url": f"https://arxiv.org/abs/{arxiv_id}",
@@ -134,12 +143,12 @@ def _parse_arxiv_list_page(html: str, category: str, limit: int) -> List[Dict]:
 
 
 def fetch_recent_list_page(category: str, limit: int = 100) -> List[Dict]:
-    """Fetch recent papers from arxiv.org/list/<category>/recent as an API fallback."""
+    """Fetch recent papers from arxiv.org/list/<archive>/recent as an API fallback."""
     category = str(category or "").strip()
     if not category:
         return []
     archive = category.split(".", 1)[0]
-    url = f"{ARXIV_LIST_URL}/{urllib.parse.quote(archive, safe='-')}/new"
+    url = f"{ARXIV_LIST_URL}/{urllib.parse.quote(archive, safe='-')}/recent?skip=0&show=2000"
     try:
         print(f"Fetching arXiv recent list page for {category}...")
         response = requests.get(url, timeout=DEFAULT_REQUEST_TIMEOUT, headers=DEFAULT_REQUEST_HEADERS)

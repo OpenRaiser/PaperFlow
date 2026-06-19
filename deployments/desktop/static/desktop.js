@@ -1572,6 +1572,22 @@
     return Math.max(0, Math.min(100, Math.round(percentage)));
   }
 
+  function paperDisplayTags(paper) {
+    const rawCategories = Array.isArray(paper?.categories)
+      ? paper.categories
+      : String(paper?.categories || "").split(/[,;]\s*/);
+    const categories = rawCategories
+      .map((item) => String(item || "").trim())
+      .filter((item) => item && /^[a-z-]+(\.[A-Z]{2})?$/i.test(item))
+      .slice(0, 4);
+    if (categories.length) return categories;
+    const fallback = [paper?.primary_category, paper?.arxiv_category, paper?.category]
+      .map((item) => String(item || "").trim())
+      .filter((item) => item && item !== "unknown" && item !== "cached");
+    if (fallback.length) return fallback.slice(0, 3);
+    return [paper?.source || ui().papers.sourceFallback].filter(Boolean);
+  }
+
   function setStatus(message) {
     $("statusText").textContent = statusText(message);
   }
@@ -2244,7 +2260,7 @@
       const reportId = state.paperReports.get(reportKey);
       const isReading = state.paperReading.has(reportKey);
       const score = normalizeScore(paper.score ?? paper.relevance ?? paper.relevance_score ?? 80);
-      const tags = paper.tags || [paper.source || ui().papers.sourceFallback, ui().papers.profileMatch];
+      const tags = paperDisplayTags(paper);
       return `
         <article class="paper-card" data-paper-number="${number}">
           <div class="score-ring" style="--score: ${Math.min(score, 100)}%">${score}%</div>

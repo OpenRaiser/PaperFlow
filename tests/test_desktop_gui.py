@@ -13,6 +13,7 @@ from deployments.desktop import server
 from deployments.desktop.shared import agents
 
 reading_agent = importlib.import_module("agents.reading-agent.main")
+arxiv_fetcher = importlib.import_module("skills.arxiv-fetcher.scripts.fetch_arxiv")
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -1555,6 +1556,81 @@ def test_desktop_daily_push_uses_saved_settings_when_gui_omits_filters(
     assert captured["custom_rss_urls"] == ["https://example.com/feed.xml"]
 
 
+def test_daily_arxiv_fetch_filters_out_old_papers(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        agents.daily_agent,
+        "arxiv_fetch_by_date",
+        lambda **_kwargs: [
+            {
+                "title": "Old May Biomolecular Paper",
+                "arxiv_id": "2605.99999v1",
+                "publish_date": "2026-05-20",
+                "categories": ["q-bio.BM"],
+            }
+        ],
+    )
+    monkeypatch.setattr(agents.daily_agent, "arxiv_fetch_recent_list_page", lambda **_kwargs: [])
+    monkeypatch.setattr(agents.daily_agent, "openreview_fetch_by_date", lambda **_kwargs: [])
+    monkeypatch.setattr(agents.daily_agent, "journal_fetch_recent", lambda **_kwargs: [])
+    monkeypatch.setattr(agents.daily_agent, "prepare_paper_features", lambda papers: papers)
+
+    class EmptyRows:
+        def fetchall(self):
+            return []
+
+    class EmptyConnection:
+        def cursor(self):
+            return self
+
+        def execute(self, *_args, **_kwargs):
+            return EmptyRows()
+
+        def fetchall(self):
+            return []
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(agents.daily_agent.db_ops, "get_connection", lambda: EmptyConnection())
+
+    papers = agents.daily_agent.fetch_and_process_papers(
+        days=1,
+        arxiv_categories=["q-bio.BM"],
+        conferences=[],
+        journals=[],
+        enable_semantic_scholar=False,
+        enable_custom_rss=False,
+        target_date="2026-06-19",
+    )
+
+    assert papers == []
+
+
+def test_arxiv_recent_list_parser_handles_current_html_shape() -> None:
+    html = """
+<dt>
+  <a href ="/abs/2606.20489" title="Abstract" id="2606.20489">arXiv:2606.20489</a>
+</dt>
+<dd>
+  <div class='meta'>
+    <div class='list-title mathjax'><span class='descriptor'>Title:</span>
+      West Nile virus outbreak in Italy modelled with the quantum Game of Life
+    </div>
+    <div class='list-authors'><a href="/search/q-bio?query=Fontana">Andrea Fontana</a></div>
+    <div class='list-subjects'><span class='descriptor'>Subjects:</span>
+      <span class="primary-subject">Populations and Evolution (q-bio.PE)</span>; Applications (stat.AP)
+    </div>
+  </div>
+</dd>
+"""
+    papers = arxiv_fetcher._parse_arxiv_list_page(html, "q-bio.BM", limit=10)  # noqa: SLF001
+
+    assert papers[0]["arxiv_id"] == "2606.20489"
+    assert papers[0]["title"].startswith("West Nile virus")
+    assert papers[0]["authors"] == ["Andrea Fontana"]
+    assert papers[0]["categories"] == ["q-bio.BM", "q-bio.PE", "stat.AP"]
+
+
 def test_desktop_relevance_threshold_changes_daily_push_weights(monkeypatch: pytest.MonkeyPatch) -> None:
     base = {
         "threshold_high_relevant": 0.40,
@@ -1739,6 +1815,15 @@ def test_desktop_paper_source_defaults_are_arxiv_only() -> None:
     assert 'const conferences = openReviewEnabled ? selectedSourceValues("conferenceSources") : [];' in collect_daily_options
     assert 'selectedSourceValues("conferenceSources").length' not in collect_daily_options
     assert "selectedSettingConferences()" not in collect_daily_options
+
+
+def test_desktop_paper_cards_show_arxiv_category_tags() -> None:
+    script = (PROJECT_ROOT / "deployments/desktop/static/desktop.js").read_text(encoding="utf-8")
+
+    assert "function paperDisplayTags(paper)" in script
+    assert "paperDisplayTags(paper)" in script
+    assert "paper?.categories" in script
+    assert "const tags = paper.tags || [paper.source || ui().papers.sourceFallback, ui().papers.profileMatch]" not in script
 
 
 def test_desktop_settings_controls_use_compact_typography() -> None:

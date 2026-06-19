@@ -15,7 +15,7 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from email.utils import parsedate_to_datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from pathlib import Path
 from typing import Any, Callable, List, Dict, Optional, Set
 from dataclasses import dataclass
@@ -37,7 +37,6 @@ import importlib
 # 导入多个数据源
 arxiv_fetcher = importlib.import_module("skills.arxiv-fetcher.scripts.fetch_arxiv")
 arxiv_fetch_by_date = arxiv_fetcher.fetch_by_date
-arxiv_fetch_latest = getattr(arxiv_fetcher, "fetch_latest", None)
 arxiv_fetch_recent_list_page = getattr(arxiv_fetcher, "fetch_recent_list_page", None)
 
 openreview_fetcher = importlib.import_module("skills.openreview-fetcher.scripts.fetch_openreview")
@@ -130,6 +129,25 @@ def _parse_feed_date(value: Any) -> str:
         return parsedate_to_datetime(text).date().isoformat()
     except Exception:
         return text[:10]
+
+
+def _parse_iso_date(value: Any) -> Optional[date]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    for fmt, width in (("%Y-%m-%d", 10), ("%Y%m%d", 8)):
+        try:
+            return datetime.strptime(text[:width], fmt).date()
+        except ValueError:
+            pass
+    return None
+
+
+def _paper_date_in_window(paper: Dict[str, Any], start_date: date, end_date: date) -> bool:
+    paper_date = _parse_iso_date((paper or {}).get("publish_date") or (paper or {}).get("published"))
+    if paper_date is None:
+        return True
+    return start_date <= paper_date <= end_date
 
 
 def _xml_text(node: ET.Element, *paths: str) -> str:
@@ -1113,12 +1131,14 @@ def fetch_and_process_papers(
     except ValueError:
         today = datetime.now()
     end_date = today.strftime("%Y%m%d")
+    end_day = today.date()
 
     def fetch_arxiv_papers(fetch_days: int) -> List[Dict]:
         if not arxiv_categories:
             print("Skipping arXiv fetch: no categories selected")
             return []
-        start_date = (today - timedelta(days=fetch_days)).strftime("%Y%m%d")
+        start_day = (today - timedelta(days=fetch_days)).date()
+        start_date = start_day.strftime("%Y%m%d")
         papers: List[Dict] = []
         per_category_limit = max(1, int(math.ceil(limit_per_source / max(1, len(arxiv_categories)))))
         for category in arxiv_categories:
@@ -1129,12 +1149,10 @@ def fetch_and_process_papers(
                 categories=[category],
                 limit=per_category_limit,
             ) or []
-            if not category_papers and callable(arxiv_fetch_latest):
-                print(f"  Date-bounded arXiv fetch returned 0 papers for {category}; fetching latest via API...")
-                category_papers = arxiv_fetch_latest(
-                    categories=[category],
-                    limit=per_category_limit,
-                ) or []
+            category_papers = [
+                paper for paper in category_papers
+                if _paper_date_in_window(paper, start_day, end_day)
+            ]
             if not category_papers and callable(arxiv_fetch_recent_list_page):
                 print(f"  arXiv API returned 0 papers for {category}; fetching recent list page...")
                 category_papers = arxiv_fetch_recent_list_page(
@@ -1190,16 +1208,19 @@ def fetch_and_process_papers(
         if not arxiv_categories:
             return []
         try:
+            start_day = (today - timedelta(days=max(1, int(days or 1)))).date()
             conn = db_ops.get_connection()
             cursor = conn.cursor()
             cursor.execute(
                 """
                 SELECT * FROM papers
                 WHERE arxiv_id IS NOT NULL AND TRIM(arxiv_id) != ''
+                  AND publish_date >= ?
+                  AND publish_date <= ?
                 ORDER BY fetched_at DESC, id DESC
                 LIMIT ?
                 """,
-                (max(1, int(limit_per_source)),),
+                (start_day.isoformat(), end_day.isoformat(), max(1, int(limit_per_source))),
             )
             rows = cursor.fetchall()
             conn.close()
