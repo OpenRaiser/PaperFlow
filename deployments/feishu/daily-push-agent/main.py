@@ -638,7 +638,15 @@ def compute_relevance_signal(paper: Dict, profile: Dict) -> float:
         if any(topic in paper_topics for topic in suppressed_topics):
             suppression_penalty = float(anchor_behavior.get("suppression_penalty", 0.0) or 0.0)
 
-    return max(0.0, max(interest_sim, topic_match, author_score, institution_score, anchor_signal) - suppression_penalty)
+    entity_score = max(author_score, institution_score)
+    weighted_signal = (
+        0.45 * interest_sim
+        + 0.35 * topic_match
+        + 0.20 * entity_score
+        + anchor_signal
+    )
+
+    return max(0.0, min(1.0, weighted_signal) - suppression_penalty)
 
 
 def compute_drift_bonus(paper: Dict, profile: Dict, weights: Dict) -> tuple[float, List[str]]:
@@ -783,6 +791,61 @@ def apply_source_diversity_quota(
     return selected
 
 
+def _paper_topic_tokens(paper: Dict) -> Set[str]:
+    tokens: List[str] = []
+    for key in ("topics", "keywords"):
+        value = paper.get(key) or []
+        if isinstance(value, str):
+            tokens.append(value)
+        else:
+            tokens.extend(str(item) for item in value if str(item).strip())
+    return {str(token).strip().lower() for token in tokens if str(token).strip()}
+
+
+def _topic_jaccard_similarity(left: Dict, right: Dict) -> float:
+    left_tokens = _paper_topic_tokens(left)
+    right_tokens = _paper_topic_tokens(right)
+    if not left_tokens or not right_tokens:
+        return 0.0
+    return len(left_tokens & right_tokens) / len(left_tokens | right_tokens)
+
+
+def apply_mmr_topic_diversity(
+    scored_papers: List[PaperWithScore],
+    weights: Dict,
+) -> List[PaperWithScore]:
+    """Rerank non-must-read papers to reduce near-duplicate topic runs."""
+    if not scored_papers or not weights.get("mmr_diversity_enabled", True):
+        return scored_papers
+
+    must_read_items = [paper for paper in scored_papers if paper.category == "must_read"]
+    candidates = [paper for paper in scored_papers if paper.category != "must_read"]
+    min_total = int(weights.get("mmr_min_total", 8))
+    if len(candidates) < min_total:
+        return scored_papers
+
+    relevance_weight = float(weights.get("mmr_relevance_weight", 0.82))
+    relevance_weight = max(0.0, min(1.0, relevance_weight))
+    diversity_weight = 1.0 - relevance_weight
+
+    selected: List[PaperWithScore] = []
+    remaining = list(candidates)
+    while remaining:
+        def mmr_key(item: PaperWithScore) -> tuple:
+            redundancy = max(
+                (_topic_jaccard_similarity(item.paper, selected_item.paper) for selected_item in selected),
+                default=0.0,
+            )
+            mmr_score = relevance_weight * float(item.score) - diversity_weight * redundancy
+            return (mmr_score, float(item.score), float(item.relevance_signal))
+
+        best = max(remaining, key=mmr_key)
+        selected.append(best)
+        remaining.remove(best)
+
+    return must_read_items + selected
+
+
 def format_must_read_config(profile: Dict) -> str:
     """Format current must-read configuration for push cards."""
     must_read = (profile or {}).get("must_read", {})
@@ -827,7 +890,7 @@ def prepare_paper_features(papers: List[Dict]) -> List[Dict]:
         paper["quality_score"] = estimate_quality_score(paper)
 
         semantic_topics = canonicalize_direction_terms(
-            extract_topics_from_title(paper.get("title", "")),
+            extract_topics_from_text(paper.get("title", ""), paper.get("abstract", "")),
             keep_unknown=True,
         )
         source_categories = list(paper.get("categories", []))
@@ -844,9 +907,9 @@ def prepare_paper_features(papers: List[Dict]) -> List[Dict]:
     return papers
 
 
-def extract_topics_from_title(title: str) -> List[str]:
-    """从标题中提取语义主题关键词"""
-    title_lower = title.lower()
+def extract_topics_from_text(title: str, abstract: str = "") -> List[str]:
+    """Extract coarse semantic topics from title and abstract text."""
+    title_lower = f"{title} {abstract}".lower()
     topics = []
 
     # ===== 用户画像中的主题（优先匹配）=====
@@ -960,6 +1023,11 @@ def extract_topics_from_title(title: str) -> List[str]:
         topics.append("privacy")
 
     return canonicalize_direction_terms(topics, keep_unknown=True)
+
+
+def extract_topics_from_title(title: str) -> List[str]:
+    """Backward-compatible wrapper for title-only topic extraction."""
+    return extract_topics_from_text(title, "")
 
 
 def _title_has_any_token(title: str, tokens: tuple) -> bool:
@@ -1391,6 +1459,7 @@ def sort_and_categorize(
     result = categorize_papers_by_rank(result, profile, weights)
     result.sort(key=_hard_priority_tuple, reverse=True)
     result = apply_source_diversity_quota(result, weights)
+    result = apply_mmr_topic_diversity(result, weights)
     result = apply_push_count_limit(result, weights)
     result.sort(key=_hard_priority_tuple, reverse=True)
     for rank, item in enumerate(result, start=1):

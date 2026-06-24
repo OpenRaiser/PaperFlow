@@ -867,7 +867,11 @@ def _rank_label(rank: int) -> str:
 
 def calibrate_recommendation_label(paper: Dict[str, Any], proposed_label: Any, analysis_source: Any = None) -> str:
     """Constrain reading-report recommendation labels to ranking/evaluation evidence."""
-    system_label = _clean_text(paper.get("system_label") or paper.get("relevance_level"))
+    system_label = _clean_text(
+        paper.get("system_label")
+        or paper.get("relevance_level")
+        or paper.get("category")
+    )
     oracle_label = _clean_text(paper.get("oracle_label"))
     analysis_source_text = _clean_text(analysis_source).lower()
 
@@ -920,7 +924,11 @@ def build_recommendation_calibration_metadata(
         "proposed_label": _clean_text(proposed_label),
         "final_label": _clean_text(final_label),
         "analysis_source": _clean_text(analysis_source),
-        "system_label": _clean_text(paper.get("system_label") or paper.get("relevance_level")),
+        "system_label": _clean_text(
+            paper.get("system_label")
+            or paper.get("relevance_level")
+            or paper.get("category")
+        ),
         "system_score": paper.get("system_score", paper.get("relevance_score")),
         "oracle_label": _clean_text(paper.get("oracle_label")),
         "oracle_score": paper.get("oracle_score"),

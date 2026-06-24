@@ -1097,9 +1097,12 @@ def calculate_paper_score(
             "bonus_must_read": 0.15,
         }
 
-    interest_sim = cosine_similarity(
-        paper.get("embedding", []),
-        profile.get("interest_vector", []),
+    interest_sim = max(
+        0.0,
+        cosine_similarity(
+            paper.get("embedding", []),
+            profile.get("interest_vector", []),
+        ),
     )
 
     topic_match = 0.0
@@ -1140,18 +1143,22 @@ def calculate_paper_score(
         if suppressed_hit and not (anchor_behavior["target_topic"] and _paper_matches_anchor_topic(paper, anchor_behavior["target_topic"])):
             suppression_penalty = float(anchor_behavior["suppression_penalty"])
 
-    bonus = weights_config.get("bonus_must_read", 0.15) if is_must_read(paper, profile) else 0.0
+    must_read_hit = is_must_read(paper, profile)
+    bonus = weights_config.get("bonus_must_read", 0.15) if must_read_hit else 0.0
+    personal_signal = max(interest_sim, topic_match, author_score, institution_score, anchor_bonus)
+    min_relevance_signal = float(weights_config.get("min_relevance_signal", 0.08) or 0.08)
+    quality_gate = 1.0 if must_read_hit else min(1.0, personal_signal / max(min_relevance_signal, 1e-6))
 
     score = (
         weights_config.get("w1_interest_vector", 0.35) * interest_sim
         + weights_config.get("w2_topic_weight", 0.25) * topic_match
         + weights_config.get("w3_author_institution", 0.20) * max(author_score, institution_score)
-        + weights_config.get("w4_quality_signal", 0.20) * quality_score
+        + weights_config.get("w4_quality_signal", 0.20) * quality_score * quality_gate
         + bonus
         + anchor_bonus
         - suppression_penalty
     )
-    return min(1.0, score)
+    return max(0.0, min(1.0, score))
 
 
 def get_must_read_matches(paper: Dict, profile: Dict) -> Dict[str, List[str]]:

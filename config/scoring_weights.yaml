@@ -5,7 +5,7 @@
 w1_interest_vector: 0.35    # 兴趣向量相似度（余弦相似度）
 w2_topic_weight: 0.25       # 主题权重匹配
 w3_author_institution: 0.20 # 作者/机构热度
-w4_quality_signal: 0.20     # 论文质量信号（venue 声誉、引用预期等）
+w4_quality_signal: 0.20     # 论文质量信号；仅在已有个人相关信号/必读命中时参与排序
 
 # 必读清单加成
 bonus_must_read: 0.15       # 必读命中仍保留 bonus，但推送排序层已改为硬优先保留 + 顶部展示
@@ -61,6 +61,11 @@ push_min_count: 20
 source_diversity_min_total: 12
 source_diversity_min_per_bucket: 3
 source_diversity_max_share: 0.70
+
+# 主题多样性重排（MMR）
+mmr_diversity_enabled: true
+mmr_min_total: 8
+mmr_relevance_weight: 0.82
 
 # 推送参数
 push_target_count: 100      # 目标推送论文数量

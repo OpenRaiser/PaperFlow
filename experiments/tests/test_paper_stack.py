@@ -808,6 +808,46 @@ def test_extract_topics_from_title_recognizes_ai_detection_signals():
     assert "detection" in topics
 
 
+def test_extract_topics_from_text_uses_abstract_when_title_is_sparse():
+    topics = daily_push_agent.extract_topics_from_text(
+        "A general benchmark",
+        "The benchmark evaluates GUI agents for computer use and interface agent planning.",
+    )
+
+    assert "gui-agent" in topics
+    assert "agent" in topics
+
+
+def test_calculate_paper_score_does_not_promote_quality_without_personal_signal():
+    score = daily_push_agent.calculate_paper_score(
+        {
+            "title": "High prestige but unrelated",
+            "embedding": [0.0, 1.0, 0.0],
+            "topics": [],
+            "authors": [],
+            "institution": "",
+            "quality_score": 1.0,
+        },
+        {
+            "interest_vector": [1.0, 0.0, 0.0],
+            "topic_weights": {"gui-agent": 0.8},
+            "author_heat": {},
+            "institution_heat": {},
+            "must_read": {"authors": [], "institutions": [], "keywords": []},
+        },
+        {
+            "w1_interest_vector": 0.35,
+            "w2_topic_weight": 0.25,
+            "w3_author_institution": 0.20,
+            "w4_quality_signal": 0.20,
+            "bonus_must_read": 0.15,
+            "min_relevance_signal": 0.08,
+        },
+    )
+
+    assert score == 0.0
+
+
 def test_categorize_papers_filters_quality_only_items():
     profile = {
         "interest_vector": [1.0, 0.0, 0.0, 0.0],
@@ -858,6 +898,43 @@ def test_categorize_papers_filters_quality_only_items():
     assert len(categorized) == 1
     assert categorized[0].paper["title"] == "Protein structure modeling"
     assert categorized[0].category in {"high_relevant", "maybe_interested"}
+
+
+def test_apply_mmr_topic_diversity_interleaves_redundant_topics():
+    papers = [
+        daily_push_agent.PaperWithScore(
+            paper={"title": "GUI A", "topics": ["gui-agent"], "keywords": ["gui-agent"]},
+            score=0.90,
+            category="high_relevant",
+            relevance_signal=0.8,
+        ),
+        daily_push_agent.PaperWithScore(
+            paper={"title": "GUI B", "topics": ["gui-agent"], "keywords": ["gui-agent"]},
+            score=0.89,
+            category="high_relevant",
+            relevance_signal=0.8,
+        ),
+        daily_push_agent.PaperWithScore(
+            paper={"title": "Protein A", "topics": ["protein-language-model"], "keywords": ["protein-language-model"]},
+            score=0.86,
+            category="high_relevant",
+            relevance_signal=0.8,
+        ),
+        daily_push_agent.PaperWithScore(
+            paper={"title": "Retrieval A", "topics": ["retrieval"], "keywords": ["retrieval"]},
+            score=0.85,
+            category="high_relevant",
+            relevance_signal=0.8,
+        ),
+    ]
+
+    reranked = daily_push_agent.apply_mmr_topic_diversity(
+        papers,
+        {"mmr_diversity_enabled": True, "mmr_min_total": 2, "mmr_relevance_weight": 0.7},
+    )
+
+    assert reranked[0].paper["title"] == "GUI A"
+    assert reranked[1].paper["title"] != "GUI B"
 
 
 def test_get_must_read_matches_reports_match_reasons():
@@ -1065,7 +1142,9 @@ def test_format_push_card_mentions_recent_upload_short_term_topics():
 def test_fetch_and_process_papers_passes_days_to_journal_fetcher(monkeypatch):
     journal_calls = []
 
+    monkeypatch.setenv("PAPERFLOW_ALLOW_STALE_DAILY_FALLBACK", "1")
     monkeypatch.setattr(daily_push_agent, "arxiv_fetch_by_date", lambda **kwargs: [])
+    monkeypatch.setattr(daily_push_agent, "arxiv_fetch_recent_list_page", lambda **kwargs: [])
     monkeypatch.setattr(daily_push_agent, "openreview_fetch_by_date", lambda **kwargs: [])
 
     def fake_journal_fetch_recent(*, journals, days, limit_per_journal):
@@ -1108,6 +1187,8 @@ def test_fetch_and_process_papers_widens_sparse_sources_for_recent_push(monkeypa
     arxiv_calls = []
     journal_calls = []
 
+    monkeypatch.setenv("PAPERFLOW_ALLOW_STALE_DAILY_FALLBACK", "1")
+
     def fake_arxiv_fetch_by_date(*, start_date, end_date, categories, limit):
         arxiv_calls.append({"start_date": start_date, "end_date": end_date, "categories": categories, "limit": limit})
         if len(arxiv_calls) == 1:
@@ -1121,6 +1202,7 @@ def test_fetch_and_process_papers_widens_sparse_sources_for_recent_push(monkeypa
         return [{"title": "Fallback Nature paper"}]
 
     monkeypatch.setattr(daily_push_agent, "arxiv_fetch_by_date", fake_arxiv_fetch_by_date)
+    monkeypatch.setattr(daily_push_agent, "arxiv_fetch_recent_list_page", lambda **kwargs: [])
     monkeypatch.setattr(daily_push_agent, "openreview_fetch_by_date", lambda **kwargs: [])
     monkeypatch.setattr(daily_push_agent, "journal_fetch_recent", fake_journal_fetch_recent)
     monkeypatch.setattr(daily_push_agent, "prepare_paper_features", lambda papers: papers)
@@ -1141,6 +1223,8 @@ def test_fetch_and_process_papers_widens_sparse_sources_for_recent_push(monkeypa
 def test_fetch_and_process_papers_widens_openreview_when_pool_is_sparse(monkeypatch):
     openreview_calls = []
 
+    monkeypatch.setenv("PAPERFLOW_ALLOW_STALE_DAILY_FALLBACK", "1")
+
     def fake_openreview_fetch_by_date(*, start_date, end_date, conferences, limit):
         openreview_calls.append(
             {
@@ -1155,6 +1239,7 @@ def test_fetch_and_process_papers_widens_openreview_when_pool_is_sparse(monkeypa
         return [{"title": "Fallback ICLR paper"}]
 
     monkeypatch.setattr(daily_push_agent, "arxiv_fetch_by_date", lambda **kwargs: [])
+    monkeypatch.setattr(daily_push_agent, "arxiv_fetch_recent_list_page", lambda **kwargs: [])
     monkeypatch.setattr(daily_push_agent, "openreview_fetch_by_date", fake_openreview_fetch_by_date)
     monkeypatch.setattr(daily_push_agent, "journal_fetch_recent", lambda **kwargs: [])
     monkeypatch.setattr(daily_push_agent, "prepare_paper_features", lambda papers: papers)

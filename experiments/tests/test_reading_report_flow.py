@@ -411,6 +411,33 @@ def test_recommendation_label_is_calibrated_by_relevance_evidence():
     )
 
 
+def test_recommendation_label_uses_daily_push_category_when_system_label_is_missing():
+    assert (
+        reading_agent.calibrate_recommendation_label(
+            {"category": "must_read", "system_score": 0.30},
+            "推荐阅读",
+            "abstract",
+        )
+        == "强烈推荐"
+    )
+    assert (
+        reading_agent.calibrate_recommendation_label(
+            {"category": "high_relevant", "system_score": 0.42},
+            "强烈推荐",
+            "abstract",
+        )
+        == "推荐阅读"
+    )
+    assert (
+        reading_agent.calibrate_recommendation_label(
+            {"category": "maybe_interested", "system_score": 0.31},
+            "强烈推荐",
+            "pdf",
+        )
+        == "值得快速浏览"
+    )
+
+
 def test_recommendation_calibration_metadata_records_evidence():
     metadata = reading_agent.build_recommendation_calibration_metadata(
         {
@@ -433,6 +460,18 @@ def test_recommendation_calibration_metadata_records_evidence():
         "oracle_label": "relevant",
         "oracle_score": 0.54,
     }
+
+
+def test_recommendation_calibration_metadata_records_category_fallback():
+    metadata = reading_agent.build_recommendation_calibration_metadata(
+        {"category": "high_relevant", "system_score": 0.42},
+        "强烈推荐",
+        "推荐阅读",
+        "abstract",
+    )
+
+    assert metadata["system_label"] == "high_relevant"
+    assert metadata["system_score"] == 0.42
 
 
 def test_generate_reading_report_keeps_full_template_and_links_on_fallback():
