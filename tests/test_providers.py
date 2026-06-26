@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sys
 
 import pytest
 
@@ -149,6 +150,140 @@ def test_openai_stream_field_helper_accepts_dict_and_objects() -> None:
     assert _field({"content": "dict-content"}, "content") == "dict-content"
     assert _field(Obj(), "content") == "object-content"
     assert _field({}, "missing", "fallback") == "fallback"
+
+
+@pytest.mark.unit
+def test_openai_llm_retries_high_after_max_reasoning_effort_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = []
+
+    class FakeUsage:
+        prompt_tokens = 3
+        completion_tokens = 5
+
+    class FakeMessage:
+        content = "ok"
+
+    class FakeChoice:
+        message = FakeMessage()
+
+    class FakeResponse:
+        choices = [FakeChoice()]
+        usage = FakeUsage()
+
+    class FakeCompletions:
+        @staticmethod
+        def create(**kwargs):
+            calls.append(dict(kwargs))
+            if kwargs.get("reasoning_effort") == "max":
+                raise ValueError("unsupported parameter: reasoning_effort")
+            return FakeResponse()
+
+    class FakeChat:
+        completions = FakeCompletions()
+
+    class FakeClient:
+        chat = FakeChat()
+
+    class FakeOpenAIModule:
+        @staticmethod
+        def OpenAI(**_kwargs):
+            return FakeClient()
+
+    monkeypatch.setitem(sys.modules, "openai", FakeOpenAIModule)
+    monkeypatch.delenv("OPENAI_REASONING_EFFORT", raising=False)
+
+    llm = OpenAILLM(model="gpt-test", api_key="sk-test")
+    response = llm.generate("hello", system="sys")
+
+    assert response.text == "ok"
+    assert calls[0]["reasoning_effort"] == "max"
+    assert calls[1]["reasoning_effort"] == "high"
+
+
+@pytest.mark.unit
+def test_openai_llm_retries_without_reasoning_effort_after_max_and_high_fail(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = []
+
+    class FakeMessage:
+        content = "ok"
+
+    class FakeChoice:
+        message = FakeMessage()
+
+    class FakeResponse:
+        choices = [FakeChoice()]
+        usage = None
+
+    class FakeCompletions:
+        @staticmethod
+        def create(**kwargs):
+            calls.append(dict(kwargs))
+            if "reasoning_effort" in kwargs:
+                raise ValueError("unsupported parameter: reasoning_effort")
+            return FakeResponse()
+
+    class FakeChat:
+        completions = FakeCompletions()
+
+    class FakeClient:
+        chat = FakeChat()
+
+    class FakeOpenAIModule:
+        @staticmethod
+        def OpenAI(**_kwargs):
+            return FakeClient()
+
+    monkeypatch.setitem(sys.modules, "openai", FakeOpenAIModule)
+    monkeypatch.delenv("OPENAI_REASONING_EFFORT", raising=False)
+
+    llm = OpenAILLM(model="gpt-test", api_key="sk-test")
+    response = llm.generate("hello")
+
+    assert response.text == "ok"
+    assert calls[0]["reasoning_effort"] == "max"
+    assert calls[1]["reasoning_effort"] == "high"
+    assert "reasoning_effort" not in calls[2]
+
+
+@pytest.mark.unit
+def test_openai_llm_can_disable_reasoning_effort(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = []
+
+    class FakeMessage:
+        content = "ok"
+
+    class FakeChoice:
+        message = FakeMessage()
+
+    class FakeResponse:
+        choices = [FakeChoice()]
+        usage = None
+
+    class FakeCompletions:
+        @staticmethod
+        def create(**kwargs):
+            calls.append(dict(kwargs))
+            return FakeResponse()
+
+    class FakeChat:
+        completions = FakeCompletions()
+
+    class FakeClient:
+        chat = FakeChat()
+
+    class FakeOpenAIModule:
+        @staticmethod
+        def OpenAI(**_kwargs):
+            return FakeClient()
+
+    monkeypatch.setitem(sys.modules, "openai", FakeOpenAIModule)
+    monkeypatch.setenv("OPENAI_REASONING_EFFORT", "default")
+
+    llm = OpenAILLM(model="gpt-test", api_key="sk-test")
+    llm.generate("hello")
+
+    assert len(calls) == 1
+    assert "reasoning_effort" not in calls[0]
 
 
 @pytest.mark.unit

@@ -162,6 +162,43 @@ def test_parse_intent_with_llm_disables_after_auth_error(monkeypatch):
     assert llm_parser.LLM_FALLBACK_DISABLED is True
 
 
+def test_openai_json_parser_retries_high_after_max_reasoning_effort_fails(monkeypatch):
+    calls = []
+
+    class FakeMessage:
+        content = '{"action":"unknown","confidence":0.2}'
+
+    class FakeChoice:
+        message = FakeMessage()
+        finish_reason = "stop"
+
+    class FakeResponse:
+        choices = [FakeChoice()]
+
+    class FakeCompletions:
+        @staticmethod
+        def create(**kwargs):
+            calls.append(dict(kwargs))
+            if kwargs.get("reasoning_effort") == "max":
+                raise RuntimeError("unsupported parameter: reasoning_effort")
+            return FakeResponse()
+
+    class FakeChat:
+        completions = FakeCompletions()
+
+    class FakeClient:
+        chat = FakeChat()
+
+    monkeypatch.delenv("OPENAI_REASONING_EFFORT", raising=False)
+    monkeypatch.setattr(llm_parser, "_get_openai_client", lambda *args, **kwargs: FakeClient())
+
+    result = llm_parser._generate_json_with_openai("system", "user", max_tokens=64)
+
+    assert result == {"action": "unknown", "confidence": 0.2}
+    assert calls[0]["reasoning_effort"] == "max"
+    assert calls[1]["reasoning_effort"] == "high"
+
+
 def test_parse_intent_with_llm_uses_local_provider(monkeypatch):
     monkeypatch.setenv("LLM_PARSER_PROVIDER", "local")
 

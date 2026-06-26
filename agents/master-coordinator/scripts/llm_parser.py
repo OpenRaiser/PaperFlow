@@ -12,7 +12,7 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Set
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
@@ -119,6 +119,46 @@ def _get_openai_parser_model() -> str:
         )
         or "gpt-4o-mini"
     )
+
+
+def _openai_reasoning_effort() -> str:
+    return (_get_first_env_value("OPENAI_REASONING_EFFORT") or "max").strip()
+
+
+def _openai_reasoning_effort_disabled() -> bool:
+    return _openai_reasoning_effort().lower() in {"", "0", "false", "off", "none", "default"}
+
+
+def _openai_reasoning_effort_candidates() -> List[str]:
+    if _openai_reasoning_effort_disabled():
+        return []
+    candidates = [_openai_reasoning_effort(), "max", "high"]
+    result: List[str] = []
+    seen: Set[str] = set()
+    for candidate in candidates:
+        value = str(candidate or "").strip()
+        key = value.lower()
+        if not value or key in seen:
+            continue
+        seen.add(key)
+        result.append(value)
+    return result
+
+
+def _is_unsupported_reasoning_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    if "reasoning" not in text and "effort" not in text:
+        return False
+    unsupported_tokens = (
+        "unsupported",
+        "not supported",
+        "unknown parameter",
+        "unrecognized",
+        "invalid parameter",
+        "extra inputs are not permitted",
+        "unexpected keyword",
+    )
+    return any(token in text for token in unsupported_tokens)
 
 
 def _get_fallback_generation_model() -> str:
@@ -1218,6 +1258,12 @@ def _generate_json_with_openai(
         }
         if use_response_format:
             kwargs["response_format"] = {"type": "json_object"}
+        for effort in _openai_reasoning_effort_candidates():
+            try:
+                return client.chat.completions.create(**{**kwargs, "reasoning_effort": effort})
+            except Exception as exc:
+                if not _is_unsupported_reasoning_error(exc):
+                    raise
         return client.chat.completions.create(**kwargs)
 
     def _parse_response(response: Any) -> Optional[Dict[str, Any]]:

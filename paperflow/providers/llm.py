@@ -64,6 +64,46 @@ def _field(value: object, name: str, default: object = None) -> object:
     return getattr(value, name, default)
 
 
+def _reasoning_effort() -> str:
+    return (os.environ.get("OPENAI_REASONING_EFFORT") or "max").strip()
+
+
+def _reasoning_effort_disabled() -> bool:
+    return _reasoning_effort().lower() in {"", "0", "false", "off", "none", "default"}
+
+
+def _reasoning_effort_candidates() -> list[str]:
+    if _reasoning_effort_disabled():
+        return []
+    candidates = [_reasoning_effort(), "max", "high"]
+    result: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        value = str(candidate or "").strip()
+        key = value.lower()
+        if not value or key in seen:
+            continue
+        seen.add(key)
+        result.append(value)
+    return result
+
+
+def _is_unsupported_reasoning_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    if "reasoning" not in text and "effort" not in text:
+        return False
+    unsupported_tokens = (
+        "unsupported",
+        "not supported",
+        "unknown parameter",
+        "unrecognized",
+        "invalid parameter",
+        "extra inputs are not permitted",
+        "unexpected keyword",
+    )
+    return any(token in text for token in unsupported_tokens)
+
+
 class OpenAILLM:
     name = "openai"
 
@@ -86,12 +126,31 @@ class OpenAILLM:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
 
-        response = self._client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-        )
+        kwargs = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        efforts = _reasoning_effort_candidates()
+        response = None
+        last_reasoning_error: Optional[Exception] = None
+        for effort in efforts:
+            try:
+                response = self._client.chat.completions.create(**{**kwargs, "reasoning_effort": effort})
+                break
+            except Exception as exc:
+                if not _is_unsupported_reasoning_error(exc):
+                    raise
+                last_reasoning_error = exc
+        if response is None:
+            try:
+                response = self._client.chat.completions.create(**kwargs)
+            except Exception:
+                if last_reasoning_error is not None:
+                    raise
+                raise
+
         choice = response.choices[0].message.content or ""
         usage = getattr(response, "usage", None)
         return LLMResponse(
