@@ -1,4 +1,6 @@
 (function () {
+  const REPORT_LIST_LIMIT = 500;
+
   const uiState = {
     reports: [],
     currentReport: null,
@@ -340,7 +342,7 @@
     const q = byId("reportQuery").value.trim();
     const days = Number(byId("reportDays").value || 30);
     const exactDate = byId("reportDate").value || "";
-    const data = await api(`/api/reports?user_id=${encodeURIComponent(scopedUser)}&q=${encodeURIComponent(q)}&days=${encodeURIComponent(days)}&date=${encodeURIComponent(exactDate)}&limit=120`);
+    const data = await api(`/api/reports?user_id=${encodeURIComponent(scopedUser)}&q=${encodeURIComponent(q)}&days=${encodeURIComponent(days)}&date=${encodeURIComponent(exactDate)}&limit=${REPORT_LIST_LIMIT}`);
     uiState.reports = data.reports || [];
     const sourceDirs = data.source_dirs || [];
     const filters = [];

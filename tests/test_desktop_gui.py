@@ -2773,7 +2773,8 @@ def test_desktop_wiki_frontend_derives_architecture_from_backend_graph() -> None
     assert "wikiMapCatalog" not in script
     assert "concept:structured-memory" not in script
     assert "concept:agent" not in script
-    assert "&limit=120" in script
+    assert "REPORT_LIST_LIMIT = 500" in script
+    assert "&limit=${REPORT_LIST_LIMIT}" in script
     assert "const query = rawQuery ||" not in script
     assert 'DEMO_MODE ? demoWikiNodes : []' in script
     assert 'class="wiki-entry-body"' in html

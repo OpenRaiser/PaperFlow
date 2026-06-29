@@ -4,6 +4,7 @@
   const DEMO_MODE = new URLSearchParams(window.location.search).get("demo") === "1";
   const LOCALE_KEY = "paperflow.desktop.locale";
   const REPORT_HIGHLIGHTS_KEY = "paperflow.report.cardHighlights";
+  const REPORT_LIST_LIMIT = 500;
   const supportedLocales = new Set(["zh", "en"]);
   const requestedLocale = new URLSearchParams(window.location.search).get("lang");
   const savedLocale = window.localStorage.getItem(LOCALE_KEY);
@@ -2956,7 +2957,7 @@
     const query = $("reportQuery").value.trim();
     const days = $("reportDays").value || "30";
     const date = $("reportDate").value || "";
-    const data = await api(`/api/reports?user_id=${encodeURIComponent(scopedUser)}&q=${encodeURIComponent(query)}&days=${days}&date=${encodeURIComponent(date)}&limit=120`);
+    const data = await api(`/api/reports?user_id=${encodeURIComponent(scopedUser)}&q=${encodeURIComponent(query)}&days=${days}&date=${encodeURIComponent(date)}&limit=${REPORT_LIST_LIMIT}`);
     state.reports = data.reports || [];
     const count = data.count || state.reports.length;
     $("reportSources").textContent = (data.source_dirs || []).length
